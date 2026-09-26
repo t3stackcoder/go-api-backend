@@ -237,3 +237,84 @@ func WriteProblem(w http.ResponseWriter, r *http.Request, err error)
 | `Kind` has three values | Five: adds notification and consumer | One pipeline mechanism serves all three paths described in Appendix D |
 | `redisx` never imports `pg` | `redisx` imports `pg` for `OutboxEntry` and the sink interfaces | Avoids duplicating the relay entry type; `pg` still never imports `redisx` |
 | Module path `github.com/OWNER/go-api-backend` | `github.com/t3stackcoder/go-api-backend` | OWNER replaced with the repository owner |
+| Consumer group `read-model`, `Descriptions` default true | Group `read_model`; `openapi.Config.NoDescriptions` (descriptions on unless disabled) | `NamePattern` is `^[A-Za-z][A-Za-z0-9_.]{0,127}$` and forbids `-`, so every persisted group name uses `_` (`read_model`, `audit`, `poison`, `inventory`); a zero `openapi.Config` should produce the documented default, which a `Descriptions bool` cannot |
+| Shutdown on SIGTERM only | Also on stdin EOF when `SHUTDOWN_ON_STDIN_EOF=1` (`examples/orders`) | Windows cannot deliver SIGTERM to a child process; integration tests close the child's stdin to trigger the same drain |
+| Behavior constructors named after the behavior (`behavior.Cache`) | `behavior.New*` constructors; the bare names are the name constants (`behavior.Cache == mediator.NameCache`) | The name constants are re-exported from the core and are what `Use` options and logs refer to |
+
+## 7. Decisions recorded by the package agents
+
+These resolve details spec.md leaves open. They live in package doc comments
+too; this list is the index.
+
+### 7.1 pg
+
+* The envelope's correlation ID, causation ID, trace parent, and occurred-at
+  are stored inside `mediator_outbox.headers` JSONB (`corr`, `cause`,
+  `trace`, `at`; user headers under `h`) because the 6.2 DDL has no columns
+  for them. Causation equals `mediator.RequestID(ctx)` of the publishing
+  Send. The workload therefore also tags every durable event with
+  `Headers({"cmd": CmdID})` and records the request ID in `wl_cmd_log`.
+* Idempotency scope is `<tenant>:<Name>` when the principal has a tenant,
+  else `<Name>`; keys are 1 to 200 characters; lock timeout 55P03 maps to
+  `CodeIdempotencyBusy` with `Details["retry_after_ms"]`.
+* A commit failure carrying a SQLSTATE is definite; a connection-level
+  failure at COMMIT is `MarkAmbiguous`. `OnCommit` hooks do not run after an
+  ambiguous commit and receive the parent context.
+* The `Inbox` behavior sets `ConsumerState.Duplicate` and returns without
+  calling next; the unit of work then commits the empty transaction.
+* Advisory locks used by the relay, janitor, and migrations are
+  database-global, so integration tests that run them are sequential or use
+  a database per test.
+
+### 7.2 redisx
+
+* Consumer groups on partition streams are created at ID `0` (spec 7.7
+  replay); the RPC `handlers` group at `$`.
+* Remote dispatch matches replies with a per-call `call` field (UUIDv7);
+  `corr` carries the caller's correlation ID unchanged. `redisx.NewRemote`
+  takes no mediator: the dispatcher is passed to `mediator.WithRemote` at
+  `New`.
+
+### 7.3 behavior
+
+* `CacheInvalidation` (name constant `behavior.CacheInvalidation`) is a
+  separate inner behavior after `Idempotency`; `Cache` (queries) sits
+  outside the unit of work.
+* Idempotency is scoped to commands that have a unit of work
+  (`mediator.Where(hasUnitOfWork)`), which makes the core's "RetryPolicy
+  with NoUnitOfWork is allowed when IdempotencyKey exists" rule vacuous for
+  the standard chain. See section 8 for the resolution.
+
+### 7.4 httpapi and openapi
+
+* `httpapi` always serves stream routes as SSE regardless of `Accept`, and
+  binds body fields of RPC GET queries from the query string.
+* `openapi` puts `x-sse-item` on the media type object next to `schema`,
+  which is where OpenAPI 3.2's `itemSchema` goes (spec 15.2 q6).
+
+### 7.5 Names
+
+* Workload request names are dotted (`wl.SetValue`); consumer groups are
+  `read_model`, `audit`, `poison`, `inventory`.
+* Every I/O call site in `pg`, `redisx`, and the behaviors passes a literal
+  fault point name from `mediator/testkit/faultpoints.txt`;
+  `TestFaultPointCatalogue` fails on an unlisted literal.
+* Unreachable lines carry `// covergate:ignore <reason>`; `tools/covergate`
+  rejects an empty reason.
+
+### 7.6 test/integration
+
+* Each test gets its own database (`CREATE DATABASE` / `DROP DATABASE WITH
+  (FORCE)`), not a schema: the relay slot, janitor, and migration advisory
+  locks are database-global, so two nodes in one database would contend for
+  the same slots.
+* The example service is built once per package in `TestMain`; nodes run
+  as child processes with `SHUTDOWN_ON_STDIN_EOF=1` and a stdin pipe, so
+  the shutdown tests work on Windows (stdin closed) and Unix (SIGTERM).
+* The readiness test binds its own Redis container to a fixed host port
+  (`HostConfigModifier`) because Docker may assign a new ephemeral port to a
+  restarted container while the node keeps the address it started with;
+  this makes `github.com/moby/moby/api` a direct dependency of the test tree.
+* A rejected stream request (for example an unauthenticated
+  `GET /orders/{id}/events`) answers HTTP 200 with one `event: error` frame
+  carrying the problem body, because stream routes are always SSE (3.5).

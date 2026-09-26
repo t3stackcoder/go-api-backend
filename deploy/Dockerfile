@@ -9,9 +9,6 @@
 #              Used by the compose `chaos` profile (node1..node3).
 #   orders     examples/orders built without the fault tag, plus cmd/mediatorctl.
 #
-# NOTE: cmd/chaosnode, cmd/mediatorctl and examples/orders are being written
-# by other milestones; `docker build` succeeds only once those packages exist.
-#
 #   docker build -f deploy/Dockerfile --target chaosnode -t go-api-backend/chaosnode .
 #   docker build -f deploy/Dockerfile --target orders    -t go-api-backend/orders .
 
