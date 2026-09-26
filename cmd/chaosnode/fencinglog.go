@@ -16,7 +16,7 @@ const FencingLogName = "ChaosFencingLog"
 // G14): "fencing=<n> partition=<p> group=<g> node=<id> topic=<t>". It is
 // positioned after Inbox, so a duplicate delivery the inbox skipped is not
 // logged, and the record is written from an on-commit hook, so an apply
-// whose transaction rolled back (for example a stale lease holder cancelled
+// whose transaction rolled back (for example a stale lease holder canceled
 // at commit) is not logged either.
 type fencingLog struct {
 	logger *slog.Logger

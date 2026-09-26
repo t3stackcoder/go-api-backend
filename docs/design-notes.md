@@ -318,3 +318,40 @@ too; this list is the index.
 * A rejected stream request (for example an unauthenticated
   `GET /orders/{id}/events`) answers HTTP 200 with one `event: error` frame
   carrying the problem body, because stream routes are always SSE (3.5).
+
+### 7.7 test/chaos
+
+* Result classification of a node's HTTP answer: 2xx is `ok`; the definite
+  problem codes (`bad_request`, `validation`, `not_found`, `conflict`,
+  `precondition_failed`, `unauthorized`, `forbidden`, `rate_limited`,
+  `idempotency_mismatch`, `handler_not_found`, `method_not_allowed`,
+  `payload_too_large`, `unsupported_media_type`) and dial failures are
+  `fail`; timeout, unavailable, internal, `idempotency_in_progress`, and a
+  broken connection are `info`.
+* `bank-idempotent` keeps one operation open and retries the same
+  idempotency key across nodes until the result is definite. L2 re-sends of
+  retired `info` operations are not added to the history (a replay would
+  misrepresent a `set`); they run after healing and before the final reads.
+* Degraded windows for the cache checkers come from Redis-affecting nemeses
+  only (`partition-redis`, `redis-restart`, `redis-flush`,
+  `redis-restore-old`, and `latency`, `reset`, `bandwidth` on Redis
+  proxies), global across nodes.
+* `redis-restore-old` snapshots `/data/appendonlydir` once after warm-up
+  (after `BGREWRITEAOF`) and restores it with `docker stop`, `docker cp`,
+  `docker start`.
+* Heal starts stopped containers and unpauses paused ones but does not
+  restart running nodes, so recovery state is not laundered by a restart.
+  Every run resets by stopping the nodes, truncating the `mediator_*` and
+  `wl_*` tables, seeding the bank, `FLUSHALL`, then starting the nodes.
+* Every nemesis holds per-resource locks (node, postgres, redis, relay,
+  handlers, clock per node), so at most one Docker-level fault targets a
+  container at a time; toxics hold no lock. A no-op nemesis (for example
+  `handler-rotate` outside `remote-send`) ends immediately and is logged
+  with `noop: true`.
+* Containers are reused across runs, so node logs are collected with
+  `docker logs --since <run start>`.
+* The compose chaos profile sets `CHAOS_GROUPS=read_model,audit` (the two
+  groups of the `events` workload); the node default of all three groups,
+  including `poison`, serves the fault sweep.
+* First results (60 s runs, seeds 1 to 5): every workload passes except
+  `events`, which exposed two framework bugs recorded in section 8.
