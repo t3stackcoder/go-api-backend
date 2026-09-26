@@ -38,10 +38,16 @@ go run ./tools/task help            # list every task
 go run ./tools/task test            # tiers 0-2: go test -shuffle=on -count=2 ./...
 go run ./tools/task up              # Postgres 18 and Redis 8 via docker compose
 go run ./tools/task down
+go run ./tools/task orders-up       # the same plus the example service on http://localhost:8080
+go run ./tools/task orders-down
 go run ./tools/task cover           # coverage profile + covergate thresholds
 go run ./tools/task lint            # go vet + staticcheck, govulncheck, golangci-lint when installed
 go run ./tools/task fuzz -fuzztime 30s
+go run ./tools/task test-integration   # tier 4, testcontainers
+go run ./tools/task test-sweep         # tier 3, after `up`; SWEEP_QUICK=1 for a short local run
+go run ./tools/task chaos-up
 go run ./tools/task chaos -workload=register -seed=1 -duration=5m
+go run ./tools/task chaos-down
 ```
 
 With make installed the same targets are `make test`, `make up`, `make cover`,
@@ -69,5 +75,11 @@ The Makefile is POSIX and runs under Git Bash, but nothing requires it: use
 `go run ./tools/task <name>`. The race detector needs cgo and a C compiler;
 `task test` enables `-race` automatically when `CGO_ENABLED=1` and the
 compiler from `go env CC` is on PATH, and says which mode it used. CI runs
-with the race detector on Linux. Docker Desktop with Linux containers is
-enough for the compose stack, Toxiproxy, and the chaos nemeses.
+with the race detector on Linux; locally, `go test -count=2 -shuffle=on` is
+the substitute. Docker Desktop with Linux containers is enough for the
+compose stack, Toxiproxy, and the chaos nemeses. A prebuilt golangci-lint
+compiled with an older Go refuses this module: install it from source with
+the module's Go (`go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0`).
+Windows cannot send SIGTERM to a child process, so the example service also
+shuts down on stdin EOF when `SHUTDOWN_ON_STDIN_EOF=1`; the integration tier
+uses that.

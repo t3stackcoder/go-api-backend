@@ -138,10 +138,12 @@ func TestRunUsage(t *testing.T) {
 
 func TestComposeTasks(t *testing.T) {
 	cases := map[string]string{
-		"up":         "docker compose -f deploy/docker-compose.yml up -d --wait",
-		"down":       "docker compose -f deploy/docker-compose.yml down -v",
-		"chaos-up":   "docker compose -f deploy/docker-compose.yml --profile chaos up -d --wait --build",
-		"chaos-down": "docker compose -f deploy/docker-compose.yml --profile chaos down -v",
+		"up":          "docker compose -f deploy/docker-compose.yml up -d --wait",
+		"down":        "docker compose -f deploy/docker-compose.yml down -v",
+		"chaos-up":    "docker compose -f deploy/docker-compose.yml --profile chaos up -d --wait --build",
+		"chaos-down":  "docker compose -f deploy/docker-compose.yml --profile chaos down -v",
+		"orders-up":   "docker compose -f deploy/docker-compose.yml --profile orders up -d --wait --build",
+		"orders-down": "docker compose -f deploy/docker-compose.yml --profile orders down -v",
 	}
 	for task, want := range cases {
 		h := newHarness(t)
@@ -331,7 +333,7 @@ func TestTestRaceDetection(t *testing.T) {
 func TestTierTasks(t *testing.T) {
 	cases := map[string]string{
 		"test-integration": "go test -tags integration -count=1 ./...",
-		"test-sweep":       "go test -tags faultsweep,faultinject -count=1 ./test/faultsweep/...",
+		"test-sweep":       "go test -tags faultsweep,faultinject -count=1 -timeout 60m ./test/faultsweep/...",
 		"openapi":          "go run ./cmd/mediatorctl openapi export --out api/openapi.json",
 		"mutate":           "gremlins unleash ./mediator --threshold-efficacy 80",
 	}
@@ -536,14 +538,14 @@ func TestCover(t *testing.T) {
 		t.Fatalf("exit %d: %s", code, h.stderr)
 	}
 	assertCmds(t, h.runner.strings(), []string{
-		"go test -covermode=atomic -coverpkg=./mediator/... -coverprofile=coverage/unit.out ./mediator/...",
+		"go test -tags integration,faultinject -covermode=atomic -coverpkg=./mediator/... -coverprofile=coverage/unit.out ./mediator/...",
 		"go run ./tools/covergate -profile coverage/unit.out -summary coverage/summary.md -thresholds mediator/pg=90",
 	})
 	if _, err := os.Stat(filepath.Join(h.app.Root, "coverage")); err != nil {
 		t.Errorf("coverage dir not created: %v", err)
 	}
 	h = newHarness(t)
-	h.runner.fails["go test -covermode=atomic -coverpkg=./mediator/... -coverprofile=coverage/unit.out ./mediator/..."] = errors.New("exit status 1")
+	h.runner.fails["go test -tags integration,faultinject -covermode=atomic -coverpkg=./mediator/... -coverprofile=coverage/unit.out ./mediator/..."] = errors.New("exit status 1")
 	if code := h.run(t, "cover"); code != 1 {
 		t.Errorf("exit %d, want 1", code)
 	}
@@ -668,7 +670,7 @@ func TestCI(t *testing.T) {
 		"go vet ./...",
 		"go env CGO_ENABLED CC",
 		"go test -shuffle=on -count=2 ./...",
-		"go test -covermode=atomic -coverpkg=./mediator/... -coverprofile=coverage/unit.out ./mediator/...",
+		"go test -tags integration,faultinject -covermode=atomic -coverpkg=./mediator/... -coverprofile=coverage/unit.out ./mediator/...",
 		"go run ./tools/covergate -profile coverage/unit.out -summary coverage/summary.md",
 	})
 

@@ -15,7 +15,7 @@ DURATION ?= 5m
 # `make fuzz FUZZTIME=5m`
 FUZZTIME ?= 30s
 
-.PHONY: help up down chaos-up chaos-down fmt lint test fuzz test-integration \
+.PHONY: help up down orders-up orders-down chaos-up chaos-down fmt lint test fuzz test-integration \
         test-sweep chaos chaos-matrix openapi openapi-check cover mutate \
         bench bench-baseline ci
 
@@ -28,6 +28,13 @@ up:
 
 down:
 	$(TASK) down
+
+# Compose with the orders profile: adds the example service of spec 13 on :8080.
+orders-up:
+	$(TASK) orders-up
+
+orders-down:
+	$(TASK) orders-down
 
 # Compose with the chaos profile: adds Toxiproxy and node1..node3.
 chaos-up:

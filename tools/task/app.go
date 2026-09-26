@@ -48,6 +48,8 @@ func init() {
 		{"down", "stop the compose stack and delete its volumes", taskDown},
 		{"chaos-up", "start the compose stack with the chaos profile (Toxiproxy and nodes)", taskChaosUp},
 		{"chaos-down", "stop the chaos profile stack and delete its volumes", taskChaosDown},
+		{"orders-up", "start Postgres, Redis, and the example service (compose profile orders)", taskOrdersUp},
+		{"orders-down", "stop the orders profile stack and delete its volumes", taskOrdersDown},
 		{"fmt", "gofmt -l; fails when any file is not formatted", taskFmt},
 		{"lint", "go vet plus staticcheck, govulncheck, golangci-lint when installed", taskLint},
 		{"test", "tiers 0 to 2: go test -shuffle=on -count=2 ./... (-race when cgo works)", taskTest},

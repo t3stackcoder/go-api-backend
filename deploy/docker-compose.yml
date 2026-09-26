@@ -1,5 +1,7 @@
 # Local stack (spec 12.1). Without profiles: Postgres and Redis only
-# (`go run ./tools/task up`). Profile `chaos` adds Toxiproxy and the chaos
+# (`go run ./tools/task up`). Profile `orders` adds the example service of
+# spec 13, built from deploy/Dockerfile target `orders`, on :8080
+# (`go run ./tools/task orders-up`). Profile `chaos` adds Toxiproxy and the chaos
 # nodes, which are built from deploy/Dockerfile target `chaosnode`
 # (`go run ./tools/task chaos-up`). Every node reaches Postgres and Redis only
 # through its own Toxiproxy listeners (deploy/toxiproxy.json) so faults can be
@@ -53,6 +55,21 @@ services:
       interval: 2s
       timeout: 2s
       retries: 30
+
+  orders:
+    profiles: [orders]
+    build: { context: .., dockerfile: deploy/Dockerfile, target: orders }
+    environment:
+      NODE_ID: orders1
+      PG_URL: postgres://app:app@postgres:5432/app?sslmode=disable
+      REDIS_ADDR: redis:6379
+      HTTP_ADDR: :8080
+      JWT_SECRET: ${JWT_SECRET:-}   # empty: the development secret, with a warning at start
+    ports: ["8080:8080"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    stop_grace_period: 20s
 
   toxiproxy:
     profiles: [chaos]

@@ -53,6 +53,16 @@ func taskChaosDown(a *App, _ []string) error {
 	return compose(a, "--profile", "chaos", "down", "-v")
 }
 
+// taskOrdersUp and taskOrdersDown run the compose stack with the example
+// service of spec 13 (profile `orders`, Dockerfile target `orders`).
+func taskOrdersUp(a *App, _ []string) error {
+	return compose(a, "--profile", "orders", "up", "-d", "--wait", "--build")
+}
+
+func taskOrdersDown(a *App, _ []string) error {
+	return compose(a, "--profile", "orders", "down", "-v")
+}
+
 // taskFmt lists unformatted files with gofmt -l and fails when there are any.
 func taskFmt(a *App, _ []string) error {
 	c := a.cmd("gofmt", "-l", ".")
@@ -166,7 +176,7 @@ func taskTestIntegration(a *App, _ []string) error {
 }
 
 func taskTestSweep(a *App, _ []string) error {
-	return a.goRun("test", "-tags", "faultsweep,faultinject", "-count=1", "./test/faultsweep/...")
+	return a.goRun("test", "-tags", "faultsweep,faultinject", "-count=1", "-timeout", "60m", "./test/faultsweep/...")
 }
 
 // taskChaos runs one chaos run. Flags override the WORKLOAD, SEED, and
@@ -267,12 +277,14 @@ func taskOpenAPICheck(a *App, _ []string) error {
 
 // taskCover writes the atomic coverage profile of ./mediator/... and runs
 // the covergate; extra arguments are passed to covergate (for example
-// -thresholds mediator/pg=90).
+// -thresholds mediator/pg=90). The profile includes the integration and
+// fault-injection tests (Docker), because the pg and redisx drivers reach
+// their thresholds only through the tests that talk to Postgres and Redis.
 func taskCover(a *App, args []string) error {
 	if err := a.mkdir(coverDir); err != nil {
 		return err
 	}
-	if err := a.goRun("test", "-covermode=atomic", "-coverpkg=./mediator/...",
+	if err := a.goRun("test", "-tags", "integration,faultinject", "-covermode=atomic", "-coverpkg=./mediator/...",
 		"-coverprofile="+coverProfile, "./mediator/..."); err != nil {
 		return err
 	}

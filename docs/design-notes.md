@@ -214,6 +214,11 @@ func WriteProblem(w http.ResponseWriter, r *http.Request, err error)
   conformance suite both implementations pass.
 * The race detector needs cgo; on this Windows machine there is no C
   compiler, so `-race` runs in CI (Linux). Locally use `go test -count=2 -shuffle=on`.
+* The coverage profile of `tools/task cover` is written with
+  `-tags integration,faultinject`, so the pg and redisx drivers are measured
+  with the tests that talk to Postgres and Redis (Docker); unit tests alone
+  leave them near 50 and 40 percent because almost every statement is an I/O
+  call site. Spec 11.2 fixes the command and the thresholds, not the tags.
 
 ## 5. Toolchain facts verified on 2026-09-26
 
@@ -433,3 +438,87 @@ chaos runs (see the relay and consumers doc comments):
 * The relay checked for Redis data loss only on its poll branch; under
   wake-up load its own next `XADD` moved the stream tail past the cursor
   and a `FLUSHALL` went undetected (G12, G5, I2, I3).
+
+### 7.8 deploy
+
+* The example service is deployed in the compose stack as profile `orders`
+  (`go run ./tools/task orders-up`, Dockerfile target `orders`, port 8080),
+  separate from the default profile so that `task up` still starts only
+  Postgres and Redis for the fault sweep. `JWT_SECRET` is passed through from
+  the host environment; empty means the development secret, which the service
+  logs a warning about at start.
+
+### 8.6 Fault sweep (tier 3)
+
+First complete run on 2026-09-26 in quick mode (first hit of every point, no
+resource variants): all eight scenarios pass and the completeness gate accepts
+the matrix. cancel, crash, delay, error, permanent, and timeout reach 37 of
+the 39 catalogue points; the two outright exclusions are `pg.migrate.apply`
+and `http.sse.write`. ambiguous reaches the 8 points that have a
+`testkit.FaultAfter` site and is excused at the other 29 by construction, and
+the crash and ambiguous subtests at those 29 points are skipped in the log
+(crash-before covers them for the gate). The quick run takes about nine
+minutes, dominated by `SweepConsumer` (156 s), `SweepRemote` (97 s), and
+`SweepRelay` (75 s). `tools/task test-sweep` passes `-timeout 60m` because
+the full matrix exceeds go test's default ten minutes.
+
+### 8.7 Chaos findings, second round (not yet fixed)
+
+`events`, 60 s, seeds 1 to 4 on the node image that carries the 8.5 fixes:
+seeds 3 and 4 pass; seeds 1 and 2 fail I6 (seed 1 also I3, seed 2 also the
+fencing checkers). Run directories `test/chaos/runs/events-seed1-20260926-165740`
+and `events-seed2-20260926-165925` hold the evidence. Two defects in the
+`redisx` lease protocol, both still open; the fix plans below were worked
+out from the logs and are what the next session should implement.
+
+**Same-node re-acquire overlaps the old reader.** Stream commands run under
+the node ID as consumer name. When Redis forgets a lease key (FLUSHALL,
+restore) the next renewal reports "lost to another owner", and `rebalance`
+in the same tick re-acquires the partition with a new epoch and starts a new
+worker. The old worker's `XREADGROUP ... BLOCK` is still outstanding: go-redis
+9.22 runs a command synchronously on its connection and takes only the socket
+deadline from the context, so cancelling the lease context does not interrupt
+the read (the comment on `partitionWorker.readCtx` claiming the connection is
+closed is wrong). Redis serves the older blocked reader first, so the next
+entry lands in the node's PEL under the same consumer name; the new worker's
+`claimForeignBefore` skips own entries, reads past it, and the entry waits
+for the periodic claim pass (ClaimMinIdle, 30 s) or the next surplus drain.
+Seed 1, node3: e2 seq 217 was created at 21:58:46.049 and applied at
+21:58:50.460 (audit, epoch 672, at the surplus drain) and 21:59:16.108
+(read_model, epoch 696, 30 s after 218), while 218 was applied at
+21:58:46.222; the leases were lost and re-acquired between 21:58:45.18 and
+45.26. Fix: (a) the lease manager keeps the ended leases whose worker has
+not exited and `rebalance` skips their partitions until it has; (b) the
+claim-before pass claims every pending entry below the batch, own name
+included, using the XPENDING summary's lowest ID so the common path stays at
+one round trip; (c) correct the comment. Tests: a synctest lease-manager
+test for (a); an integration test that issues a ghost read in the node's own
+name (the existing `ghostRead` helper) for (b).
+
+**A stale owner writes for up to LeaseRenew after Redis forgets its key.**
+After `redis-restore-old` (equally a flush, or a restart that loses the last
+second of AOF) the lease keys are gone; another node acquires them at once
+with higher tokens; the old owner learns at its next renewal tick and keeps
+reading and applying until then. Seed 2: node1 applied with 1414, 1428, and
+1474 from 22:00:24.08, when node2 acquired the same partitions with 1507,
+1523, and 1527, until its tick at 22:00:27.65. The two readers split the
+entries, and the fencing checkers flag every lower token that applies after
+a higher one. The lease store cannot close this window; the token has to be
+checked where the effect happens, which for the framework is Postgres. Fix:
+migration `0002_partition_epoch.sql` with
+`mediator_partition_epoch (consumer_group, topic, partition, epoch)`;
+`pg.Tx.FencePartition(ctx, group, topic, partition, token) (ok bool, err error)`
+as `INSERT ... ON CONFLICT DO UPDATE SET epoch = EXCLUDED.epoch WHERE
+mediator_partition_epoch.epoch <= EXCLUDED.epoch RETURNING 1` (the row lock
+also serializes the two owners' transactions); the Inbox behavior calls it
+before `InboxInsert` whenever `mediator.FencingToken(ctx)` is present and
+returns `mediator.Wrap(CodeConflict, ..., pg.ErrStaleLease)` when no row
+comes back; `redisx` `handle` recognizes `pg.ErrStaleLease`, ends the lease
+(`LeaseEndLost`) and stops the worker instead of retrying or dead-lettering;
+`testkit/memstore` and `pg/storetest` gain the method and a conformance
+test; new fault point `pg.inbox.fence` (a `testkit.Fault` call only, so the
+ambiguous kind is excused by construction). The table and the `Tx` method
+are additions to spec 6.2 and to the frozen `pg.Tx` interface: add both to
+the section 6 table when they land. Seed 2's I6 violations (e6, e0) fit the
+first defect: node2 lost and re-acquired its leases within one tick at
+21:59:58.97 and 22:00:24.06.

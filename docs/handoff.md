@@ -1,239 +1,170 @@
 # Handoff: implementing spec.md
 
 Written for the next agent continuing this work. Read `spec.md` (the
-contract), `docs/design-notes.md` (decisions and deviations), then this file.
+contract), `docs/design-notes.md` (decisions, deviations, and the hardening
+and tier outcomes in sections 7 and 8), then this file. Keep this file
+current: update it in the same commit as the work it describes.
+
+Last updated 2026-09-26 at the end of the fourth session (the one that
+verified the WIP commit `43fca39` and found the two defects in section 3).
 
 ## 1. Where things stand
 
-Every package in the table below is complete, and the whole tree passes
-`go build ./...` and `go vet ./...`. The last full unit run before the final
-wave was green across 20 packages (`go test -count=1 ./...`); the partial
-packages listed in section 2 have NOT been run since, and `gofmt -l .` flags
-one of their files. Nothing is committed yet: the branch `main` has no
-commits and the user has not asked for one. Module path is
-`github.com/t3stackcoder/go-api-backend`, `go 1.27` (toolchain auto-downloads).
+Module `github.com/t3stackcoder/go-api-backend`, `go 1.27`. The branch is
+`main`; there is no git remote, so CI (`.github/workflows/ci.yml`) has never
+run. The whole tree builds, vets, and is gofmt-clean under every build tag
+(`integration`, `faultinject`, `faultsweep`, `chaos`), and `go mod tidy` is
+a no-op.
 
-| Package | State | Coverage (unit / with `-tags integration`) |
-|---|---|---|
-| `mediator` (core) | done | 99.5 (7 lines annotated unreachable) |
-| `mediator/authz`, `retry`, `ratelimit` | done | 100 |
-| `mediator/testkit` (fault points, clocks) | done | 100 / 97 under `faultinject` |
-| `mediator/validate` | done | 100 |
-| `mediator/httpapi` | done | 99.4 / 100 under `faultinject` |
-| `mediator/openapi` | done | 100 |
-| `mediator/pg` (+ `migrations/`) | done | 53 / 89 |
-| `mediator/pg/storetest`, `testkit/memstore` | done | 99 (memstore) |
-| `mediator/redisx` | done | 38 / 92.5 (95.6 with `faultinject`) |
-| `mediator/behavior` (+ `cachemodel`), `mediator/otel` | done | 100 |
-| `mediator/ctl`, `cmd/mediatorctl` | done | 96.6 / 99 |
-| `mediator/testkit/history` | done | 98.6 |
-| `mediator/testkit/workload`, `testkit/invariants` | done | 43 / 94, 14 / 95 |
-| `tools/task`, `tools/covergate`, `Makefile`, `deploy/`, `.github/workflows/ci.yml` | done | 97 |
+| Area | State |
+|---|---|
+| Core, behaviors, validate, pg, redisx, httpapi, openapi, ctl, otel, testkit | complete; `go test -count=1 ./...` green in 25 packages; lint at zero (design-notes 5, 8.4) |
+| Example service and integration tier (`examples/orders`, `test/integration`) | complete and verified: shutdown drain, ack-after-commit, OpenAPI drift, readiness, end to end, Docker target `orders` |
+| Chaos tier (`test/chaos`, `cmd/chaosnode`) | complete; 7 of 8 workloads green on 60 s runs; `events` fails 2 of 4 seeds on the two open defects of section 3 (design-notes 8.7) |
+| M7 hardening | done: G17 met (6 allocs, 0.44 µs), generic schema names, metrics single-sourced, retry rule, json/v2 tag grammar (design-notes 8.1 to 8.4) |
+| Fault sweep tier (`test/faultsweep`) | complete; quick matrix green with the completeness gate passing (design-notes 8.6); the full matrix has not been run |
+| Bug A, lease-handover reorder (G6, voluntary release) | fixed and verified: unit, integration (`TestConsumers_SurplusReleaseDrainsBeforeHandover`, `TestConsumers_ClaimsForeignEntriesBelowBatch`, `TestFault_ClaimForeignBefore`) |
+| Bug B, relay data loss under wake-up load (G12) | fixed and verified: unit (`TestSlot_TailCheckPerBatch`, `TestSlot_RunLoop_DetectsLossOnWake`), integration (`TestIntegration_Relay_RedisFlushBetweenWakeups`) |
+| Defect C, same-node re-acquire overlaps the old reader (G6, involuntary loss) | open; analyzed with a fix plan in design-notes 8.7 |
+| Defect D, stale owner writes until its next renewal after Redis forgets its lease (G14) | open; analyzed with a fix plan in design-notes 8.7 |
+| Example service in the compose stack | added as profile `orders` (`task orders-up` / `orders-down`); compose config validates; not yet started end to end |
 
-Agents completed each package with a final report; the exported APIs are
-summarized in `docs/design-notes.md` section 3 and in each package's doc
-comments. Deviations from spec.md are listed in design-notes section 6.
+Verified complete against the spec before this session: all 7 property
+tests, 6 fuzz targets, 16 CLI commands, 20 metrics, 39 fault points, every
+Makefile target.
 
-## 2. Work that was in flight when this handoff was written
+## 2. What the fourth session did
 
-Four background agents were STOPPED mid-task at the user's request. The
-tree still passes `go build ./...` and `go vet ./...` with their partial
-output in place. Exact state at the stop:
+The previous session committed `43fca39` ("WIP: fault sweep tier and the two
+chaos bug fixes, unverified") without updating this file. This session
+verified that commit, finished the small items around it, and analyzed what
+the chaos re-run exposed.
 
-* `examples/orders/`: library package `orders/` (consumers, events,
-  handlers, register, requests, schema, doc, a unit test), `main.go`,
-  `auth.go`, `auth_test.go`, `ready.go` all exist. The agent's last note:
-  `auth_test.go` referenced a missing `testRedisConfig()` helper and it was
-  about to switch to a zero `redisx.Config` and run the unit tests. Not yet
-  verified: `go test ./examples/...`, the integration tests (none written),
-  `test/integration/` (empty), `cmd/mediatorctl/registry.go` (still the
-  erroring default), `docker build --target orders`. `api/openapi.json`
-  exists but was written before the registry was linked, so regenerate it
-  with `go run ./tools/task openapi` once `registry.go` links
-  `orders.Registry`, then run `openapi-check`. `gofmt -l` flags
-  `examples/orders/orders/orders_test.go`.
-* `cmd/chaosnode/`: admin.go, config.go, fault_inject.go, fault_noinject.go,
-  fencinglog.go, main.go, proxy.go, server.go, toggle.go exist and compile.
-  Nothing under `test/chaos/` was written. A stray build artifact
-  `chaosnode.exe` sits in the repository root: delete it and add `*.exe` to
-  `.gitignore`. The compose chaos profile has not been started.
-* `test/faultsweep/`: only the tagless `plan/` subpackage exists
-  (plan.go, plan_test.go, dryrun.go, dryrun_test.go); the harness, the
-  eight scenarios, the crash sweep, and the completeness test are not
-  written. Check `go test ./test/faultsweep/plan/` first.
-* Lint cleanup: the agent had edited at least `mediator/runtime.go`
-  (duplicate failure report dedupe) before being stopped; the rest of the
-  71 findings remain. Re-run the linter (section 2.4) to see what is left.
+* Bug A and Bug B: the relay fix the WIP message called "partial" was in
+  fact complete in `mediator/pg/relay.go`. Both fixes pass their unit tests
+  and their new integration tests under `-tags integration,faultinject`.
+* Fault sweep, quick mode (`SWEEP_QUICK=1`, first hit of every point, no
+  resource variants): all eight scenarios pass in 517 s and
+  `TestFaultSweepCompleteness` passes. Per-kind coverage and the skip
+  accounting are in design-notes 8.6.
+* Chaos `events`, seeds 1 to 4, 60 s each, on the node image rebuilt with
+  both fixes: seeds 3 and 4 pass; seeds 1 and 2 fail I6 (seed 1 also I3,
+  seed 2 also the fencing checkers). The run directories are kept under
+  `test/chaos/runs/` (gitignored): `events-seed1-20260926-165740` and
+  `events-seed2-20260926-165925`. Root causes and fix plans: design-notes
+  8.7 and section 3 below. No code was changed for them.
+* `tools/task test-sweep` now passes `-timeout 60m` (the matrix exceeds go
+  test's default; the CI sweep job is 75 minutes so the go test timeout
+  fires first and prints goroutines).
+* `tools/task cover` now runs with `-tags integration,faultinject` so the
+  driver packages are measured with their container tests; the CI unit job
+  is 45 minutes. The gate has NOT been run with the new tags yet.
+* Compose profile `orders` (example service on :8080), tasks `orders-up` and
+  `orders-down`, Makefile aliases, README section (design-notes 7.8).
+* README: tier commands and Windows notes (race detector substitute,
+  golangci-lint from source, stdin-EOF shutdown).
+* `go mod tidy` removed the unused toxiproxy client and its transitive
+  dependencies (the chaos controller speaks Toxiproxy's HTTP API directly).
+* This file was rewritten; design-notes gained a section 4 bullet on the
+  coverage tags, 7.8, 8.6, and 8.7.
 
-If a directory is incomplete, redo that item from the brief below (each is
-self-contained given spec.md and design-notes; the original agent briefs
-were longer, and the spec sections cited are the source of truth).
+## 3. What is left, in order
 
-### 2.0 Resume in this order
+1. **Defect C** (design-notes 8.7, first item). In `mediator/redisx`:
+   (a) `leaseManager` keeps the ended leases whose worker has not exited
+   (`ending map[leaseKey]*lease`, filled by `end` for leases with a worker,
+   cleared by a `workerDone` the worker defers after `exit`) and `rebalance`
+   skips those partitions; (b) `foreignBefore` claims every pending entry
+   below the batch, own name included, and skips the range scan when the
+   XPENDING summary's lowest ID is at or above the batch; (c) fix the
+   `readCtx` comment. Tests: a synctest lease-manager test for (a) next to
+   `TestLeaseManager_WorkerOwnsSurplusRelease`; an integration test for (b)
+   that reuses `ghostRead` with the node's own name so the ghost's entry
+   lands in the node's PEL and must be applied before the next batch
+   (`cfg.ClaimMinIdle` high enough that the periodic pass cannot be what
+   restores the order).
+2. **Defect D** (design-notes 8.7, second item). Migration
+   `migrations/0002_partition_epoch.sql` (forward DDL, then `-- down`), the
+   `pg.Tx.FencePartition` method in `pg/ports.go`, `pg/tx.go`, and
+   `testkit/memstore/tx.go` (buffer the epoch per transaction, apply at
+   commit, lock the row key like the inbox), a `storetest` conformance test
+   (monotonic; equal token accepted; independent per partition; rollback
+   keeps the old value; add the method to the read-only and closed-tx
+   tables), the check in `pg.Inbox()` before `InboxInsert`, the sentinel
+   `pg.ErrStaleLease`, the `redisx` `handle` branch that ends the lease and
+   stops the worker on it, the fault point `pg.inbox.fence` in
+   `mediator/testkit/faultpoints.txt`, and the section 6 rows in
+   design-notes. `TestIntegration_Migrations_UpDownUp` exercises every
+   migration; `TestInbox_*` in `pg/inbox_test.go` is where the behavior
+   test goes (memstore, `mediator.WithFencingToken`).
+3. **Verify both** in this order: `go test -count=1 ./mediator/...`;
+   `go test -tags integration,faultinject -count=1 ./mediator/pg/ ./mediator/redisx/ ./mediator/testkit/...`;
+   `go run ./tools/task chaos-up` (rebuilds the image) then `events` seeds
+   1 to 4 (and 5 to 8 if time allows), then `chaos-down`; then the quick
+   sweep, which must show `pg.inbox.fence` covered by every kind; then the
+   full sweep (`go run ./tools/task test-sweep`, about an hour). Do not run
+   the sweep and chaos at the same time.
+4. **Coverage gate with the new tags.** Run `go run ./tools/task cover`
+   (Docker) and read `coverage/summary.md`. Before this session the numbers
+   were `pg` 89, `testkit/workload` and `testkit/invariants` about 94,
+   `redisx` 92.5 to 95.6, all under the 95 default; `mediator`, `behavior`,
+   `validate` are at 100 and must stay there. Either raise the packages
+   below 95 with tests or add `-thresholds` to the cover task with the
+   reason written next to it.
+5. **Compose smoke test** of the `orders` profile: `go run ./tools/task
+   orders-up`, then `GET http://localhost:8080/readyz` and `/openapi.json`,
+   then `orders-down`.
+6. **Benchmark baseline** (`go run ./tools/task bench` then `bench-baseline`)
+   on a quiet machine, and **mutation testing** (`task mutate`, gremlins,
+   80 percent gate, nightly in CI). Neither has been run.
+7. **CI.** No remote exists. The first push exercises tiers 0 to 4 and the
+   openapi job for the first time, including the race detector, which has
+   never run anywhere (no C compiler on this machine).
+8. **Chaos at spec scale.** The nightly matrix is 5 minutes per cell over
+   seeds 1 to 3 (`task chaos-matrix`, `CHAOS_DURATION`). The `kill` and
+   `pg-restart` nemeses have not been drawn in a live run yet; the
+   definition of done wants two weeks of green nightlies, which is calendar
+   time. Soak mode (`-soak`) exists and has not been exercised.
+9. **Commit** only when the user asks, with the attribution line the session
+   specifies.
 
-1. Delete `chaosnode.exe`, add `*.exe` to `.gitignore`, run `gofmt -w` on
-   the flagged file, then `go build ./... && go vet ./... && go test -count=1 ./...`
-   to learn the real state of the partial packages before changing anything.
-2. Finish 2.1 (example service) first: it links the CLI registry, which
-   regenerates `api/openapi.json`, which the `openapi` CI job checks.
-3. Then 2.2 (chaos) and 2.3 (fault sweep) can run as two parallel agents:
-   they touch disjoint directories (`cmd/chaosnode` + `test/chaos` versus
-   `test/faultsweep`). Both use Docker heavily; do not add a third
-   container-heavy agent alongside them or testcontainers start to time out.
-4. Then 2.4 (lint) and the hardening items in section 3. The lint pass and
-   the coverage-raising pass both edit `*_test.go` files in `pg` and `redisx`,
-   so run them one after the other, not concurrently.
-5. Agents must not change exported signatures of finished packages; if one
-   is needed, record it in `docs/design-notes.md` first.
+## 4. How to run each tier here
 
-### 2.1 Example service (spec 13, M4)
+```sh
+go run ./tools/task test                     # tiers 0-2 (no -race locally)
+go run ./tools/task test-integration         # tier 4, testcontainers
+SWEEP_QUICK=1 go test -tags faultsweep,faultinject -count=1 -timeout 60m -v ./test/faultsweep/...
+go run ./tools/task test-sweep               # tier 3, full matrix
+go run ./tools/task chaos-up                 # builds the node image (--build)
+go run ./tools/task chaos -workload events -seed 1 -duration 60s
+go run ./tools/task chaos-down
+go run ./tools/task cover                    # needs Docker now
+```
 
-Expected files: `examples/orders/orders/*.go` (library: request types,
-handlers, consumers, `Register`, `NewMediator(Deps)`, `Registry()`,
-`OpenAPIConfig()`, `Migrate`), `examples/orders/main.go` and `auth.go`
-(HMAC JWT), `cmd/mediatorctl/registry.go` replaced to link `orders.Registry`,
-`api/openapi.json` committed, `test/integration/*_test.go` with
-`//go:build integration` (runtime shutdown G16, consumer ack-after-commit,
-served OpenAPI equals committed, readiness reflecting Redis down).
-Verify: `go run ./tools/task openapi-check`; `go test -tags integration
--count=1 ./examples/... ./test/integration/...`; `docker build --target
-orders -f deploy/Dockerfile .`. Cross-platform shutdown: the binary must also
-exit cleanly on stdin EOF when `SHUTDOWN_ON_STDIN_EOF=1` (Windows cannot send
-SIGTERM to a child). Consumer group names cannot contain `-` (core
-`NamePattern`), so the spec's `read-model` is `read_model`.
+`go test -v` in package-list mode buffers a package's output until it
+finishes, so a sweep log stays empty for minutes while the containers are
+visibly cycling in `docker ps`; pass a single package path or `-json` to
+stream. The sweep uses testcontainers unless `PG_URL` and `REDIS_ADDR` are
+both set (CI sets them after `task up`). A chaos run writes `summary.json`,
+`nemesis.jsonl`, and the node logs into its run directory; the node logs
+carry one `consumer apply` line per delivery with `fencing=`, `partition=`,
+`group=`, `key=`, `seq=`, and `event_id=`, and the event ID is a UUIDv7
+whose first 48 bits are the creation time in milliseconds, which is how the
+8.7 timelines were reconstructed.
 
-### 2.2 Chaos tier (spec 11.6, M5, M6)
-
-Expected: `cmd/chaosnode/` (node binary built with `-tags faultinject`;
-admin endpoints `/chaos/clock`, `/chaos/fault`, `/chaos/remote`,
-`/chaos/relay`, `/chaos/stats`, `/chaos/goroutines`; logs one
-`fencing=<n> partition=<p> group=<g> node=<id> topic=<t>` record per consumer
-apply and a periodic `goroutines=<n>` marker) and `test/chaos/` (build tag
-`chaos`, `TestChaos` with `-workload -seed -duration`; controller over node
-HTTP, Toxiproxy API on :8474, Docker CLI; all eight workloads and fifteen
-nemeses of the 11.6 tables; run directories with `history.jsonl`,
-`nemesis.jsonl`, `summary.json`, node logs, `porcupine.html`; `TestReplay`
-offline). Verify: `go run ./tools/task chaos-up`, then
-`go run ./tools/task chaos -workload register -seed 1 -duration 60s`, then
-`events`, `bank-idempotent`, `remote-send`, `register-cached`; finally
-`chaos-down`. The workload under test, history recorder, Porcupine models,
-and invariants already exist under `mediator/testkit/{workload,history,invariants}`.
-
-### 2.3 Fault sweep tier (spec 11.4, M2/M3/M6 acceptance)
-
-Expected: `test/faultsweep/` with build tags `faultsweep` and `faultinject`
-(a tagless `doc.go`), a harness that runs each scenario clean, records
-`testkit.Hits()`, then re-runs once per (point, hit, kind) with one armed
-`testkit.Schedule`, recovers, and verifies invariants; the eight scenarios
-`SweepCommandAtomicity`, `SweepRelay`, `SweepConsumer`, `SweepIdempotency`,
-`SweepCache` (reusing `behavior/cachemodel.Scheduler` against real Redis),
-`SweepRemote`, `SweepLease`, `SweepShutdown`; the crash sweep in a child
-process (`os.Exit(137)`, recovery mode, optional Postgres restart between);
-resource exhaustion variants; `TestFaultSweepCompleteness` comparing
-`testkit.Observed()` with `mediator/testkit/faultpoints.txt` (with justified
-exclusions such as `pg.migrate.apply` and `http.*`); tagless unit tests in
-`test/faultsweep/plan`. Verify: `go run ./tools/task test-sweep`.
-
-### 2.4 Lint cleanup
-
-A lint agent was fixing the 71 findings of the CI configuration
-(`.golangci.yml`) across `mediator/` and `tools/` without changing exported
-APIs. Verify with a golangci-lint 2.14 built for Go 1.27: the user's
-installed binary is a Go 1.26 build and refuses this module, so run
-`go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0`
-into a scratch `GOBIN` and run it with the default config, then with
-`--build-tags integration` and `--build-tags faultinject`. Expected: 0 issues.
-Intentional `//nolint:gosec` annotations: `math/rand/v2` in
-`mediator/context.go` (UUIDv7 random bits) and `mediator/retry/retry.go` (jitter).
-
-## 3. Remaining work after those land (hardening, spec M7)
-
-1. **Coverage gate.** `tools/task cover` runs unit-only, so `pg` (53),
-   `redisx` (38), `testkit/workload` (43), and `testkit/invariants` (14) fail
-   the 95 percent default. Change the cover task to run with
-   `-tags integration,faultinject` (CI's ubuntu runner has Docker), then raise
-   `pg` from 89 and `workload`/`invariants` from about 94 to 95, or set
-   explicit `-thresholds` with written reasons. Do not lower `mediator`,
-   `behavior`, `validate` below 100.
-2. **G17.** Time bound holds (0.57 µs full default chain, no I/O). The
-   allocation bound (6) does not: 8 warm, 9 cold. Breakdown: core 4 warm
-   (request box, scope, `WithValue`, response box), +1 cold for the generated
-   correlation string, Timeout +4 (`context.WithTimeout`), Tracing +1 (noop
-   `ContextWithSpan`). Candidates: lazy correlation string in core (store the
-   UUID, format on read), a custom deadline context in `behavior/timeout.go`.
-   The benchmark gate is relative (`benchstat` vs baseline, spec 15.2 q5);
-   `TestSend_DefaultChainAllocations` in `behavior` pins the measured numbers
-   so regressions fail. Record the outcome in design-notes.
-3. **Generic component names.** `validate.shortName` turns
-   `Page[OrderSummary]` into `Page_github.com_..._OrderSummary_` in OpenAPI
-   components. Strip package paths inside `[...]` (e.g. `Page_OrderSummary_`),
-   then regenerate `mediator/openapi/testdata/golden.json`
-   (`go test ./mediator/openapi/ -run 'TestGolden$' -args -update`) and
-   `api/openapi.json` (`go run ./tools/task openapi`), and re-run the
-   TypeScript check (`OPENAPI_TS=1 go test -run TestTypeScriptClient ./mediator/openapi/`).
-4. **Metrics double count.** `behavior.NewMetrics` emits
-   `mediator.consumer.processed` on the consumer path and
-   `otel.NewConsumersObserver` emits it too; wire only the observer in apps
-   (it also sees `dlq` and `skip`) or drop it from Metrics. Decide and document.
-5. **Idempotency scope.** `behavior` scopes Idempotency to commands without
-   `NoUnitOfWork`, which makes the core's "RetryPolicy with NoUnitOfWork is
-   allowed when IdempotencyKey exists" rule vacuous. Either tighten the core
-   Build check (reject RetryPolicy on any NoUnitOfWork request) or document.
-6. **Mutation testing** (`gremlins`, 80 percent gate) has not been run;
-   `tools/task mutate` exists. **Soak** mode exists in the chaos harness brief
-   but has not been exercised. **Benchmarks baseline**
-   (`tools/task bench-baseline`) has not been recorded.
-7. **Design-notes refresh.** Add: `Kind` five values (present), consumer
-   group underscore rule, `openapi.Config.NoDescriptions` (spec said
-   Descriptions default true), `CacheInvalidation` behavior name, G17 numbers,
-   stdin-EOF shutdown, the `read_model` group name, and anything the tier
-   agents report. Keep section 6 (deviations table) authoritative.
-8. **README** should mention the tiers' commands and the Windows notes
-   (no race detector locally, golangci-lint rebuild).
-9. **Commit.** When the user asks: replace nothing else, commit with the
-   attribution line the session specifies.
-
-## 3.1 Decisions that are not in spec.md
-
-These were made by the package agents and live in package doc comments;
-they matter when writing the tiers.
-
-* `pg` stores the envelope's correlation ID, causation ID, trace parent, and
-  occurred-at inside the `mediator_outbox.headers` JSONB (`corr`, `cause`,
-  `trace`, `at`, user headers under `h`) because the 6.2 DDL has no columns
-  for them. Causation equals `mediator.RequestID(ctx)` of the publishing
-  Send. The workload therefore also tags every durable event with
-  `Headers({"cmd": CmdID})` and records the request ID in `wl_cmd_log`.
-* Consumer groups on partition streams are created at ID `0` (spec 7.7
-  replay); the RPC `handlers` group at `$`.
-* Remote dispatch matches replies with a per-call `call` field (UUIDv7);
-  `corr` carries the caller's correlation ID unchanged. `redisx.NewRemote`
-  takes no mediator (it is passed to `mediator.WithRemote` at `New`).
-* Idempotency scope is `<tenant>:<Name>` when the principal has a tenant,
-  else `<Name>`; keys are 1 to 200 characters; lock timeout 55P03 maps to
-  `CodeIdempotencyBusy` with `Details["retry_after_ms"]`.
-* A commit failure carrying a SQLSTATE is definite; a connection-level
-  failure at COMMIT is `MarkAmbiguous`. `OnCommit` hooks do not run after an
-  ambiguous commit and receive the parent context.
-* The `Inbox` behavior sets `ConsumerState.Duplicate` and returns without
-  calling next; the unit of work then commits the empty transaction.
-* `CacheInvalidation` is a separate inner behavior after `Idempotency`;
-  `Cache` (queries) sits outside the unit of work. `behavior` constructors
-  are `New*` because the bare names are the name constants.
-* The core `NamePattern` forbids `-`, so groups are `read_model`, `audit`,
-  `poison`, `inventory`; workload request names are dotted (`wl.SetValue`).
-* `httpapi` always serves stream routes as SSE regardless of `Accept`, and
-  binds body fields of RPC GET queries from the query string.
-* `openapi` puts `x-sse-item` on the media type object next to `schema`,
-  which is where OpenAPI 3.2's `itemSchema` goes.
-
-## 4. Environment facts (verified 2026-09-26)
+## 5. Environment facts (verified 2026-09-26)
 
 * Windows 11, Git Bash for commands; `make` not installed (use
   `go run ./tools/task <name>`); Docker Desktop 29 with Linux containers and
-  Compose v2.40; Node 24 with npx.
+  Compose v2.40; Node 24 with npx; staticcheck and golangci-lint not
+  installed (the user's golangci-lint is a Go 1.26 build and refuses the
+  module; install v2.14.0 from source with Go 1.27 into a scratch `GOBIN`).
 * No C compiler: `-race` cannot run locally; CI runs it. Use
   `go test -count=2 -shuffle=on` locally.
+* go-redis is v9.22.0 with `ContextTimeoutEnabled`: a command runs
+  synchronously on its connection and only the socket deadline comes from
+  the context, so cancelling the context of a blocking `XREADGROUP` does not
+  interrupt it; the read returns when Redis replies or `BLOCK` expires.
 * `encoding/json/v2` facts that bit agents: nil slices encode as `[]`, map
   order needs `json.Deterministic(true)`, unknown members need
   `json.RejectUnknownMembers(true)`, the map-merge tag is `json:",embed"`,
@@ -244,15 +175,21 @@ they matter when writing the tiers.
   database-global: integration tests that run them are sequential or use a
   database per test.
 
-## 5. Conventions the agents followed
+## 6. Conventions
 
-* Exported APIs were frozen once another package depended on them; changes
-  go through design-notes first.
+* Exported APIs of finished packages are frozen; a needed change is recorded
+  in `docs/design-notes.md` first (Defect D adds a `pg.Tx` method: record
+  it in section 6 in the same commit).
 * Every I/O call site passes a literal fault point name from
   `mediator/testkit/faultpoints.txt`; `TestFaultPointCatalogue` fails on an
-  unlisted literal.
+  unlisted literal, and `TestFaultSweepCompleteness` fails when a point is
+  not swept by every kind (exclusions with reasons live in
+  `test/faultsweep/zz_completeness_test.go`).
 * Integration tests sit beside the code as `*_integration_test.go` with
   `//go:build integration` and their own `TestMain` (testcontainers
   `postgres:18`, `redis:8`); `test/integration` holds cross-package scenarios.
 * Unreachable lines carry `// covergate:ignore <reason>`; `tools/covergate`
   rejects an empty reason.
+* Decisions that are not in spec.md are indexed in design-notes section 7
+  (pg, redisx, behavior, httpapi and openapi, names, test/integration,
+  test/chaos, deploy); do not duplicate them here.
