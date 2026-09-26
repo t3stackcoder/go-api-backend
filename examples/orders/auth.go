@@ -19,7 +19,7 @@ import (
 
 // devSecret signs tokens when JWT_SECRET is unset. It is for local runs
 // only; the process logs a warning when it falls back to it.
-const devSecret = "orders-dev-secret-change-me"
+const devSecret = "orders-dev-secret-change-me" //nolint:gosec // G101: local development fallback only, never a real credential; the service warns when it is used
 
 // claims are the JWT claims the service understands. Everything else in
 // the payload is kept in Principal.Claims.

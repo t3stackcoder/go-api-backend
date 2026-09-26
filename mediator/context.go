@@ -27,8 +27,7 @@ func NewID(now time.Time) uuid.UUID {
 	id[3] = byte(ms >> 16)
 	id[4] = byte(ms >> 8)
 	id[5] = byte(ms)
-	r1 := rand.Uint64()
-	r2 := rand.Uint64()
+	r1, r2 := rand.Uint64(), rand.Uint64() //nolint:gosec // G404: UUIDv7 random bits are not a secret; math/rand/v2 is ChaCha8 seeded from the OS
 	id[6] = 0x70 | byte(r1>>56)&0x0f
 	id[7] = byte(r1 >> 48)
 	id[8] = 0x80 | byte(r1>>40)&0x3f

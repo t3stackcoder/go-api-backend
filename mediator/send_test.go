@@ -247,11 +247,10 @@ func TestSend_Remote(t *testing.T) {
 func TestSend_Scope(t *testing.T) {
 	m := mediator.New()
 	type seen struct {
-		corr   string
-		req    uuid.UUID
-		cause  uuid.UUID
-		depth  int
-		parent uuid.UUID
+		corr  string
+		req   uuid.UUID
+		cause uuid.UUID
+		depth int
 	}
 	var inner, outer seen
 	mustNil(t, mediator.HandleFunc(m, func(ctx context.Context, q sQuery) (int, error) {

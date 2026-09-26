@@ -73,7 +73,7 @@ func openStream(t *testing.T, client *http.Client, target string, hdr ...string)
 	for i := 0; i+1 < len(hdr); i += 2 {
 		req.Header.Set(hdr[i], hdr[i+1])
 	}
-	resp, err := client.Do(req)
+	resp, err := client.Do(req) //nolint:bodyclose // the body is the event stream; sseConn.close closes it
 	if err != nil {
 		cancel()
 		t.Fatal(err)

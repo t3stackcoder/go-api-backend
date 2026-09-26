@@ -128,7 +128,7 @@ func FuzzProblemJSON(f *testing.F) {
 		case 1:
 			ve := &mediator.ValidationError{}
 			for i := 0; i < nfields%6; i++ {
-				ve.Add("/f"+msg, code, msg)
+				ve = ve.Add("/f"+msg, code, msg)
 			}
 			err = ve
 		case 2:

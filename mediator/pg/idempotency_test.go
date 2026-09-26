@@ -55,7 +55,7 @@ func newIdemHarness(t *testing.T, uowCfg pg.UnitOfWorkConfig) *idemHarness {
 		mu.Unlock()
 	}})
 	h.m = build(t, func(m *mediator.Mediator) {
-		mediator.HandleFunc(m, func(ctx context.Context, c idemCmd) (thingResult, error) {
+		must(t, mediator.HandleFunc(m, func(ctx context.Context, c idemCmd) (thingResult, error) {
 			mu.Lock()
 			h.calls++
 			mu.Unlock()
@@ -69,15 +69,15 @@ func newIdemHarness(t *testing.T, uowCfg pg.UnitOfWorkConfig) *idemHarness {
 				return thingResult{}, h.fail
 			}
 			return thingResult{ID: "id-" + c.Name}, nil
-		})
-		mediator.HandleFunc(m, func(ctx context.Context, c plainCmd) (mediator.Void, error) {
+		}))
+		must(t, mediator.HandleFunc(m, func(ctx context.Context, c plainCmd) (mediator.Void, error) {
 			mu.Lock()
 			h.calls++
 			mu.Unlock()
 			return mediator.Void{}, nil
-		})
-		mediator.HandleFunc(m, func(ctx context.Context, c badCmd) (mediator.Void, error) { return mediator.Void{}, nil })
-		mediator.HandleFunc(m, func(ctx context.Context, q getThing) (thingResult, error) { return thingResult{ID: q.ID}, nil })
+		}))
+		must(t, mediator.HandleFunc(m, func(ctx context.Context, c badCmd) (mediator.Void, error) { return mediator.Void{}, nil }))
+		must(t, mediator.HandleFunc(m, func(ctx context.Context, q getThing) (thingResult, error) { return thingResult{ID: q.ID}, nil }))
 	}, pg.UnitOfWork(h.store, uowCfg), idem)
 	return h
 }
@@ -306,7 +306,7 @@ func TestIdempotency_Outcomes(t *testing.T) {
 func TestIdempotency_RequiresUnitOfWork(t *testing.T) {
 	store := memstore.New(memstore.Config{})
 	m := build(t, func(m *mediator.Mediator) {
-		mediator.HandleFunc(m, func(ctx context.Context, c idemCmd) (thingResult, error) { return thingResult{}, nil })
+		must(t, mediator.HandleFunc(m, func(ctx context.Context, c idemCmd) (thingResult, error) { return thingResult{}, nil }))
 	}, pg.Idempotency(pg.IdempotencyConfig{}))
 	_, err := mediator.Send(context.Background(), m, idemCmd{Key: "k"})
 	if mediator.CodeOf(err) != mediator.CodeInternal || !errors.Is(err, pg.ErrNoUnitOfWork) {

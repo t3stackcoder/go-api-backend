@@ -100,8 +100,8 @@ type embedded struct {
 	mediator.Query[int]
 	Base
 	Hidden     string `json:"-"`
-	unexported int
-	Page       int `json:"page,omitempty" query:"page"`
+	unexported int    //lint:ignore U1000 unexported: BindingsOf must skip it
+	Page       int    `json:"page,omitempty" query:"page"`
 	NoTag      string
 	Empty      string   `json:"e" query:""`
 	Hdr        []string `header:"X-List"`

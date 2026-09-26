@@ -772,6 +772,8 @@ func (w *partitionWorker) process(log *slog.Logger, msgs []redis.XMessage, needC
 				return false
 			}
 			// The operator acknowledged the poison entry: continue.
+		case resContinue:
+			// Move to the next entry.
 		}
 		i++
 	}

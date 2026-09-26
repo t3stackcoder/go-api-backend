@@ -258,7 +258,7 @@ func boundMembersInBody(body []byte, bound map[string]Source) *mediator.Validati
 			if ve == nil {
 				ve = &mediator.ValidationError{}
 			}
-			ve.Add("/"+escapePointer(name), "binding", fmt.Sprintf("is bound from the %s, not the body", src))
+			ve = ve.Add("/"+escapePointer(name), "binding", fmt.Sprintf("is bound from the %s, not the body", src))
 		}
 		if err := dec.SkipValue(); err != nil {
 			break
@@ -323,8 +323,9 @@ func jsonTypeName(t reflect.Type) string {
 		return "object"
 	case reflect.Slice, reflect.Array:
 		return "array"
+	default:
+		return "value"
 	}
-	return "value"
 }
 
 func kindName(k jsontext.Kind) string {
@@ -341,6 +342,7 @@ func kindName(k jsontext.Kind) string {
 		return "object"
 	case '[':
 		return "array"
+	default:
+		return "value"
 	}
-	return "value"
 }

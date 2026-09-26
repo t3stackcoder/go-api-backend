@@ -113,7 +113,7 @@ func (Sleep) Route() httpapi.Route {
 // Requires an authenticated caller, like every request of the service.
 func (Sleep) Requires() authz.Requirement { return authz.Authenticated() }
 
-// NoUnitOfWork: the query touches no data.
+// NoUnitOfWork marks the query as touching no data.
 func (Sleep) NoUnitOfWork() {}
 
 // Timeout allows the full minute the validation permits.

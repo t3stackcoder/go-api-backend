@@ -54,8 +54,7 @@ func isOpaque(t reflect.Type) bool {
 	case timeType, uuidType, rawType:
 		return true
 	}
-	switch t.Kind() {
-	case reflect.Interface, reflect.Bool:
+	if k := t.Kind(); k == reflect.Interface || k == reflect.Bool {
 		return true
 	}
 	return isJSONMarshaler(t) || (t.Kind() != reflect.String && isTextMarshaler(t))
@@ -637,8 +636,9 @@ func isScalar(t reflect.Type) bool {
 		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
 		reflect.Float32, reflect.Float64:
 		return true
+	default:
+		return false
 	}
-	return false
 }
 
 func (c *compiler) mapChecker(own []rule, t reflect.Type, where string, el checker) checker {

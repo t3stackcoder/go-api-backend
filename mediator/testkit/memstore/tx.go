@@ -58,6 +58,8 @@ func (t *Tx) check(ctx context.Context, write bool) error {
 		return pg.ErrTxClosed
 	case txAborted:
 		return pg.ErrTxAborted
+	case txOpen:
+		// Statements are allowed; the read-only check follows.
 	}
 	if write && t.opts.ReadOnly {
 		t.state = txAborted
@@ -207,6 +209,8 @@ func (t *Tx) Commit(ctx context.Context) error {
 	case txAborted:
 		t.discard()
 		return pg.ErrTxAborted
+	case txOpen:
+		// Committed below.
 	}
 	if h := t.s.Hooks.BeforeCommit; h != nil {
 		if err := h(); err != nil {
@@ -254,6 +258,8 @@ func (t *Tx) Rollback(ctx context.Context) error {
 	switch t.state {
 	case txCommitted, txRolledBack:
 		return nil
+	case txOpen, txAborted:
+		// Discarded below.
 	}
 	t.discard()
 	if h := t.s.Hooks.Rollback; h != nil {

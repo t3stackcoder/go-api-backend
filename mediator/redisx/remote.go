@@ -191,7 +191,7 @@ func (r *Remote) freshHandlers(ctx context.Context, name string) ([]string, erro
 		return v.nodes, nil
 	}
 	min := strconv.FormatInt(now.Add(-HandlerStaleAfter).UnixMilli(), 10)
-	nodes, err := r.client.ZRangeByScore(ctx, r.keys.Handlers(name), &redis.ZRangeBy{Min: min, Max: "+inf"}).Result()
+	nodes, err := r.client.ZRangeArgs(ctx, redis.ZRangeArgs{Key: r.keys.Handlers(name), Start: min, Stop: "+inf", ByScore: true}).Result()
 	if err != nil {
 		return nil, err
 	}

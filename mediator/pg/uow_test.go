@@ -78,10 +78,18 @@ func build(t *testing.T, register func(m *mediator.Mediator), behaviors ...media
 
 func uow(store pg.Store) mediator.Behavior { return pg.UnitOfWork(store, pg.UnitOfWorkConfig{}) }
 
+// must fails the test when a registration returns an error.
+func must(t testing.TB, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestUnitOfWork_CommitsAndNotifiesOncePerPartition(t *testing.T) {
 	store := memstore.New(memstore.Config{Partitions: 3})
 	m := build(t, func(m *mediator.Mediator) {
-		mediator.HandleFunc(m, func(ctx context.Context, c createThing) (thingResult, error) {
+		must(t, mediator.HandleFunc(m, func(ctx context.Context, c createThing) (thingResult, error) {
 			if _, ok := pg.StoreTxFrom(ctx); !ok {
 				t.Error("no store tx in handler context")
 			}
@@ -94,7 +102,7 @@ func TestUnitOfWork_CommitsAndNotifiesOncePerPartition(t *testing.T) {
 				}
 			}
 			return thingResult{ID: c.Name}, nil
-		})
+		}))
 	}, uow(store))
 	res, err := mediator.Send(context.Background(), m, createThing{Name: "a"})
 	if err != nil || res.ID != "a" {
@@ -117,12 +125,12 @@ func TestUnitOfWork_RollsBackOnError(t *testing.T) {
 	store := memstore.New(memstore.Config{})
 	boom := errors.New("boom")
 	m := build(t, func(m *mediator.Mediator) {
-		mediator.HandleFunc(m, func(ctx context.Context, c createThing) (thingResult, error) {
+		must(t, mediator.HandleFunc(m, func(ctx context.Context, c createThing) (thingResult, error) {
 			if err := mediator.Publish(ctx, m, thingCreated{ID: c.Name}); err != nil {
 				return thingResult{}, err
 			}
 			return thingResult{}, boom
-		})
+		}))
 	}, uow(store))
 	if _, err := mediator.Send(context.Background(), m, createThing{Name: "a"}); !errors.Is(err, boom) {
 		t.Fatalf("want boom, got %v", err)
@@ -135,10 +143,10 @@ func TestUnitOfWork_RollsBackOnError(t *testing.T) {
 func TestUnitOfWork_RollsBackOnPanic(t *testing.T) {
 	store := memstore.New(memstore.Config{})
 	m := build(t, func(m *mediator.Mediator) {
-		mediator.HandleFunc(m, func(ctx context.Context, c createThing) (thingResult, error) {
+		must(t, mediator.HandleFunc(m, func(ctx context.Context, c createThing) (thingResult, error) {
 			_ = mediator.Publish(ctx, m, thingCreated{ID: c.Name})
 			panic("handler exploded")
-		})
+		}))
 	}, uow(store))
 	_, err := mediator.Send(context.Background(), m, createThing{Name: "a"})
 	var pe *mediator.PanicError
@@ -154,7 +162,7 @@ func TestUnitOfWork_JoinsAmbientTransaction(t *testing.T) {
 	store := memstore.New(memstore.Config{})
 	var outerTx, innerTx pg.Tx
 	m := build(t, func(m *mediator.Mediator) {
-		mediator.HandleFunc(m, func(ctx context.Context, c createThing) (thingResult, error) {
+		must(t, mediator.HandleFunc(m, func(ctx context.Context, c createThing) (thingResult, error) {
 			outerTx, _ = pg.StoreTxFrom(ctx)
 			if _, err := mediator.Send(ctx, m, getThing{ID: c.Name}); err != nil {
 				return thingResult{}, err
@@ -163,18 +171,18 @@ func TestUnitOfWork_JoinsAmbientTransaction(t *testing.T) {
 				return thingResult{}, err
 			}
 			return thingResult{ID: c.Name}, nil
-		})
-		mediator.HandleFunc(m, func(ctx context.Context, q getThing) (thingResult, error) {
+		}))
+		must(t, mediator.HandleFunc(m, func(ctx context.Context, q getThing) (thingResult, error) {
 			innerTx, _ = pg.StoreTxFrom(ctx)
 			return thingResult{ID: q.ID}, nil
-		})
-		mediator.HandleFunc(m, func(ctx context.Context, _ requiresNewCmd) (mediator.Void, error) {
+		}))
+		must(t, mediator.HandleFunc(m, func(ctx context.Context, _ requiresNewCmd) (mediator.Void, error) {
 			tx, _ := pg.StoreTxFrom(ctx)
 			if tx == outerTx {
 				t.Error("RequiresNew must not join the ambient transaction")
 			}
 			return mediator.Void{}, nil
-		})
+		}))
 	}, uow(store))
 	if _, err := mediator.Send(context.Background(), m, createThing{Name: "a"}); err != nil {
 		t.Fatal(err)
@@ -190,15 +198,15 @@ func TestUnitOfWork_JoinsAmbientTransaction(t *testing.T) {
 func TestUnitOfWork_DefaultsByKind(t *testing.T) {
 	store := memstore.New(memstore.Config{})
 	m := build(t, func(m *mediator.Mediator) {
-		mediator.HandleFunc(m, func(ctx context.Context, c createThing) (thingResult, error) { return thingResult{}, nil })
-		mediator.HandleFunc(m, func(ctx context.Context, q getThing) (thingResult, error) {
+		must(t, mediator.HandleFunc(m, func(ctx context.Context, c createThing) (thingResult, error) { return thingResult{}, nil }))
+		must(t, mediator.HandleFunc(m, func(ctx context.Context, q getThing) (thingResult, error) {
 			return thingResult{}, mediator.Publish(ctx, m, thingCreated{ID: "x"})
-		})
-		mediator.HandleStreamFunc(m, func(ctx context.Context, q listThings) iter.Seq2[int, error] {
+		}))
+		must(t, mediator.HandleStreamFunc(m, func(ctx context.Context, q listThings) iter.Seq2[int, error] {
 			return func(yield func(int, error) bool) { yield(1, nil) }
-		})
-		mediator.HandleFunc(m, func(ctx context.Context, _ serializableCmd) (mediator.Void, error) { return mediator.Void{}, nil })
-		mediator.ConsumeFunc(m, "g", func(ctx context.Context, e thingCreated) error { return nil })
+		}))
+		must(t, mediator.HandleFunc(m, func(ctx context.Context, _ serializableCmd) (mediator.Void, error) { return mediator.Void{}, nil }))
+		must(t, mediator.ConsumeFunc(m, "g", func(ctx context.Context, e thingCreated) error { return nil }))
 	}, pg.UnitOfWork(store, pg.UnitOfWorkConfig{DefaultLockTimeout: 7 * time.Second}))
 	ctx := context.Background()
 	if _, err := mediator.Send(ctx, m, createThing{}); err != nil {
@@ -261,7 +269,7 @@ func TestUnitOfWork_HooksOrder(t *testing.T) {
 	store := memstore.New(memstore.Config{})
 	var log []string
 	m := build(t, func(m *mediator.Mediator) {
-		mediator.HandleFunc(m, func(ctx context.Context, c createThing) (thingResult, error) {
+		must(t, mediator.HandleFunc(m, func(ctx context.Context, c createThing) (thingResult, error) {
 			pg.BeforeCommit(ctx, func(context.Context) error {
 				log = append(log, "before1")
 				return nil
@@ -285,7 +293,7 @@ func TestUnitOfWork_HooksOrder(t *testing.T) {
 				log = append(log, "after2")
 			})
 			return thingResult{}, nil
-		})
+		}))
 	}, uow(store))
 	if _, err := mediator.Send(context.Background(), m, createThing{}); err != nil {
 		t.Fatal(err)
@@ -301,11 +309,11 @@ func TestUnitOfWork_BeforeCommitErrorRollsBack(t *testing.T) {
 	veto := errors.New("veto")
 	afterRan := false
 	m := build(t, func(m *mediator.Mediator) {
-		mediator.HandleFunc(m, func(ctx context.Context, c createThing) (thingResult, error) {
+		must(t, mediator.HandleFunc(m, func(ctx context.Context, c createThing) (thingResult, error) {
 			pg.OnCommit(ctx, func(context.Context) { afterRan = true })
 			pg.BeforeCommit(ctx, func(context.Context) error { return veto })
 			return thingResult{}, nil
-		})
+		}))
 	}, uow(store))
 	if _, err := mediator.Send(context.Background(), m, createThing{}); !errors.Is(err, veto) {
 		t.Fatalf("want veto, got %v", err)
@@ -333,10 +341,10 @@ func TestUnitOfWork_CommitFailureClassification(t *testing.T) {
 			store.Hooks = tc.hooks
 			afterRan := false
 			m := build(t, func(m *mediator.Mediator) {
-				mediator.HandleFunc(m, func(ctx context.Context, c createThing) (thingResult, error) {
+				must(t, mediator.HandleFunc(m, func(ctx context.Context, c createThing) (thingResult, error) {
 					pg.OnCommit(ctx, func(context.Context) { afterRan = true })
 					return thingResult{}, nil
-				})
+				}))
 			}, uow(store))
 			_, err := mediator.Send(context.Background(), m, createThing{})
 			if err == nil {
@@ -373,7 +381,7 @@ func TestIsDefiniteCommitFailure(t *testing.T) {
 func TestUnitOfWork_BeginError(t *testing.T) {
 	store := memstore.New(memstore.Config{})
 	m := build(t, func(m *mediator.Mediator) {
-		mediator.HandleFunc(m, func(ctx context.Context, c createThing) (thingResult, error) { return thingResult{}, nil })
+		must(t, mediator.HandleFunc(m, func(ctx context.Context, c createThing) (thingResult, error) { return thingResult{}, nil }))
 	}, uow(store))
 	store.Hooks.Begin = func(pg.TxOptions) error { return errors.New("pool exhausted") }
 	if _, err := mediator.Send(context.Background(), m, createThing{}); err == nil || mediator.CodeOf(err) != mediator.CodeInternal {
@@ -392,7 +400,7 @@ func TestUnitOfWork_Stream(t *testing.T) {
 	store := memstore.New(memstore.Config{})
 	failAt := 0
 	m := build(t, func(m *mediator.Mediator) {
-		mediator.HandleStreamFunc(m, func(ctx context.Context, q listThings) iter.Seq2[int, error] {
+		must(t, mediator.HandleStreamFunc(m, func(ctx context.Context, q listThings) iter.Seq2[int, error] {
 			return func(yield func(int, error) bool) {
 				for i := 1; i <= q.N; i++ {
 					if _, ok := pg.StoreTxFrom(ctx); !ok {
@@ -408,12 +416,12 @@ func TestUnitOfWork_Stream(t *testing.T) {
 					}
 				}
 			}
-		})
-		mediator.HandleFunc(m, func(ctx context.Context, c createThing) (thingResult, error) {
+		}))
+		must(t, mediator.HandleFunc(m, func(ctx context.Context, c createThing) (thingResult, error) {
 			for range mediator.Stream(ctx, m, listThings{N: 2}) {
 			}
 			return thingResult{}, nil
-		})
+		}))
 	}, uow(store))
 	ctx := context.Background()
 

@@ -249,7 +249,7 @@ func TestSend_NestedScope(t *testing.T) {
 	mediator.MustHandle(m, mediator.HandlerFunc[createOrder, createOrderResult](func(ctx context.Context, c createOrder) (createOrderResult, error) {
 		outerCorr = mediator.CorrelationID(ctx)
 		v, err := mediator.Send(ctx, m, getOrder{OrderID: c.CustomerID})
-		return createOrderResult{OrderID: v.OrderID}, err
+		return createOrderResult(v), err
 	}))
 	build(t, m)
 	ctx := mediator.WithCorrelationID(context.Background(), "corr-1")
@@ -482,7 +482,8 @@ func TestNames(t *testing.T) {
 }
 
 func TestPartition_Deterministic(t *testing.T) {
-	if mediator.Partition("k", 16) != mediator.Partition("k", 16) {
+	first, again := mediator.Partition("k", 16), mediator.Partition("k", 16)
+	if first != again {
 		t.Fatal("unstable")
 	}
 	if mediator.Partition("k", 1) != 0 || mediator.Partition("k", 0) != 0 {

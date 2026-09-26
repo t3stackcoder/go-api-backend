@@ -54,7 +54,7 @@ func readyChecks(pool *pgxpool.Pool, client *redis.Client, cfg redisx.Config, to
 	}
 }
 
-// stdinEOF returns a context that is also cancelled when standard input
+// stdinEOF returns a context that is also canceled when standard input
 // reaches end of file. Windows cannot deliver SIGTERM to a child process,
 // so integration tests start the service with SHUTDOWN_ON_STDIN_EOF=1 and
 // close its stdin to request the same graceful shutdown a SIGTERM triggers

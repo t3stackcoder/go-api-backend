@@ -24,7 +24,12 @@ linters:
     - bodyclose
   settings:
     errcheck:
-      check-type-assertions: true
+      # Type assertions stay unchecked (the errcheck default, and all spec
+      # 11.1 asks for): the registry and the trait flags guarantee the dynamic
+      # type at every `req.(Q)` adapter and `reflect.Zero(t).Interface().(Trait)`
+      # site, so a failed assertion is a programming error that must panic
+      # rather than grow an unreachable branch.
+      check-type-assertions: false
       check-blank: false
     exhaustive:
       # A switch with a default clause is considered exhaustive.

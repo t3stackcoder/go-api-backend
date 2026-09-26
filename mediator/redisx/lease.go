@@ -348,7 +348,7 @@ func (lm *leaseManager) rebalance(ctx context.Context) {
 					candidates = append(candidates, p)
 				}
 			}
-			rand.Shuffle(len(candidates), func(i, j int) { candidates[i], candidates[j] = candidates[j], candidates[i] })
+			rand.Shuffle(len(candidates), func(i, j int) { candidates[i], candidates[j] = candidates[j], candidates[i] }) //nolint:gosec // G404: spreads nodes over free partitions, not security-sensitive
 			have := len(mine)
 			for _, p := range candidates {
 				if have >= desired || ctx.Err() != nil {

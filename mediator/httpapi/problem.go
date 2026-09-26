@@ -160,7 +160,7 @@ func writeProblem(w http.ResponseWriter, p Problem, retryAfter int) {
 		h.Set(headerCorrelation, p.CorrelationID)
 	}
 	w.WriteHeader(p.Status)
-	_, _ = w.Write(b)
+	_, _ = w.Write(b) //nolint:gosec // G705: b is JSON from marshalProblem, served as application/problem+json, never as HTML
 }
 
 // retryAfterSeconds returns the Retry-After value for err, or 0 when the

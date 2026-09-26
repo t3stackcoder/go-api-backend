@@ -242,13 +242,13 @@ func TestToPorcupine(t *testing.T) {
 	if len(all) != 4 {
 		t.Fatalf("got %d operations, want 4", len(all))
 	}
-	if all[1].Return != math.MaxInt64 || all[1].Output.(Output).Type != TypeInfo {
+	if out, ok := all[1].Output.(Output); !ok || all[1].Return != math.MaxInt64 || out.Type != TypeInfo {
 		t.Fatalf("info op: %+v", all[1])
 	}
 	if all[3].Return != math.MaxInt64 || all[3].Call != 40 {
 		t.Fatalf("open invoke: %+v", all[3])
 	}
-	if all[0].Input.(Input).Value != int64(1) || all[0].ClientId != 0 || all[0].Call != 10 || all[0].Return != 20 {
+	if in, ok := all[0].Input.(Input); !ok || in.Value != int64(1) || all[0].ClientId != 0 || all[0].Call != 10 || all[0].Return != 20 {
 		t.Fatalf("set op: %+v", all[0])
 	}
 	dropped := ToPorcupine(ops, DropFails)

@@ -16,16 +16,6 @@ import (
 	"github.com/t3stackcoder/go-api-backend/mediator/testkit/memstore"
 )
 
-type relayEvent struct {
-	mediator.Event
-	ID string `json:"id"`
-	N  int    `json:"n"`
-	T  string `json:"-"`
-}
-
-func (e relayEvent) StreamKey() string { return e.ID }
-func (e relayEvent) Topic() string     { return e.T }
-
 // publish appends n durable events per key through the real write path.
 func publish(t *testing.T, store pg.Store, topic string, keys []string, n int) {
 	t.Helper()

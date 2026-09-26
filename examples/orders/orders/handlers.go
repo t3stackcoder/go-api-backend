@@ -233,7 +233,7 @@ GROUP BY o.id ORDER BY o.created_at DESC, o.id DESC LIMIT $2 OFFSET $3`, q.Custo
 }
 
 // watchOrder tails order_events for one order with short reads on the
-// querier every poll interval, honouring ctx, and ends after the submitted
+// querier every poll interval, honoring ctx, and ends after the submitted
 // event (or at once when the order is already submitted and nothing is left
 // to replay).
 func (s *service) watchOrder(ctx context.Context, q WatchOrder) iter.Seq2[OrderEvent, error] {

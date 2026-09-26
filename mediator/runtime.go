@@ -77,9 +77,14 @@ func (r *Runtime) Run(ctx context.Context) error {
 		}{fmt.Sprintf("extra_%d", i), e})
 	}
 
-	var all []*running
+	// failure is the first component to fail or exit early; its run is
+	// remembered so the drain below does not report the same error twice.
+	type failure struct {
+		run *running
+		err error
+	}
 	var byStage [][]*running
-	failed := make(chan error, 16)
+	failed := make(chan failure, 16)
 	var wg sync.WaitGroup
 	for _, stage := range stages {
 		var rs []*running
@@ -89,7 +94,6 @@ func (r *Runtime) Run(ctx context.Context) error {
 			}
 			cctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 			run := &running{name: s.name, c: s.c, cancel: cancel, done: make(chan error, 1)}
-			all = append(all, run)
 			rs = append(rs, run)
 			wg.Add(1)
 			go func() {
@@ -98,32 +102,32 @@ func (r *Runtime) Run(ctx context.Context) error {
 					if v := recover(); v != nil {
 						err := fmt.Errorf("component %s: %w", run.name, recovered(v))
 						run.done <- err
-						failed <- err
+						failed <- failure{run, err}
 					}
 				}()
 				err := run.c.Run(cctx)
 				run.done <- err
 				if err != nil && cctx.Err() == nil {
-					failed <- fmt.Errorf("component %s: %w", run.name, err)
+					failed <- failure{run, fmt.Errorf("component %s: %w", run.name, err)}
 				} else if err == nil && cctx.Err() == nil {
-					failed <- fmt.Errorf("component %s exited early", run.name)
+					failed <- failure{run, fmt.Errorf("component %s exited early", run.name)}
 				}
 			}()
 		}
 		byStage = append(byStage, rs)
 	}
 
-	var cause error
+	var cause failure
 	select {
 	case <-ctx.Done():
 		logger.Info("shutdown requested")
 	case cause = <-failed:
-		logger.Error("component failed; shutting down", "error", cause)
+		logger.Error("component failed; shutting down", "error", cause.err)
 	}
 
 	var errs []error
-	if cause != nil {
-		errs = append(errs, cause)
+	if cause.err != nil {
+		errs = append(errs, cause.err)
 	}
 	for _, stage := range byStage {
 		for _, run := range stage {
@@ -133,7 +137,8 @@ func (r *Runtime) Run(ctx context.Context) error {
 		for _, run := range stage {
 			select {
 			case err := <-run.done:
-				if err != nil && !errors.Is(err, context.Canceled) {
+				// The component that triggered the shutdown is already in errs as the cause.
+				if err != nil && run != cause.run && !errors.Is(err, context.Canceled) {
 					errs = append(errs, fmt.Errorf("component %s: %w", run.name, err))
 				}
 				logger.Info("component stopped", "component", run.name)
@@ -153,7 +158,6 @@ func (r *Runtime) Run(ctx context.Context) error {
 		}
 	}
 	// Do not wait for components that ignored cancellation; they were reported.
-	_ = all
 	go wg.Wait()
 	return errors.Join(errs...)
 }

@@ -160,6 +160,9 @@ func TestRuntime_ComponentFailureStopsEverything(t *testing.T) {
 		}
 		err := rt.Run(context.Background())
 		wantContains(t, err, "component consumers: lease lost", "component relay: flush failed")
+		if n := strings.Count(err.Error(), "lease lost"); n != 1 {
+			t.Fatalf("the cause must be reported once, got %d: %v", n, err)
+		}
 		if strings.Contains(err.Error(), "http") || strings.Contains(err.Error(), "janitor") {
 			t.Fatalf("clean stops must not be reported: %v", err)
 		}
@@ -193,6 +196,9 @@ func TestRuntime_EarlyExitAndPanic(t *testing.T) {
 		}
 		err := rt.Run(context.Background())
 		wantContains(t, err, "component remote_server:", "boom in remote")
+		if n := strings.Count(err.Error(), "boom in remote"); n != 1 {
+			t.Fatalf("the panic must be reported once, got %d: %v", n, err)
+		}
 		var pe *mediator.PanicError
 		if !errors.As(err, &pe) {
 			t.Fatalf("want PanicError in %v", err)

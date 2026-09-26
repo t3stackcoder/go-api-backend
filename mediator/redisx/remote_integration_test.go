@@ -487,7 +487,7 @@ func TestRemote_KeyedRequestSurvivesServerCrash(t *testing.T) {
 	s3cfg := cfg
 	s3cfg.NodeID = "s3"
 	s3 := NewRemoteServer(serverM, client, s3cfg, withServerHook(func(stage, call string) bool {
-		return !(stage == "executed" && crashed.CompareAndSwap(false, true))
+		return stage != "executed" || !crashed.CompareAndSwap(false, true)
 	}))
 	startComponent(t, s3)
 	before := executions.Load()

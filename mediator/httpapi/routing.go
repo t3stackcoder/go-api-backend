@@ -60,8 +60,10 @@ func RouteOf(info *mediator.RequestInfo) Route {
 		return Route{Method: http.MethodGet, Path: path}
 	case mediator.KindStream:
 		return Route{Method: http.MethodGet, Path: path}
+	default:
+		// Notifications and consumers are not exposed over HTTP.
+		return Route{}
 	}
-	return Route{}
 }
 
 func allScalar(bindings []Binding) bool {
@@ -217,6 +219,8 @@ func collectBindings(t reflect.Type, index []int, visiting map[reflect.Type]bool
 				*errs = append(*errs, fmt.Errorf("httpapi: %s.%s is bound from the %s but %s is not a scalar or a slice of scalars", t, f.Name, b.Source, f.Type))
 				continue
 			}
+		case SourceBody:
+			// Any JSON-decodable type.
 		}
 		*out = append(*out, b)
 	}
@@ -259,8 +263,9 @@ func isScalar(t reflect.Type) bool {
 		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
 		reflect.Float32, reflect.Float64:
 		return true
+	default:
+		return false
 	}
-	return false
 }
 
 // isScalarOrSlice also accepts slices of scalars, except []byte, which JSON
@@ -399,6 +404,8 @@ func routeFor(info *mediator.RequestInfo, prefix string) (*route, error) {
 			pathBound = append(pathBound, b.Name)
 		case SourceBody:
 			bodyBound = append(bodyBound, b.Field.Name)
+		case SourceQuery, SourceHeader:
+			// Neither the pattern nor the method constrains these.
 		}
 	}
 	for _, p := range params {

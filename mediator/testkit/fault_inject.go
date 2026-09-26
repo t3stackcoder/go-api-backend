@@ -117,7 +117,7 @@ func Hits() map[string]int {
 }
 
 // Observed returns every point name reached since process start, so the
-// sweep can prove each catalogued point was exercised.
+// sweep can prove each cataloged point was exercised.
 func Observed() []string {
 	hitMu.Lock()
 	defer hitMu.Unlock()
@@ -213,6 +213,8 @@ func FaultAfter(ctx context.Context, point string) error {
 		}
 		fmt.Fprintf(os.Stderr, "testkit: injected crash at %s\n", point)
 		os.Exit(137)
+	case FaultError, FaultPermanent, FaultTimeout, FaultDelay, FaultCancel:
+		// These act in Fault, before the operation; nothing is armed here.
 	}
 	return nil
 }

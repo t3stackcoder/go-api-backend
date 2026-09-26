@@ -66,7 +66,7 @@ func (p Policy) Delay(attempt int, rnd *rand.Rand) time.Duration {
 		n++ // inclusive upper bound; at MaxInt64 the bound itself is excluded
 	}
 	if rnd == nil {
-		return time.Duration(rand.Int64N(n))
+		return time.Duration(rand.Int64N(n)) //nolint:gosec // G404: retry jitter is not security-sensitive
 	}
 	return time.Duration(rnd.Int64N(n))
 }

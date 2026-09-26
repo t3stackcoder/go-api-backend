@@ -331,7 +331,7 @@ func TestDebugRequests(t *testing.T) {
 	ctx, cancel := context.WithCancel(principal())
 	cancel()
 	if _, err := mediator.Send(ctx, m, orders.Sleep{Millis: 5000}); mediator.CodeOf(err) != mediator.CodeTimeout {
-		t.Errorf("cancelled sleep: %v", err)
+		t.Errorf("canceled sleep: %v", err)
 	}
 	srv, err := httpapi.New(m, httpapi.Config{})
 	if err != nil {

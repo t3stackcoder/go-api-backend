@@ -43,7 +43,7 @@ func bindParams(req any, rt *route, r *http.Request) error {
 			if ve == nil {
 				ve = &mediator.ValidationError{}
 			}
-			ve.Add("/"+escapePointer(b.JSONName), "type", err.Error())
+			ve = ve.Add("/"+escapePointer(b.JSONName), "type", err.Error())
 		}
 	}
 	if ve == nil {

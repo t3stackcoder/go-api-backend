@@ -96,6 +96,12 @@ func isAlnumOrHyphen(c byte) bool {
 	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-'
 }
 
+// isDotAtomText reports whether ch may appear in an unquoted local part:
+// RFC 5322 atext plus the dot that separates atoms.
+func isDotAtomText(ch rune) bool {
+	return ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' || strings.ContainsRune(".!#$%&'*+-/=?^_`{|}~", ch)
+}
+
 // isEmail accepts local@domain where the local part is a dot-atom or a
 // quoted string of at most 64 characters and the domain is a host name or a
 // bracketed IP literal; the whole address is at most 254 characters.
@@ -120,7 +126,7 @@ func isEmail(s string) bool {
 			return false
 		}
 		for _, ch := range local {
-			if !(ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' || strings.ContainsRune(".!#$%&'*+-/=?^_`{|}~", ch)) {
+			if !isDotAtomText(ch) {
 				return false
 			}
 		}

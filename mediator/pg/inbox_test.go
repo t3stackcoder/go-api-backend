@@ -16,13 +16,13 @@ func TestInbox_SkipsDuplicates(t *testing.T) {
 	calls := 0
 	var fail error
 	m := build(t, func(m *mediator.Mediator) {
-		mediator.ConsumeFunc(m, "proj", func(ctx context.Context, e thingCreated) error {
+		must(t, mediator.ConsumeFunc(m, "proj", func(ctx context.Context, e thingCreated) error {
 			calls++
 			if _, ok := pg.StoreTxFrom(ctx); !ok {
 				t.Error("handler must run inside the unit of work")
 			}
 			return fail
-		})
+		}))
 	}, uow(store), pg.Inbox())
 	ctx := context.Background()
 	env := mediator.Envelope{ID: mediator.NewID(time.Now()), Type: "thingCreated", Topic: "thingCreated", StreamKey: "o1"}

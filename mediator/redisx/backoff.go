@@ -40,7 +40,7 @@ func (b backoff) jittered(retry int) time.Duration {
 	if d <= 0 {
 		return 0
 	}
-	f := 0.9 + rand.Float64()*0.2
+	f := 0.9 + rand.Float64()*0.2 //nolint:gosec // G404: retry jitter is not security-sensitive
 	return time.Duration(float64(d) * f)
 }
 

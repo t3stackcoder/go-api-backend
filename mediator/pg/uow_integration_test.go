@@ -38,7 +38,7 @@ func newG8(t *testing.T, uowCfg pg.UnitOfWorkConfig) (*g8Harness, *pg.PgStore) {
 	store := pg.NewStore(pool, pg.StoreConfig{Partitions: 2})
 	h := &g8Harness{hold: 300 * time.Millisecond}
 	h.m = build(t, func(m *mediator.Mediator) {
-		mediator.HandleFunc(m, func(ctx context.Context, c counterCmd) (thingResult, error) {
+		must(t, mediator.HandleFunc(m, func(ctx context.Context, c counterCmd) (thingResult, error) {
 			n := h.calls.Add(1)
 			tx, ok := pg.TxFrom(ctx)
 			if !ok {
@@ -49,7 +49,7 @@ func newG8(t *testing.T, uowCfg pg.UnitOfWorkConfig) (*g8Harness, *pg.PgStore) {
 			}
 			time.Sleep(h.hold)
 			return thingResult{ID: c.Name}, nil
-		})
+		}))
 	}, pg.UnitOfWork(store, uowCfg), pg.Idempotency(pg.IdempotencyConfig{}))
 	return h, store
 }
@@ -134,7 +134,7 @@ func TestIntegration_NotifyOnCommit(t *testing.T) {
 	store := pg.NewStore(pool, pg.StoreConfig{Partitions: 1})
 	fail := false
 	m := build(t, func(m *mediator.Mediator) {
-		mediator.HandleFunc(m, func(ctx context.Context, c createThing) (thingResult, error) {
+		must(t, mediator.HandleFunc(m, func(ctx context.Context, c createThing) (thingResult, error) {
 			for i := 0; i < 3; i++ {
 				if err := mediator.Publish(ctx, m, thingCreated{ID: c.Name}); err != nil {
 					return thingResult{}, err
@@ -144,7 +144,7 @@ func TestIntegration_NotifyOnCommit(t *testing.T) {
 				return thingResult{}, errors.New("boom")
 			}
 			return thingResult{ID: c.Name}, nil
-		})
+		}))
 	}, uow(store))
 	pc, err := pool.Acquire(ctx)
 	if err != nil {

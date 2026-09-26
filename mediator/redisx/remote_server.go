@@ -48,6 +48,8 @@ func WithServerClock(c testkit.Clock) RemoteServerOption {
 }
 
 // withHeartbeat overrides the heartbeat interval (tests).
+//
+//lint:ignore U1000 used by the integration && faultinject tests only
 func withHeartbeat(d time.Duration) RemoteServerOption {
 	return func(s *RemoteServer) {
 		if d > 0 {
@@ -59,6 +61,8 @@ func withHeartbeat(d time.Duration) RemoteServerOption {
 // withServerHook installs a test hook called with the stage ("read",
 // "executed", "replied") and call ID of every request; returning false
 // abandons the request at that stage, which simulates a crash.
+//
+//lint:ignore U1000 used by the integration tests only
 func withServerHook(h func(stage, call string) bool) RemoteServerOption {
 	return func(s *RemoteServer) { s.hook = h }
 }

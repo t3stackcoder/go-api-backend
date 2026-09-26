@@ -25,7 +25,7 @@ func TestCacheEntry_RoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", entry, err)
 		}
-		if !reflect.DeepEqual(vers, c.versions) && !(len(vers) == 0 && len(c.versions) == 0) {
+		if !reflect.DeepEqual(vers, c.versions) && (len(vers) != 0 || len(c.versions) != 0) {
 			t.Errorf("versions = %v, want %v", vers, c.versions)
 		}
 		if string(body) != c.body {

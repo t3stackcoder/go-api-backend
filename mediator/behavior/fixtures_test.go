@@ -343,7 +343,7 @@ func (p metricPoint) matches(want map[string]string) bool {
 func attrMap(set attribute.Set) map[string]string {
 	out := map[string]string{}
 	for _, kv := range set.ToSlice() {
-		out[string(kv.Key)] = kv.Value.Emit()
+		out[string(kv.Key)] = kv.Value.String()
 	}
 	return out
 }
@@ -430,7 +430,7 @@ func spanNames(tel *telemetry) []string {
 func spanAttr(s tracetest.SpanStub, key attribute.Key) (string, bool) {
 	for _, kv := range s.Attributes {
 		if kv.Key == key {
-			return kv.Value.Emit(), true
+			return kv.Value.String(), true
 		}
 	}
 	return "", false

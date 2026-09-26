@@ -17,7 +17,8 @@ func TestInfoCache(t *testing.T) {
 	builds := 0
 	c := infoCache[int]{build: func(i *mediator.RequestInfo) *int { builds++; n := len(i.Name); return &n }}
 	a, b := &mediator.RequestInfo{Name: "aa"}, &mediator.RequestInfo{Name: "bbb"}
-	if *c.get(a) != 2 || *c.get(a) != 2 || builds != 1 {
+	first, again := *c.get(a), *c.get(a)
+	if first != 2 || again != 2 || builds != 1 {
 		t.Fatalf("builds %d", builds)
 	}
 	c.prepare([]*mediator.RequestInfo{a, b})
@@ -190,7 +191,7 @@ type edgeCases struct {
 	Arr     [2]string      `json:"arr"`
 	Embed   *node          `json:"-"`
 	*node
-	skipped int `log:"redact"`
+	skipped int `log:"redact"` //lint:ignore U1000 unexported: the redactor must skip it, asserted below
 }
 
 func TestRedactor_EdgeCases(t *testing.T) {

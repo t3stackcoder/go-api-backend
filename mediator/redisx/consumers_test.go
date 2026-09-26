@@ -40,7 +40,8 @@ func TestConfig_WithDefaults(t *testing.T) {
 	if c.NodeID == "" || !strings.Contains(c.NodeID, "-") {
 		t.Fatalf("node id %q", c.NodeID)
 	}
-	if DefaultNodeID() == DefaultNodeID() {
+	first, again := DefaultNodeID(), DefaultNodeID()
+	if first == again {
 		t.Fatal("node ids should be unique")
 	}
 	custom := Config{Prefix: "x", NodeID: "n", PartitionsPerTopic: 4}.WithDefaults()

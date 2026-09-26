@@ -81,8 +81,9 @@ func (t *Type) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 		}
 		*t = Type(ss)
 		return nil
+	default:
+		return fmt.Errorf("validate: schema type must be a string or an array of strings")
 	}
-	return fmt.Errorf("validate: schema type must be a string or an array of strings")
 }
 
 // Property is one named member schema of an object.
@@ -190,8 +191,9 @@ func (a *AdditionalProperties) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 		}
 		*a = AdditionalProperties{Schema: s}
 		return nil
+	default:
+		return fmt.Errorf("validate: additionalProperties must be a boolean or a schema")
 	}
-	return fmt.Errorf("validate: additionalProperties must be a boolean or a schema")
 }
 
 // Schemer is implemented by types that supply their own JSON Schema instead

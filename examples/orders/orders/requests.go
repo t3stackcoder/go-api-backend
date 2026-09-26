@@ -301,8 +301,8 @@ func (WatchOrder) Route() httpapi.Route {
 // Requires an authenticated caller.
 func (WatchOrder) Requires() authz.Requirement { return authz.Authenticated() }
 
-// NoUnitOfWork: the tail polls live data with short reads outside any
-// transaction, so no repeatable-read snapshot is held open.
+// NoUnitOfWork keeps the tail outside any transaction: it polls live data
+// with short reads, so no repeatable-read snapshot is held open.
 func (WatchOrder) NoUnitOfWork() {}
 
 // Timeout bounds the stream at WatchTimeout instead of the 30 s default.
@@ -374,7 +374,7 @@ func distinctSKUs(lines []OrderLine) error {
 			if ve == nil {
 				ve = &mediator.ValidationError{}
 			}
-			ve.Add("/lines/"+strconv.Itoa(i)+"/sku", "unique", "duplicates the SKU of line "+strconv.Itoa(first))
+			ve = ve.Add("/lines/"+strconv.Itoa(i)+"/sku", "unique", "duplicates the SKU of line "+strconv.Itoa(first))
 			continue
 		}
 		seen[l.SKU] = i

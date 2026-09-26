@@ -283,11 +283,8 @@ func IsTransient(err error) bool {
 		return true
 	}
 	var e *Error
-	if errors.As(err, &e) {
-		switch e.Code {
-		case CodeUnavailable, CodeTimeout:
-			return true
-		}
+	if errors.As(err, &e) && (e.Code == CodeUnavailable || e.Code == CodeTimeout) {
+		return true
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return true

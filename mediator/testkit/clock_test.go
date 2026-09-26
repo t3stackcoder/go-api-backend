@@ -21,7 +21,8 @@ func fired(ch <-chan time.Time) (time.Time, bool) {
 
 func TestFakeClock_NowAndAfter(t *testing.T) {
 	c := testkit.NewFakeClock(start)
-	if !c.Now().Equal(start) || !c.Now().Equal(start) {
+	first, again := c.Now(), c.Now()
+	if !first.Equal(start) || !again.Equal(start) {
 		t.Fatal("frozen")
 	}
 	// Zero and negative durations fire immediately with the current time.

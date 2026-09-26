@@ -376,9 +376,13 @@ type embRoot struct {
 	embHidden
 	embNamed `json:"named"`
 	Field    embBase `json:"field"`
-	hidden   string  `validate:"required"`
+	hidden   string  `validate:"required"` //lint:ignore U1000 unexported: the validator must skip it
 	Skip     string  `json:"-" validate:"required"`
-	Dash     string  `json:"-," validate:"required"`
+	// The "-," form names the member "-" in validate's json/v1-style tag
+	// parser (json/v2 itself rejects it). Both suppressions are needed because
+	// standalone staticcheck honors only lint:ignore and golangci-lint only nolint.
+	//lint:ignore SA5008 "-," names the member "-" in validate's tag parser
+	Dash string `json:"-," validate:"required"` //nolint:staticcheck // SA5008: "-," names the member "-" in validate's tag parser
 }
 
 func TestEmbeddedFlattening(t *testing.T) {

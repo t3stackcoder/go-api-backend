@@ -169,6 +169,9 @@ func TestInference_Compiles(t *testing.T) {
 	var res infResult
 	res, err := mediator.Send(ctx, m, infCreate{ID: "a"})
 	must(err)
+	if res.ID != "a" {
+		t.Fatal(res)
+	}
 	res, err = mediator.Send(ctx, m, &infCreate{ID: "b"})
 	must(err)
 	if res.ID != "b" {
@@ -183,7 +186,7 @@ func TestInference_Compiles(t *testing.T) {
 	_, _ = view, void
 
 	// 4.5 Stream with a value and a pointer yields typed items.
-	var seq iter.Seq2[infView, error] = mediator.Stream(ctx, m, infTail{N: 2})
+	seq := mediator.Stream(ctx, m, infTail{N: 2})
 	n := 0
 	for v, err := range seq {
 		must(err)

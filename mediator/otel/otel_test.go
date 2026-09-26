@@ -82,7 +82,7 @@ func (h *harness) collect(t *testing.T) (map[string]metricdata.Metrics, map[stri
 			add := func(set attribute.Set, p point) {
 				p.attrs = map[string]string{}
 				for _, kv := range set.ToSlice() {
-					p.attrs[string(kv.Key)] = kv.Value.Emit()
+					p.attrs[string(kv.Key)] = kv.Value.String()
 				}
 				pts[m.Name] = append(pts[m.Name], p)
 			}
@@ -158,7 +158,11 @@ func TestInstruments_Complete(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer reg.Unregister()
+	defer func() {
+		if err := reg.Unregister(); err != nil {
+			t.Error(err)
+		}
+	}()
 
 	metrics, _ := h.collect(t)
 	var names []string
@@ -209,7 +213,7 @@ func (failingMeter) Float64Histogram(string, ...metric.Float64HistogramOption) (
 
 func TestConsumersObserver(t *testing.T) {
 	h := newHarness(t)
-	var obs redisx.Observer = motel.NewConsumersObserver(h.inst)
+	obs := motel.NewConsumersObserver(h.inst)
 	obs.LeaseAcquired("g", "t", 0, 7)
 	obs.LeaseAcquired("g", "t", 1, 8)
 	obs.LeaseEnded("g", "t", 0, "released")
