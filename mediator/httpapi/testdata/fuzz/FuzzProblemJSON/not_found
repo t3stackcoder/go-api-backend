@@ -1,0 +1,7 @@
+go test fuzz v1
+string("not_found")
+string("order missing")
+int(0)
+string("orderId")
+int64(0)
+byte('\x00')

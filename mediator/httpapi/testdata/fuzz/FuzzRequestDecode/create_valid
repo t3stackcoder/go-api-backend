@@ -1,0 +1,4 @@
+go test fuzz v1
+[]byte("{\"customerId\":\"c1\",\"lines\":[{\"sku\":\"a\",\"qty\":1}],\"when\":\"2024-01-02T03:04:05Z\"}")
+byte('\x00')
+string("")

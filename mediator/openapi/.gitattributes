@@ -1,0 +1,3 @@
+testdata/golden.json text eol=lf
+schema/*.json text eol=lf
+scalar/*.html text eol=lf

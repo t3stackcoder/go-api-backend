@@ -1,0 +1,11 @@
+/bin/
+/dist/
+/coverage/
+*.out
+*.test
+*.prof
+/test/chaos/runs/
+/.idea/
+/.vscode/
+*.swp
+*.exe

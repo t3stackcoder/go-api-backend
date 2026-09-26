@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{title}}</title>
+  <style>
+    body { margin: 0; }
+    noscript { display: block; padding: 2rem; font-family: system-ui, sans-serif; }
+  </style>
+</head>
+<body>
+  <noscript>
+    This page needs JavaScript to render the API reference.
+    The OpenAPI document is at <a href="./openapi.json">openapi.json</a>.
+  </noscript>
+  <div id="app"></div>
+  <!--
+    The Scalar API reference is loaded from the jsDelivr CDN by the browser;
+    the server embeds only this page. The document URL is relative to this
+    page so the reference works under any mount prefix.
+  -->
+  <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference@1"></script>
+  <script>
+    Scalar.createApiReference('#app', { url: './openapi.json' })
+  </script>
+</body>
+</html>

@@ -1,0 +1,239 @@
+# Design notes: how the implementation maps to spec.md
+
+These notes record the decisions that resolve Go import constraints the spec
+does not spell out, the exact package contracts every package codes against,
+and the places where the implementation deliberately deviates from spec.md.
+Where spec.md and these notes disagree, spec.md wins unless the deviation is
+listed in section 6 below.
+
+## 1. Import graph
+
+Arrows point from importer to imported. No cycles.
+
+```
+retry, ratelimit, authz, testkit           (leaves; import nothing of ours)
+        ^
+mediator (core)  -> authz, retry, ratelimit, google/uuid, otel api
+        ^
+validate         -> mediator (for ValidationError, IsMarker)
+httpapi          -> mediator, authz            (Route type lives here)
+openapi          -> mediator, validate, httpapi (Operation type lives here)
+pg               -> mediator, testkit, pgx
+redisx           -> mediator, pg, testkit, go-redis   (implements pg.StreamSink, pg.StreamTrimmer)
+behavior         -> mediator, validate, pg, redisx, otel
+testkit/memstore -> pg                          (in-memory pg.Store)
+examples, cmd, test/* -> everything
+```
+
+The core detects traits whose types live in leaf packages (`authz.Requirement`,
+`retry.Policy`, `ratelimit.Policy`) and records them in `mediator.Traits`.
+Traits whose types live in packages that import the core (`pg.TxOptions`,
+`httpapi.Route`, `openapi.Operation`) are detected by those packages with
+`RequestInfo.Implements(reflect.TypeFor[pg.TxOptioner]())` at Build.
+
+## 2. Core contracts (package mediator, already implemented)
+
+* `Kind` has five values: command, query, stream, notification, consumer.
+  `Use` scopes default to the three request kinds; `Notifications()` and
+  `Consumers()` add the two event paths; `Everywhere()` selects all.
+* `Behavior.Handle(ctx, req any, info *RequestInfo, next Next)`. On the
+  notification and consumer paths `req` is the event value and the result is
+  always nil. `info.Group` is set on the consumer path.
+* `StreamBehavior` adds `HandleStream(ctx, req, info, next StreamNext) iter.Seq2[any, error]`.
+  Any behavior that derives a cancellable context (Timeout, UnitOfWork,
+  Tracing, Logging, Metrics, Recovery) must implement it, because a plain
+  `Handle` returns before the sequence is iterated.
+* `Preparer.Prepare(infos []*RequestInfo) error` runs at Build for behaviors
+  that validate configuration (Validation compiles tags, Authorization
+  enforces RequireAuthByDefault, Retry checks policies). Errors are joined.
+* `m.OnBuild(func(*Mediator) error)` lets other packages add Build checks
+  (httpapi route validation).
+* `mediator.UnitOfWork` interface (`ReadOnly`, `AppendOutbox`) is what
+  `Publish` uses; `pg` puts its implementation in the context with
+  `mediator.WithUnitOfWork`.
+* `m.Deliver(ctx, group, env, payload)` runs the consumer chain for one
+  delivery. Transports (redisx) call it. `ConsumerStateFrom(ctx).Duplicate`
+  is set by the inbox behavior when the handler was skipped.
+* Core never panics out of `Send`, `Publish`, `Stream`, or `Deliver`; the
+  Recovery behavior adds logging and metrics on top.
+* `mediator.CanonicalJSON` / `CanonicalHash` implement 6.6 hashing.
+* `mediator.Partition(key, P)` is fnv1a64 mod P.
+* `mediator.NewID(now)` is a UUIDv7 without allocations.
+* Behavior name constants live in core (`mediator.NameRecovery` ...);
+  `behavior` re-exports them as `behavior.Recovery` etc.
+* Errors: `*mediator.Error` (code, message, details, cause);
+  `*mediator.ValidationError`; sentinels `ErrHandlerNotFound`,
+  `ErrNoUnitOfWork`, `ErrDurablePublishInQuery`, `ErrAlreadyBuilt`,
+  `ErrNotBuilt`, `ErrDepthExceeded`. `mediator.MarkAmbiguous` /
+  `IsAmbiguous` mark an unknown commit outcome. Drivers add transient
+  classifiers with `mediator.RegisterTransient` from `init`.
+* `mediator.StatusOf(code)` and `Code.Title()` are the HTTP mapping.
+
+## 3. Package contracts for the remaining packages
+
+### 3.1 validate
+
+```go
+type Validator struct{ ... }
+func New(opts ...Option) *Validator
+func (v *Validator) Compile(t reflect.Type) error      // parses every tag in the type graph; all errors joined; unknown rule is an error
+func (v *Validator) Check(ctx context.Context, val any) error // tag rules then Validate(ctx) on nested structs and root; returns *mediator.ValidationError or the error of Validate
+type Schema struct { ... }                               // JSON Schema 2020-12 subset, marshals with json/v2 (use json.Deterministic(true) or ordered fields)
+type Schemas struct { Defs map[string]*Schema }           // component registry; names are Go type names, package-qualified on collision
+type SchemaOptions struct { AllowUnknownFields bool; SkipField func(reflect.StructField) bool; Descriptions bool }
+func (v *Validator) SchemaFor(t reflect.Type, reg *Schemas, opts SchemaOptions) (*Schema, error) // returns the schema, or a $ref "#/components/schemas/<name>" for named struct types registered in reg
+type Schemer interface{ JSONSchema() *Schema }          // a type supplies its own schema
+```
+
+Tag grammar and semantics: spec 5.8 and Appendix B exactly. Marker fields
+(`mediator.IsMarker`) and `json:"-"` fields are skipped. Field paths are JSON
+Pointers from `json` names. Descriptions from `doc:"..."` tags.
+
+### 3.2 pg
+
+Interfaces are in `pg/ports.go` (Store, Tx, IdempotencyRow, OutboxEntry,
+StreamSink, StreamTrimmer, FencingSource, TxOptions, TxOptioner).
+
+```go
+func NewPool(ctx, url string, cfg PoolConfig) (*pgxpool.Pool, error)
+func NewStore(pool *pgxpool.Pool, cfg StoreConfig) *PgStore   // StoreConfig{Partitions int} ; implements Store
+func TxFrom(ctx) (pgx.Tx, bool)          // pgx tx of the ambient unit of work; false with memstore
+func StoreTxFrom(ctx) (Tx, bool)         // the Tx interface of the ambient unit of work
+func WithTx(ctx, store Store, opts TxOptions, f func(ctx) error) error   // same semantics as the behavior, outside the pipeline
+func OnCommit(ctx, hook func(ctx))       // after successful COMMIT, in the owner goroutine, before Send returns; errors/panics logged
+func BeforeCommit(ctx, hook func(ctx) error) // inside the tx just before COMMIT; an error aborts the commit
+func UnitOfWork(store Store, cfg UnitOfWorkConfig) mediator.Behavior   // name mediator.NameUnitOfWork; implements StreamBehavior
+func Idempotency(cfg IdempotencyConfig) mediator.Behavior            // name mediator.NameIdempotency; commands with a key; runs inside UoW
+func Inbox() mediator.Behavior                                         // name mediator.NameInbox; consumer path; runs inside UoW
+func Migrate(ctx, pool) error ; MigrationStatus(ctx, pool) ...
+type Relay struct{...}  func NewRelay(pool, sink StreamSink, cfg RelayConfig) *Relay   // mediator.Component
+type Janitor struct{...} func NewJanitor(pool, cfg JanitorConfig) *Janitor            // mediator.Component; JanitorConfig.Trimmer StreamTrimmer optional
+```
+
+Unit of work rules (6.1): join ambient tx when Propagation is Required; on
+the consumer path the tx is read-write ReadCommitted; a stream's tx opens at
+first iteration and closes when the sequence ends; commit failures with a
+SQLSTATE are definite (not ambiguous), connection-level failures at COMMIT
+are `MarkAmbiguous(Wrap(CodeUnavailable, "commit outcome unknown", err))`.
+Deadline: `SET LOCAL idle_in_transaction_session_timeout` from the request
+deadline when present.
+
+The relay wake-up: `Tx.Notify(ctx, pg.NotifyChannel, topic+":"+partition)`
+is issued inside the transaction (deduplicated per (topic, partition) per
+transaction by the UoW); Postgres delivers it at commit, which is the
+"OnCommit hook" of 6.3 without needing a second connection.
+
+Idempotency scope is `tenant + ":" + info.Name` when the principal has a
+tenant, else `info.Name`. Key sources: `IdempotencyKey()` trait first, then
+`mediator.IdempotencyKeyFrom(ctx)`. Request hash is
+`mediator.CanonicalHash(req)`. Lock timeout SQLSTATE 55P03 maps to
+`CodeIdempotencyBusy` with `Details["retry_after_ms"]`.
+
+### 3.3 redisx
+
+```go
+type Config struct { Addr, Username, Password string; DB int; Prefix string /* "mediator" */; PartitionsPerTopic int; LeaseTTL, LeaseRenew, ClaimMinIdle, ReadBlock time.Duration; ReadBatch, MaxAttempts int; CacheDefaultTTL time.Duration; ReplyStreamMaxLen int64; AssumeNoEviction bool; NodeID string }
+func NewClient(ctx, cfg Config) (*redis.Client, error)
+func CheckEviction(ctx, client) error                       // 7.7 maxmemory-policy check
+type Streams struct{...}; func NewStreams(client, cfg) *Streams   // implements pg.StreamSink and pg.StreamTrimmer; XADD field layout below
+type Consumers struct{...}; func NewConsumers(m *mediator.Mediator, client, cfg Config, fencing pg.FencingSource) *Consumers // mediator.Component; leases, drain rules, DLQ, halted gauge
+type Cache struct{...}; func NewCache(client, cfg) *Cache
+    func (c *Cache) Get(ctx, key string) (body []byte, ok bool, err error)                        // Lua cache_get
+    func (c *Cache) SnapshotTags(ctx, tags []string) (map[string]int64, error)                     // MGET
+    func (c *Cache) Set(ctx, key string, snapshot map[string]int64, body []byte, ttl time.Duration) error // Lua cache_set
+    func (c *Cache) BumpTagsPre(ctx, tags []string) error ; BumpTagsPost(ctx, tags []string) error // INCR each; distinct fault points
+type Limiter struct{...}; func NewLimiter(client, cfg) *Limiter
+    func (l *Limiter) Check(ctx, name, key string, p ratelimit.Policy) (ratelimit.Decision, error) // Lua GCRA with TIME
+type Remote struct{...}; func NewRemote(m, client, cfg) *Remote  // implements mediator.RemoteDispatcher (client side)
+type RemoteServer / ReplyReader                                  // mediator.Component
+func DLQList/DLQRequeue/DLQDrop, LeaseList/LeaseRelease, ConsumerLag                // ops functions used by mediatorctl
+```
+
+Stream entry fields (XADD): `id`, `type`, `topic`, `key`, `seq`,
+`partition`, `at` (RFC3339Nano), `corr`, `cause`, `trace`, `schema`,
+`headers` (JSON object), `payload` (JSON), `outbox_id`. Consumers rebuild
+`mediator.Envelope` from them. Key layout: spec 7.1 with `cfg.Prefix` in
+place of the literal `mediator`.
+
+### 3.4 behavior
+
+```go
+type Config struct {
+    Logger *slog.Logger; Tracer trace.Tracer; Meter metric.Meter; Clock mediator.Clock
+    DefaultTimeout time.Duration   // 30s
+    LogPayloads bool; RequireAuthByDefault bool
+    Validator *validate.Validator  // nil -> validate.New()
+    Store pg.Store                 // nil -> UnitOfWork, Idempotency, Inbox are omitted
+    UnitOfWork pg.UnitOfWorkConfig; Idempotency pg.IdempotencyConfig
+    Cache CacheBackend; CacheTTL time.Duration   // nil -> Cache omitted
+    Limiter RateLimiter; FailClosed bool         // nil -> RateLimit omitted
+}
+type CacheBackend interface { Get; SnapshotTags; Set; BumpTagsPre; BumpTagsPost }   // *redisx.Cache satisfies it
+type RateLimiter interface { Check(ctx, name, key string, p ratelimit.Policy) (ratelimit.Decision, error) }
+type Entry struct { Behavior mediator.Behavior; Options []mediator.UseOption }
+func Standard(cfg Config) []Entry          // default order of 5.1 with scopes
+func UseStandard(m *mediator.Mediator, cfg Config) error
+const Recovery = mediator.NameRecovery ... // re-exported names
+```
+
+Scopes of the standard set: Recovery, Tracing, Logging, Metrics use
+`Everywhere()`; Timeout uses requests and consumers; Authorization,
+RateLimit, Validation, Cache, Retry use requests with trait predicates;
+UnitOfWork uses requests and consumers minus `NoUnitOfWork` types;
+Idempotency uses commands with a key trait or always for commands (it skips
+at run time when no key is present); Inbox uses `Consumers()`.
+
+Cache invalidation for commands is a separate inner behavior named
+`CacheInvalidation`, positioned after Idempotency (inside the unit of work):
+after `next` succeeds it bumps tags pre-commit directly and registers the
+post-commit bump with `pg.OnCommit`. A replayed idempotent command never
+reaches it, which is correct because a replay changes nothing.
+
+### 3.5 httpapi
+
+```go
+type Config struct { Prefix string; MaxBodyBytes int64; AllowUnknownFields bool; Authenticator func(*http.Request) (authz.Principal, error); Logger *slog.Logger; Docs http.Handler /* served at /docs and /openapi.json when set */; ReadyChecks []func(context.Context) error; ReadyMaxLag time.Duration; KeepAlive time.Duration /* SSE, 15s */ }
+func BuildCheck(m *mediator.Mediator) error          // for m.OnBuild: validates Route traits and bindings, all violations at once
+func New(m *mediator.Mediator, cfg Config) (*Server, error) // after Build
+func (s *Server) Handler() http.Handler
+func (s *Server) Routes() []RouteInfo                  // method, path, *RequestInfo, bindings; openapi consumes it
+func RouteOf(info *mediator.RequestInfo) Route         // RPC default or trait
+func BindingsOf(t reflect.Type) ([]Binding, error)     // path/query/header/body per field
+func NewListener(s *Server, addr string, drain time.Duration) *Listener // mediator.Component
+func WriteProblem(w http.ResponseWriter, r *http.Request, err error)
+```
+
+## 4. Test placement
+
+* Unit tests sit beside the code.
+* Integration tests that need containers sit beside the code too, in files
+  named `*_integration_test.go` with `//go:build integration`, each package
+  owning its `TestMain`. `test/integration` holds cross-package scenarios
+  (runtime shutdown, end-to-end example service).
+* `testkit/memstore` is the in-memory `pg.Store`; `pg/storetest` is the
+  conformance suite both implementations pass.
+* The race detector needs cgo; on this Windows machine there is no C
+  compiler, so `-race` runs in CI (Linux). Locally use `go test -count=2 -shuffle=on`.
+
+## 5. Toolchain facts verified on 2026-09-26
+
+* `go 1.27` in go.mod; toolchain go1.27.0 auto-downloads.
+* `encoding/json/v2` and `encoding/json/jsontext` are stable.
+  Differences from v1 that matter: nil slices encode as `[]` and nil maps
+  as `{}`; map key order is unspecified unless `json.Deterministic(true)`;
+  unknown members are rejected only with `json.RejectUnknownMembers(true)`;
+  names are case-sensitive; duplicate names are rejected.
+* `httptest.NewTestServer(t, handler)` (Go 1.27) takes a `testing.TB`.
+* `testing/synctest.Test(t, func(t *testing.T))` is the bubble API.
+
+## 6. Deviations from spec.md
+
+| Spec | Implementation | Why |
+|---|---|---|
+| `testkit.MemStore` | `testkit/memstore.Store` | `pg` imports `testkit` for fault points; the fake must import `pg` for the interfaces, so it lives in a subpackage |
+| Relay wake-up "from an OnCommit hook" | `pg_notify` issued inside the transaction, delivered at commit | Same latency, no second connection, and a rolled-back transaction sends nothing |
+| Cache behavior bumps tags "before COMMIT" | A separate `CacheInvalidation` behavior inside the unit of work | The `Cache` behavior sits outside the unit of work and cannot reach its hooks |
+| Integration tests in `test/integration` only | Package-level `*_integration_test.go` plus `test/integration` for cross-package scenarios | Keeps each package's `TestMain` and containers independent |
+| `Kind` has three values | Five: adds notification and consumer | One pipeline mechanism serves all three paths described in Appendix D |
+| `redisx` never imports `pg` | `redisx` imports `pg` for `OutboxEntry` and the sink interfaces | Avoids duplicating the relay entry type; `pg` still never imports `redisx` |
+| Module path `github.com/OWNER/go-api-backend` | `github.com/t3stackcoder/go-api-backend` | OWNER replaced with the repository owner |

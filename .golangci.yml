@@ -1,0 +1,65 @@
+# golangci-lint v2 configuration (tier 0, spec 11.1): errcheck, gosec and
+# exhaustive on top of the standard set. Runs in CI through the official
+# action and locally through `go run ./tools/task lint` when a golangci-lint
+# built with Go >= go.mod's version is installed.
+version: "2"
+
+run:
+  timeout: 10m
+  tests: true
+
+linters:
+  # standard = errcheck, govet, ineffassign, staticcheck, unused
+  default: standard
+  enable:
+    - errcheck
+    - exhaustive
+    - gosec
+    - govet
+    - staticcheck
+    - ineffassign
+    - unused
+    - misspell
+    - unconvert
+    - bodyclose
+  settings:
+    errcheck:
+      check-type-assertions: true
+      check-blank: false
+    exhaustive:
+      # A switch with a default clause is considered exhaustive.
+      default-signifies-exhaustive: true
+    gosec:
+      excludes:
+        # G115 (integer overflow on conversion) is noisy for counters and
+        # partition arithmetic that are bounded by construction.
+        - G115
+    staticcheck:
+      checks: ["all", "-ST1000", "-ST1003"]
+    misspell:
+      locale: US
+  exclusions:
+    generated: lax
+    presets:
+      - std-error-handling
+      - common-false-positives
+    rules:
+      # Tests may use math/rand, fixed permissions, and unchecked Close.
+      - path: _test\.go
+        linters: [gosec]
+      - path: _test\.go
+        linters: [errcheck]
+        text: "Close|Remove|Setenv"
+      # tools/task builds subprocess commands from its own arguments and
+      # tools/covergate opens files named on the command line by design.
+      - path: ^tools/
+        linters: [gosec]
+        text: "G(204|304|306)"
+      # CLIs read paths from flags.
+      - path: ^cmd/
+        linters: [gosec]
+        text: "G(304|306)"
+
+formatters:
+  enable:
+    - gofmt

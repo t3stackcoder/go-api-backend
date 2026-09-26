@@ -1,0 +1,7 @@
+go test fuzz v1
+string("rate_limited")
+string("slow")
+int(0)
+string("retry_after_ms")
+int64(1500)
+byte('\x00')

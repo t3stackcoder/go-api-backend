@@ -1,0 +1,6 @@
+# Generated fixtures (api/openapi.json, golden files) are diffed byte for
+# byte by the openapi drift check, so every text file is stored and checked
+# out with LF on every platform.
+* text=auto eol=lf
+*.png binary
+*.exe binary

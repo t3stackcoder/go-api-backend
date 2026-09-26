@@ -1,0 +1,12 @@
+[
+  { "name": "pg-node1",    "listen": "0.0.0.0:15432", "upstream": "postgres:5432", "enabled": true },
+  { "name": "pg-node2",    "listen": "0.0.0.0:15433", "upstream": "postgres:5432", "enabled": true },
+  { "name": "pg-node3",    "listen": "0.0.0.0:15434", "upstream": "postgres:5432", "enabled": true },
+  { "name": "pg-node4",    "listen": "0.0.0.0:15435", "upstream": "postgres:5432", "enabled": true },
+  { "name": "pg-node5",    "listen": "0.0.0.0:15436", "upstream": "postgres:5432", "enabled": true },
+  { "name": "redis-node1", "listen": "0.0.0.0:16379", "upstream": "redis:6379",    "enabled": true },
+  { "name": "redis-node2", "listen": "0.0.0.0:16380", "upstream": "redis:6379",    "enabled": true },
+  { "name": "redis-node3", "listen": "0.0.0.0:16381", "upstream": "redis:6379",    "enabled": true },
+  { "name": "redis-node4", "listen": "0.0.0.0:16382", "upstream": "redis:6379",    "enabled": true },
+  { "name": "redis-node5", "listen": "0.0.0.0:16383", "upstream": "redis:6379",    "enabled": true }
+]

@@ -1,0 +1,2 @@
+go test fuzz v1
+string("min=1,dive,dive,unique,oneof=a b c")
