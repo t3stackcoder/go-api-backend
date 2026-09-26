@@ -43,6 +43,11 @@ linters:
       checks: ["all", "-ST1000", "-ST1003"]
     misspell:
       locale: US
+      # spec.md calls Appendix A the "fault point catalogue" and the test that
+      # guards it is TestFaultPointCatalogue; keep that spelling.
+      ignore-rules:
+        - catalogue
+        - catalogued
   exclusions:
     generated: lax
     presets:
