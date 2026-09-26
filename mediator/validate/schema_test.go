@@ -338,9 +338,9 @@ func TestSchemasNaming(t *testing.T) {
 		t.Fatal("foreign entry was overwritten")
 	}
 
-	// Generic names are sanitized.
+	// Generic names are sanitized and their type arguments lose the package.
 	b := mustSchema(t, v, reflect.TypeFor[Box[time.Time]](), reg, SchemaOptions{})
-	jsonEqual(t, b, `{"$ref": "#/components/schemas/Box_time.Time_"}`)
+	jsonEqual(t, b, `{"$ref": "#/components/schemas/Box_Time_"}`)
 
 	// A registry with a user-provided Defs map works, and NameOf misses.
 	reg2 := &Schemas{Defs: map[string]*Schema{}}
@@ -350,6 +350,64 @@ func TestSchemasNaming(t *testing.T) {
 	}
 	if len((&Schemas{}).Names()) != 0 {
 		t.Fatal("empty registry")
+	}
+}
+
+// TestStripTypeArgPackages covers the type argument shapes reflect prints.
+func TestStripTypeArgPackages(t *testing.T) {
+	cases := map[string]string{
+		"Plain": "Plain",
+		"Box[github.com/t3stackcoder/go-api-backend/examples/orders/orders.OrderSummary]": "Box[OrderSummary]",
+		"Box[time.Time]":          "Box[Time]",
+		"Box[string]":             "Box[string]",
+		"Map[string,a/b.X]":       "Map[string,X]",
+		"Map[a/b.K, c/d.V]":       "Map[K, V]",
+		"Box[a/b.Wrapper[a/b.X]]": "Box[Wrapper[X]]",
+		"Box[*a/b.X]":             "Box[*X]",
+		"Box[[]a/b.X]":            "Box[[]X]",
+		"Box[map[string]*a/b.X]":  "Box[map[string]*X]",
+		"Map[a/b.X,[]a/b.Wrapper[*gopkg.in/yaml.v3.Node]]": "Map[X,[]Wrapper[*Node]]",
+		"Box[struct { A int }]":                            "Box[struct { A int }]",
+	}
+	for in, want := range cases {
+		if got := stripTypeArgPackages(in); got != want {
+			t.Errorf("stripTypeArgPackages(%q) = %q, want %q", in, got, want)
+		}
+	}
+	// Through reflect: the generic Box over types of this package and of
+	// package mediator.
+	if got := shortName(reflect.TypeFor[Box[Line]]()); got != "Box_Line_" {
+		t.Errorf("shortName = %q", got)
+	}
+	if got := shortName(reflect.TypeFor[Box[*mediator.Void]]()); got != "Box__Void_" {
+		t.Errorf("shortName = %q", got)
+	}
+	if got := shortName(reflect.TypeFor[Box[[]Box[Line]]]()); got != "Box___Box_Line__" {
+		t.Errorf("shortName = %q", got)
+	}
+	if got := qualifiedName(reflect.TypeFor[Box[Line]]()); got != "validate.Box_Line_" {
+		t.Errorf("qualifiedName = %q", got)
+	}
+}
+
+// TestSchemasNamingGenericCollision: two instantiations whose arguments
+// share a short name collide and are told apart by the qualified name and
+// the counter, and every $ref handed out follows the rename.
+func TestSchemasNamingGenericCollision(t *testing.T) {
+	v := New()
+	reg := &Schemas{}
+	first := mustSchema(t, v, reflect.TypeFor[Box[mediator.Void]](), reg, SchemaOptions{})
+	jsonEqual(t, first, `{"$ref": "#/components/schemas/Box_Void_"}`)
+	stub, _ := v.SchemaFor(reflect.TypeFor[Box[mediator.Void]](), reg, SchemaOptions{})
+	second := mustSchema(t, v, reflect.TypeFor[Box[Void]](), reg, SchemaOptions{})
+	jsonEqual(t, second, `{"$ref": "#/components/schemas/validate.Box_Void__2"}`)
+	if stub.Ref != "#/components/schemas/validate.Box_Void_" {
+		t.Fatalf("earlier $ref was not renamed: %s", stub.Ref)
+	}
+	// The two Void argument types collide too and are qualified in turn.
+	want := []string{"mediator.Void", "validate.Box_Void_", "validate.Box_Void__2", "validate.Void"}
+	if names := reg.Names(); !reflect.DeepEqual(names, want) {
+		t.Fatalf("Names = %v", names)
 	}
 }
 

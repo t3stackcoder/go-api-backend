@@ -17,6 +17,12 @@ import (
 // mediator.lease.handovers, mediator.consumer.processed,
 // mediator.consumer.halted, mediator.consumer.pending, mediator.consumer.lag,
 // and mediator.dlq.size.
+//
+// It is the only emitter of mediator.consumer.processed: the transport sees
+// every delivery outcome (ok, dedup, error, dlq, skip), while the Metrics
+// behavior runs only for deliveries that reach the pipeline, so the behavior
+// records consumers under mediator.request.duration (kind "consumer") and
+// leaves this counter to the observer.
 func NewConsumersObserver(inst *Instruments) redisx.Observer {
 	return consumersObserver{inst: inst}
 }

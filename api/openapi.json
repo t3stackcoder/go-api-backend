@@ -71,7 +71,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Page_github.com_t3stackcoder_go-api-backend_examples_orders_orders.OrderSummary_"
+                  "$ref": "#/components/schemas/Page_OrderSummary_"
                 }
               }
             }
@@ -1129,7 +1129,7 @@
         },
         "additionalProperties": false
       },
-      "Page_github.com_t3stackcoder_go-api-backend_examples_orders_orders.OrderSummary_": {
+      "Page_OrderSummary_": {
         "type": "object",
         "properties": {
           "items": {

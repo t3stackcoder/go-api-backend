@@ -119,7 +119,10 @@ func genStrings(t *rapid.T, valid bool) propStrings {
 		Len:    word(t, valid, lower, 3, 3),
 		Pat:    word(t, valid, abc, 1, 3),
 		One:    propColor(pick(t, valid, []string{"red", "green", "blue"}, []string{"", "RED", "yellow"})),
-		Email:  pick(t, valid, []string{"a@b.com", "x.y+z@example.org", "u@[10.0.0.1]"}, []string{"", "nope", "a@", "@b.com", "a b@c.d", ".a@b.com"}),
+		// "@b.com" is not a disagreement probe: santhosh-tekuri/jsonschema's
+		// email format accepts an empty local part, which RFC 5321 and
+		// isEmail reject, and format checks are implementation-defined.
+		Email:  pick(t, valid, []string{"a@b.com", "x.y+z@example.org", "u@[10.0.0.1]"}, []string{"", "nope", "a@", "a b@c.d", ".a@b.com"}),
 		UUID:   pick(t, valid, []string{uuid.New().String(), "00000000-0000-0000-0000-000000000000"}, []string{"", "x", "123e4567e89b12d3a456426614174000"}),
 		URL:    pick(t, valid, []string{"https://example.com/p?q=1", "mailto:a@b.com", "http://[::1]/"}, []string{"", "/rel", "example.com", "://x"}),
 		DT:     pick(t, valid, []string{"2024-01-02T03:04:05Z", "2024-06-30T23:59:59.5+02:00", time.Unix(rapid.Int64Range(0, 4e9).Draw(t, "unix"), 0).UTC().Format(time.RFC3339)}, []string{"", "2024-01-02", "2024-13-01T00:00:00Z", "yesterday"}),

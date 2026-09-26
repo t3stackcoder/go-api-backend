@@ -87,10 +87,9 @@ func BenchmarkPublish_InProcess(b *testing.B) {
 }
 
 // TestSend_CoreAllocations guards the allocation budget of the bare Send path
-// (spec 4.12, G17). The cold path pays one extra allocation for the generated
-// correlation ID string; with an ambient correlation ID (the HTTP adapter
-// always sets one) the path is: box request, scope, context value, box
-// response.
+// (spec 4.12, G17): box request, scope, context value, box response. A cold
+// context costs nothing extra: the generated correlation ID is kept as a
+// UUID in the scope and formatted only when CorrelationID reads it.
 func TestSend_CoreAllocations(t *testing.T) {
 	bare := benchMediator(t, 0, false)
 	passthrough := benchMediator(t, 12, false)
@@ -104,9 +103,9 @@ func TestSend_CoreAllocations(t *testing.T) {
 		max  float64
 	}{
 		{"bare, ambient correlation", bare, warm, 4},
-		{"bare, cold context", bare, cold, 5},
+		{"bare, cold context", bare, cold, 4},
 		{"12 pass-through behaviors, ambient correlation", passthrough, warm, 4},
-		{"12 pass-through behaviors, cold context", passthrough, cold, 6},
+		{"12 pass-through behaviors, cold context", passthrough, cold, 4},
 	}
 	for _, c := range cases {
 		got := testing.AllocsPerRun(2000, func() {

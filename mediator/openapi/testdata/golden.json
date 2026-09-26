@@ -207,7 +207,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Page_github.com_t3stackcoder_go-api-backend_mediator_openapi_test.OrderSummary_"
+                  "$ref": "#/components/schemas/Page_OrderSummary_"
                 }
               }
             }
@@ -1731,7 +1731,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Page_github.com_t3stackcoder_go-api-backend_mediator_openapi_test.OrderSummary_"
+                  "$ref": "#/components/schemas/Page_OrderSummary_"
                 }
               }
             }
@@ -2360,7 +2360,7 @@
         },
         "additionalProperties": false
       },
-      "Page_github.com_t3stackcoder_go-api-backend_mediator_openapi_test.OrderSummary_": {
+      "Page_OrderSummary_": {
         "type": "object",
         "properties": {
           "items": {

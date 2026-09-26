@@ -1,7 +1,9 @@
 package validate
 
 import (
+	"encoding/json/v2"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -80,6 +82,138 @@ func TestCompileErrors(t *testing.T) {
 				t.Fatalf("error should name the type and field: %q", err)
 			}
 		})
+	}
+}
+
+// TestJSONNameAgreesWithJSONV2 (G13): validate derives member names from
+// json tags exactly as encoding/json/v2 does and rejects every tag json/v2
+// rejects. json/v2 itself is the oracle: each tag is put on a one-field
+// struct, marshaled, and its member name (or its rejection) compared with
+// the compiled plan (or the Compile error). SchemaFor fails on the same
+// tags, so the generated schema cannot disagree either.
+//
+// The structs are built with reflect.StructOf because the tags under test
+// are, by design, ones a linter objects to: staticcheck's SA5008 still
+// follows the json/v2 experiment, which quoted such names ('-'), while the
+// json/v2 shipped with Go 1.27 rejects quoted names and spells a member
+// named "-" as json:"-,omitempty".
+func TestJSONNameAgreesWithJSONV2(t *testing.T) {
+	cases := []struct {
+		tag  string
+		name string // the member name; "" when skipped or rejected
+		err  string // part of the Compile error; "" when json/v2 accepts the tag
+	}{
+		{tag: "", name: "A"},
+		{tag: ",omitempty", name: "A"},
+		{tag: "-"},
+		{tag: "-,omitempty", name: "-"},
+		{tag: "-,omitzero", name: "-"},
+		{tag: "--", name: "--"},
+		{tag: "my-name", name: "my-name"},
+		{tag: "a b", name: "a b"},
+		{tag: "1a", name: "1a"},
+		{tag: "a,unknownoption", name: "a"},
+		{tag: "a,omitempty,omitzero", name: "a"},
+		{tag: "-,", err: `json tag "-," is malformed: trailing comma`},
+		{tag: "a,", err: `json tag "a," is malformed: trailing comma`},
+		{tag: ",", err: `json tag "," is malformed: trailing comma`},
+		{tag: "a,,omitempty", err: `json tag "a,,omitempty" is malformed: empty option`},
+		{tag: "'-'", err: `'\'' cannot appear in a member name`},
+		{tag: "'quoted name',omitempty", err: `'\'' cannot appear in a member name`},
+		{tag: "'abc", err: `'\'' cannot appear in a member name`},
+		{tag: `a"b`, err: `'"' cannot appear in a member name`},
+		{tag: `a\b`, err: `'\\' cannot appear in a member name`},
+		{tag: "a\x60b", err: "'\x60' cannot appear in a member name"},
+	}
+	for _, tc := range cases {
+		t.Run(strconv.Quote(tc.tag), func(t *testing.T) {
+			typ := reflect.StructOf([]reflect.StructField{{Name: "A", Type: reflect.TypeFor[string](), Tag: reflect.StructTag("json:" + strconv.Quote(tc.tag))}})
+			val := reflect.New(typ).Elem()
+			val.Field(0).SetString("x")
+			encoded, jerr := json.Marshal(val.Interface())
+
+			v := New()
+			cerr := v.Compile(typ)
+			_, serr := v.SchemaFor(typ, nil, SchemaOptions{})
+			if tc.err != "" {
+				if jerr == nil {
+					t.Fatalf("json/v2 accepts %q, so validate must too", tc.tag)
+				}
+				if cerr == nil || !strings.Contains(cerr.Error(), ".A: ") || !strings.Contains(cerr.Error(), tc.err) {
+					t.Fatalf("Compile = %v, want %q naming the field", cerr, tc.err)
+				}
+				if serr == nil || !strings.Contains(serr.Error(), tc.err) {
+					t.Fatalf("SchemaFor = %v", serr)
+				}
+				return
+			}
+			if jerr != nil {
+				t.Fatalf("json/v2 rejects %q (%v), so validate must too", tc.tag, jerr)
+			}
+			if cerr != nil || serr != nil {
+				t.Fatalf("Compile = %v, SchemaFor = %v", cerr, serr)
+			}
+			var members map[string]string
+			if err := json.Unmarshal(encoded, &members); err != nil {
+				t.Fatal(err)
+			}
+			var want []string
+			for k := range members {
+				want = append(want, k)
+			}
+			p, err := v.plan(typ)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got []string
+			for i := range p.fields {
+				got = append(got, p.fields[i].name)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("validate sees members %q, json/v2 %q (%s)", got, want, encoded)
+			}
+			if tc.name != "" && (len(got) != 1 || got[0] != tc.name) {
+				t.Fatalf("member %q, want %q", got, tc.name)
+			}
+		})
+	}
+}
+
+// TestJSONTagOnUnexportedField: json/v2 refuses any tag other than "-" on an
+// unexported, non-embedded field, so Compile does too; a plain unexported
+// field and one tagged "-" are skipped as before.
+func TestJSONTagOnUnexportedField(t *testing.T) {
+	field := func(name, tag string) reflect.StructField {
+		sf := reflect.StructField{Name: name, Type: reflect.TypeFor[string]()}
+		if tag != "" {
+			sf.Tag = reflect.StructTag("json:" + strconv.Quote(tag))
+		}
+		if name[0] >= 'a' && name[0] <= 'z' {
+			sf.PkgPath = "validate"
+		}
+		return sf
+	}
+	ok := reflect.StructOf([]reflect.StructField{field("Public", "public"), field("hidden", ""), field("gone", "-")})
+	if err := New().Compile(ok); err != nil {
+		t.Fatalf("untagged and \"-\" unexported fields are skipped: %v", err)
+	}
+	for _, tag := range []string{"secret", ",omitempty", ""} {
+		typ := reflect.StructOf([]reflect.StructField{field("Public", "public"), {Name: "secret", Type: reflect.TypeFor[string](), Tag: reflect.StructTag("json:" + strconv.Quote(tag)), PkgPath: "validate"}})
+		val := reflect.New(typ).Elem()
+		if _, jerr := json.Marshal(val.Interface()); jerr == nil {
+			t.Fatalf("json/v2 accepts json:%q on an unexported field", tag)
+		}
+		err := New().Compile(typ)
+		if err == nil || !strings.Contains(err.Error(), ".secret: unexported field has json tag "+strconv.Quote(tag)+", which encoding/json/v2 rejects") {
+			t.Fatalf("json:%q: Compile = %v", tag, err)
+		}
+	}
+	// A bad tag inside a nested struct is reported against the declaring type.
+	promotedBad := reflect.StructOf([]reflect.StructField{{Name: "Other", Type: reflect.TypeFor[string](), Tag: reflect.StructTag("json:" + strconv.Quote("other,"))}})
+	outer := reflect.StructOf([]reflect.StructField{{Name: "Head", Type: reflect.TypeFor[string](), Tag: `json:"head"`}, {Name: "Tail", Type: promotedBad, Tag: `json:"tail"`}})
+	err := New().Compile(outer)
+	if err == nil || !strings.Contains(err.Error(), `.Other: json tag "other," is malformed: trailing comma`) {
+		t.Fatalf("Compile = %v", err)
 	}
 }
 

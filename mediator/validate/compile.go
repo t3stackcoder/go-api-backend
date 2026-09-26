@@ -164,26 +164,67 @@ type rawField struct {
 	hasName bool
 }
 
-// jsonName returns the member name from a json tag, whether it was explicit,
-// and whether the field is skipped.
-func jsonName(sf reflect.StructField) (name string, explicit, skip bool) {
-	tag := sf.Tag.Get("json")
+// badField is a field whose json tag encoding/json/v2 rejects.
+type badField struct {
+	typ reflect.Type // the struct declaring the field
+	sf  reflect.StructField
+	err error
+}
+
+// jsonName returns the member name of a field under the encoding/json/v2 tag
+// grammar, whether the tag named it explicitly, and whether the field is
+// skipped. The HTTP decoder and the canonical hasher use json/v2, so the
+// validator must see exactly the names they see (G13): json:"-" skips the
+// field; otherwise the name runs from the start of the tag to the first
+// comma and may not contain a comma, backslash, or quote (json/v2 as shipped
+// in Go 1.27 accepts no quoted names, so a member literally named "-" is
+// spelled json:"-,omitempty"); options after the first comma are ignored,
+// except that a trailing comma or an empty option is malformed. A tag json/v2
+// rejects, including any tag other than "-" on an unexported field, is
+// returned as an error so Compile fails naming the field.
+func jsonName(sf reflect.StructField) (name string, explicit, skip bool, err error) {
+	tag, hasTag := sf.Tag.Lookup("json")
 	if tag == "-" {
-		return "", false, true
+		return "", false, true, nil
 	}
-	name, _, _ = strings.Cut(tag, ",")
-	if name != "" {
-		return name, true, false
+	if hasTag && !sf.IsExported() && !sf.Anonymous {
+		return "", false, false, fmt.Errorf("unexported field has json tag %q, which encoding/json/v2 rejects; remove the tag or use json:\"-\"", tag)
 	}
-	return sf.Name, false, false
+	name, rest := sf.Name, tag
+	if tag != "" && tag[0] != ',' {
+		n := strings.IndexAny(tag, ",\\'\"`")
+		if n < 0 {
+			return tag, true, false, nil
+		}
+		if tag[n] != ',' {
+			return "", false, false, fmt.Errorf("json tag %q is malformed: %q cannot appear in a member name (encoding/json/v2 rejects it)", tag, tag[n])
+		}
+		name, explicit, rest = tag[:n], true, tag[n:]
+	}
+	for rest != "" {
+		opt, more, found := strings.Cut(rest[1:], ",")
+		if opt == "" {
+			what := "trailing comma"
+			if found {
+				what = "empty option"
+			}
+			return "", false, false, fmt.Errorf("json tag %q is malformed: %s (encoding/json/v2 rejects it)", tag, what)
+		}
+		rest = ""
+		if found {
+			rest = "," + more
+		}
+	}
+	return name, explicit, false, nil
 }
 
 // collectFields flattens t the way encoding/json does: embedded structs
 // without a JSON name are promoted (unexported ones too, but not unexported
 // embedded pointers), an embedded struct with a JSON name is an ordinary
 // member, the dominant field wins for repeated names, and marker, json:"-",
-// and unexported fields are dropped.
-func collectFields(t reflect.Type) []rawField {
+// and unexported fields are dropped. Fields whose json tag json/v2 rejects
+// are returned separately in bad and take no part in dominance.
+func collectFields(t reflect.Type) (flat []rawField, bad []badField) {
 	type item struct {
 		t     reflect.Type
 		index []int
@@ -206,7 +247,11 @@ func collectFields(t reflect.Type) []rawField {
 		visited[it.t] = len(it.index)
 		for i := 0; i < it.t.NumField(); i++ {
 			sf := it.t.Field(i)
-			name, explicit, skip := jsonName(sf)
+			name, explicit, skip, err := jsonName(sf)
+			if err != nil {
+				bad = append(bad, badField{typ: it.t, sf: sf, err: err})
+				continue
+			}
 			if skip {
 				continue
 			}
@@ -243,7 +288,6 @@ func collectFields(t reflect.Type) []rawField {
 		}
 		return boolCompare(b.hasName, a.hasName)
 	})
-	var flat []rawField
 	for i := 0; i < len(out); {
 		j := i + 1
 		for j < len(out) && out[j].name == out[i].name {
@@ -255,7 +299,7 @@ func collectFields(t reflect.Type) []rawField {
 		i = j
 	}
 	slices.SortFunc(flat, func(a, b rawField) int { return slices.Compare(a.index, b.index) })
-	return flat
+	return flat, bad
 }
 
 func boolCompare(a, b bool) int {
@@ -324,7 +368,11 @@ func (c *compiler) structPlan(t reflect.Type) *structPlan {
 	c.plans[t] = p
 	c.fresh = append(c.fresh, p)
 	tname := typeName(t)
-	for _, rf := range collectFields(t) {
+	fields, bad := collectFields(t)
+	for _, b := range bad {
+		c.errorf(typeName(b.typ)+"."+b.sf.Name, "%v", b.err)
+	}
+	for _, rf := range fields {
 		where := tname + "." + rf.sf.Name
 		if rf.sf.Anonymous && !rf.sf.IsExported() && validateModeOf(rf.sf.Type) != validateNone {
 			// The value is reachable only through an unexported field, which

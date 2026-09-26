@@ -28,7 +28,12 @@
 // Field paths in errors are JSON Pointers built from json tag names, for
 // example /lines/0/qty. Nested structs are validated recursively, embedded
 // structs are flattened like encoding/json does, marker fields and json:"-"
-// fields are skipped.
+// fields are skipped. Member names follow the encoding/json/v2 tag grammar
+// exactly, because that is what the HTTP decoder and the canonical hasher
+// use: the name runs to the first comma and may not contain a comma,
+// backslash, or quote, options after it are ignored, and a tag json/v2
+// rejects (a trailing comma, an empty option, a quoted name, or any tag
+// other than "-" on an unexported field) is a Compile error naming the field.
 //
 // required means "present and not null" in the JSON document. Pointers,
 // slices, maps and []byte fail required when nil; strings fail it when empty

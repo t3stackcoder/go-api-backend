@@ -224,6 +224,9 @@ func WriteProblem(w http.ResponseWriter, r *http.Request, err error)
   unknown members are rejected only with `json.RejectUnknownMembers(true)`;
   names are case-sensitive; duplicate names are rejected.
 * `httptest.NewTestServer(t, handler)` (Go 1.27) takes a `testing.TB`.
+* Go 1.27's `encoding/json/v2` has no single-quoted member names: `json:"'-'"` and
+  `json:"-,"` are malformed, a member literally named `-` is `json:"-,omitempty"`,
+  and staticcheck SA5008 still follows the experiment grammar and flags that form.
 * `testing/synctest.Test(t, func(t *testing.T))` is the bubble API.
 
 ## 6. Deviations from spec.md
@@ -240,6 +243,7 @@ func WriteProblem(w http.ResponseWriter, r *http.Request, err error)
 | Consumer group `read-model`, `Descriptions` default true | Group `read_model`; `openapi.Config.NoDescriptions` (descriptions on unless disabled) | `NamePattern` is `^[A-Za-z][A-Za-z0-9_.]{0,127}$` and forbids `-`, so every persisted group name uses `_` (`read_model`, `audit`, `poison`, `inventory`); a zero `openapi.Config` should produce the documented default, which a `Descriptions bool` cannot |
 | Shutdown on SIGTERM only | Also on stdin EOF when `SHUTDOWN_ON_STDIN_EOF=1` (`examples/orders`) | Windows cannot deliver SIGTERM to a child process; integration tests close the child's stdin to trigger the same drain |
 | Behavior constructors named after the behavior (`behavior.Cache`) | `behavior.New*` constructors; the bare names are the name constants (`behavior.Cache == mediator.NameCache`) | The name constants are re-exported from the core and are what `Use` options and logs refer to |
+| Timeout "applies `context.WithTimeout`" (5.6) | `behavior.deadlineCtx`: one allocation, observably equivalent, lazily backed by `context.WithDeadline` on the first `Done()` | G17: saves 4 allocations on the no-I/O path; children derived by pgx, go-redis, or errgroup still attach without a watcher goroutine (`TestDeadlineCtx_NoWatcherGoroutines`) |
 
 ## 7. Decisions recorded by the package agents
 
@@ -281,9 +285,11 @@ too; this list is the index.
   separate inner behavior after `Idempotency`; `Cache` (queries) sits
   outside the unit of work.
 * Idempotency is scoped to commands that have a unit of work
-  (`mediator.Where(hasUnitOfWork)`), which makes the core's "RetryPolicy
-  with NoUnitOfWork is allowed when IdempotencyKey exists" rule vacuous for
-  the standard chain. See section 8 for the resolution.
+  the core's "RetryPolicy with NoUnitOfWork is allowed when IdempotencyKey exists"
+  rule vacuous for the standard chain. The core keeps allowing it (an
+  application may wire its own key-based idempotency without a transaction),
+  but the standard Retry behavior's Prepare rejects the combination at Build,
+  because a retry outside a unit of work could repeat effects.
 
 ### 7.4 httpapi and openapi
 
@@ -355,3 +361,74 @@ too; this list is the index.
   including `poison`, serves the fault sweep.
 * First results (60 s runs, seeds 1 to 5): every workload passes except
   `events`, which exposed two framework bugs recorded in section 8.
+
+## 8. Hardening outcomes (M7)
+
+### 8.1 G17
+
+Before: 9 allocations per `Send` with an ambient correlation ID and 10 with
+a cold context (core 4: request box, scope, `WithValue`, response box; +1
+cold for the formatted correlation string; Timeout +4 from
+`context.WithTimeout`: timer context, timer, timer callback, cancel closure;
+Tracing +1 for the no-op tracer's `ContextWithSpan`). After: 6 and 6,
+meeting the spec 4.12 target, at 0.42 to 0.46 µs per `Send` for the full
+default chain with no I/O (5 allocs/op and 280 B/op under `-benchmem`;
+baseline 0.54 µs warm and 1.02 µs cold).
+
+Two changes. The core keeps a generated correlation ID as the UUID in the
+scope and formats it only when `CorrelationID` is read. The Timeout behavior
+uses `deadlineCtx`, a one-allocation deadline context whose timer and Done
+channel are created on the first `Done` call (only I/O paths make one) and
+whose `Err` answers from the clock until then. It is not a foreign context
+to the standard library: its Done channel and cancel key resolve to an
+inner `context.WithDeadline` created lazily, so children derived by pgx,
+go-redis, errgroup, or through `WithValue` wrappers attach without a
+watcher goroutine (`TestDeadlineCtx_NoWatcherGoroutines` pins this against
+a foreign-context control); the I/O path pays one extra allocation on the
+first `Done`. Known difference from `context.WithTimeout`: `context.Cause`
+before any `Done` call follows the nearest standard-library ancestor; the
+framework classifies outcomes through `Err`. Pinned floors:
+`TestSend_DefaultChainAllocations` 6/6, `TestSend_CoreAllocations` 4/4.
+
+### 8.2 Schema component names
+
+Component names strip package paths from the type arguments of generic
+instantiations (`Page[.../orders.OrderSummary]` becomes `Page_OrderSummary_`,
+`Map[K,V]` becomes `Map_K_V_`). Two instantiations whose arguments share a
+short name collide like any other names and are disambiguated by
+`qualifiedName` plus the counter (`pkg.Page_X_`, `pkg.Page_X__2`).
+
+### 8.3 Metrics
+
+`mediator.consumer.processed` has one emitter, `otel.NewConsumersObserver`
+on `redisx.Consumers`, which sees every delivery outcome including `dlq`
+and `skip`. The Metrics behavior records consumer deliveries only as
+`mediator.request.duration` and `mediator.request.inflight` with kind
+`consumer`, so an application wiring both no longer counts each delivery
+twice.
+
+### 8.4 Validation tag grammar
+
+`validate` derives member names with the `encoding/json/v2` grammar as
+shipped in Go 1.27 (G13): `-` skips, the name runs to the first comma and
+may not contain a comma, backslash, or quote, options are ignored, and a
+tag json/v2 rejects (trailing comma, empty option, quoted name, any tag but
+`-` on an unexported field) is a `Compile` and therefore Build error naming
+the field. `TestJSONNameAgreesWithJSONV2` uses json/v2 itself as the oracle.
+The other tag readers (`behavior/redact.go`, `httpapi/routing.go`,
+`openapi/generate.go`, `testkit/history/values.go`) still cut at the first
+comma; they agree with `validate` on every tag json/v2 accepts and only
+differ on tags that now fail Build.
+
+### 8.5 Chaos findings under repair
+
+The `events` workload exposed two protocol bugs, both fixed after the first
+chaos runs (see the relay and consumers doc comments):
+
+* A voluntary lease release could happen while the worker's blocking
+  `XREADGROUP` was outstanding, so an entry landed in the old owner's PEL
+  after the new owner's drain-first pass and was applied out of order by
+  the later `XAUTOCLAIM` (G6, I6).
+* The relay checked for Redis data loss only on its poll branch; under
+  wake-up load its own next `XADD` moved the stream tail past the cursor
+  and a `FLUSHALL` went undetected (G12, G5, I2, I3).

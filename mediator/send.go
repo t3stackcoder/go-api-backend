@@ -75,6 +75,8 @@ func (m *Mediator) SendAny(ctx context.Context, req any) (any, error) {
 
 // enter derives the call scope for a Send: correlation ID (kept or created),
 // causation (the enclosing request or event), a fresh request ID, and depth.
+// A created correlation ID equals the request ID; it is stored as the UUID
+// and formatted by CorrelationID on first read.
 func (m *Mediator) enter(ctx context.Context) (context.Context, error) {
 	parent := scopeFrom(ctx)
 	next := &scope{}
@@ -82,15 +84,15 @@ func (m *Mediator) enter(ctx context.Context) (context.Context, error) {
 		if parent.depth >= m.maxDepth {
 			return nil, ErrDepthExceeded
 		}
-		next.correlation = parent.correlation
+		next.correlation, next.corrID = parent.correlation, parent.corrID
 		next.parent = parent.current
 		next.depth = parent.depth + 1
 	} else {
 		next.depth = 1
 	}
 	next.current = NewID(m.clock.Now())
-	if next.correlation == "" {
-		next.correlation = next.current.String()
+	if next.correlation == "" && next.corrID == uuid.Nil {
+		next.corrID = next.current
 	}
 	return context.WithValue(ctx, scopeKey{}, next), nil
 }

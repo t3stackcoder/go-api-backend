@@ -69,14 +69,52 @@ func (r *Schemas) NameOf(t reflect.Type) (string, bool) {
 	return n, ok
 }
 
-// shortName is the sanitized Go type name.
+// shortName is the sanitized Go type name. The type arguments of a generic
+// instantiation lose their package paths first, so Page[pkg/orders.Summary]
+// becomes Page_Summary_ rather than a name carrying the import path;
+// qualifiedName disambiguates when two instantiations then collide.
 func shortName(t reflect.Type) string {
 	return strings.Map(func(c rune) rune {
 		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '.' || c == '_' || c == '-' {
 			return c
 		}
 		return '_'
-	}, t.Name())
+	}, stripTypeArgPackages(t.Name()))
+}
+
+// stripTypeArgPackages removes the package qualifier of every type name in
+// the type argument list of an instantiated generic type name, as
+// reflect.Type.Name prints it: Page[github.com/x/y/orders.Summary] becomes
+// Page[Summary], Map[string,*a/b.K] becomes Map[string,*K], and nested
+// instantiations such as Page[a/b.Wrapper[a/b.X]] become Page[Wrapper[X]].
+// A qualifier is everything up to and including the last dot of one token,
+// where tokens are separated by the type-syntax punctuation [ ] , * and
+// space; the head of the name before the first bracket is left alone.
+func stripTypeArgPackages(name string) string {
+	open := strings.IndexByte(name, '[')
+	if open < 0 {
+		return name
+	}
+	var b strings.Builder
+	b.WriteString(name[:open+1])
+	start := open + 1
+	flush := func(end int) {
+		tok := name[start:end]
+		if i := strings.LastIndexByte(tok, '.'); i >= 0 {
+			tok = tok[i+1:]
+		}
+		b.WriteString(tok)
+	}
+	for i := open + 1; i < len(name); i++ {
+		switch name[i] {
+		case '[', ']', ',', '*', ' ':
+			flush(i)
+			b.WriteByte(name[i])
+			start = i + 1
+		}
+	}
+	flush(len(name))
+	return b.String()
 }
 
 // qualifiedName prefixes the short name with the last package path element.

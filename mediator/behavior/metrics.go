@@ -13,16 +13,17 @@ import (
 
 // NewMetrics returns the Metrics behavior (5.5, 9.1): mediator.request.duration
 // (seconds) and mediator.request.inflight with name and kind, the duration
-// carrying outcome ok, error, panic, or timeout; mediator.notification.handlers
-// on the publish path; and mediator.consumer.processed with outcome ok,
-// dedup, or error on the consumer path. Instruments are created once here;
-// attribute sets are precomputed per request type at Prepare so a call
-// allocates nothing for them. A meter that refuses an instrument leaves the
-// behavior recording into no-op instruments and Prepare reports the error.
+// carrying outcome ok, error, panic, or timeout, on every path including
+// consumers (kind "consumer"); and mediator.notification.handlers on the
+// publish path. Instruments are created once here; attribute sets are
+// precomputed per request type at Prepare so a call allocates nothing for
+// them. A meter that refuses an instrument leaves the behavior recording
+// into no-op instruments and Prepare reports the error.
 //
-// Note that redisx.Consumers also reports mediator.consumer.processed
-// through its Observer (with the dlq outcome the behavior cannot see); wire
-// one or the other into the same meter, not both.
+// mediator.consumer.processed is not emitted here: its single source is the
+// transport observer (otel.NewConsumersObserver on redisx.Consumers), which
+// sees every delivery outcome including dlq and skip, so emitting it here as
+// well would count each delivery twice.
 func NewMetrics(cfg Config) mediator.Behavior {
 	inst, err := cfg.instruments()
 	m := &metrics{inst: inst, clock: cfg.clock(), err: err}
@@ -37,23 +38,11 @@ type metrics struct {
 	attrs infoCache[metricAttrs]
 }
 
-// consumerOutcome indexes metricAttrs.consumer.
-type consumerOutcome uint8
-
-const (
-	consumerOK consumerOutcome = iota
-	consumerDedup
-	consumerError
-)
-
-var consumerOutcomeNames = [...]string{motel.ConsumerOutcomeOK, motel.ConsumerOutcomeDedup, motel.ConsumerOutcomeError}
-
 // metricAttrs holds the precomputed attribute options of one type.
 type metricAttrs struct {
 	inflight []metric.AddOption
 	outcome  [4][]metric.RecordOption
 	handlers []metric.RecordOption
-	consumer [3][]metric.AddOption
 }
 
 func newMetricAttrs(info *mediator.RequestInfo) *metricAttrs {
@@ -65,10 +54,6 @@ func newMetricAttrs(info *mediator.RequestInfo) *metricAttrs {
 	}
 	for i, o := range outcomeNames {
 		a.outcome[i] = []metric.RecordOption{metric.WithAttributeSet(attribute.NewSet(name, kind, attribute.String(motel.AttrOutcome, o)))}
-	}
-	group := attribute.String(motel.AttrGroup, info.Group)
-	for i, o := range consumerOutcomeNames {
-		a.consumer[i] = []metric.AddOption{metric.WithAttributeSet(attribute.NewSet(group, attribute.String(motel.AttrOutcome, o)))}
 	}
 	return a
 }
@@ -82,23 +67,12 @@ func (m *metrics) Prepare(infos []*mediator.RequestInfo) error {
 	return m.err
 }
 
-// finish records the end of one call. o is the outcome; for the consumer
-// path the delivery outcome is derived from it and the consumer state.
+// finish records the end of one call with outcome o.
 func (m *metrics) finish(ctx context.Context, info *mediator.RequestInfo, a *metricAttrs, secs float64, o outcome) {
 	m.inst.RequestInflight.Add(ctx, -1, a.inflight...)
 	m.inst.RequestDuration.Record(ctx, secs, a.outcome[o]...)
-	switch info.Kind {
-	case mediator.KindNotification:
+	if info.Kind == mediator.KindNotification {
 		m.inst.NotificationHandlers.Record(ctx, int64(info.Handlers), a.handlers...)
-	case mediator.KindConsumer:
-		co := consumerOK
-		if o != outcomeOK {
-			co = consumerError
-		} else if st, ok := mediator.ConsumerStateFrom(ctx); ok && st.Duplicate {
-			co = consumerDedup
-		}
-		m.inst.ConsumerProcessed.Add(ctx, 1, a.consumer[co]...)
-	default:
 	}
 }
 

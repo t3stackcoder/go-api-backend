@@ -29,7 +29,9 @@ const (
 	AttrTag       = "tag"
 )
 
-// Consumer delivery outcomes of mediator.consumer.processed.
+// Consumer delivery outcomes of mediator.consumer.processed, which only the
+// consumers observer (NewConsumersObserver) emits. redisx.Consumers reports
+// them through redisx.Observer with the same strings.
 const (
 	ConsumerOutcomeOK    = "ok"
 	ConsumerOutcomeDedup = "dedup"

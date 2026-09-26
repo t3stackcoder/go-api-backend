@@ -219,8 +219,8 @@ func TestRetry_Prepare(t *testing.T) {
 		want string
 	}{
 		{"query", info(mediator.KindQuery, reflect.TypeFor[retryQuery](), mediator.Traits{}), "commands only"},
-		{"no unit of work without key", info(mediator.KindCommand, reflect.TypeFor[retryNoUow](), mediator.Traits{NoUnitOfWork: true}), "no IdempotencyKey"},
-		{"no unit of work with key", info(mediator.KindCommand, reflect.TypeFor[retryNoUow](), mediator.Traits{NoUnitOfWork: true, IdempotencyKey: true}), ""},
+		{"no unit of work without key", info(mediator.KindCommand, reflect.TypeFor[retryNoUow](), mediator.Traits{NoUnitOfWork: true}), "remove NoUnitOfWork or RetryPolicy"},
+		{"no unit of work with key", info(mediator.KindCommand, reflect.TypeFor[retryNoUow](), mediator.Traits{NoUnitOfWork: true, IdempotencyKey: true}), "remove NoUnitOfWork or RetryPolicy"},
 		{"valid", info(mediator.KindCommand, reflect.TypeFor[retryCmd](), mediator.Traits{}), ""},
 		{"without trait", &mediator.RequestInfo{Kind: mediator.KindCommand}, ""},
 	}
@@ -260,6 +260,31 @@ func TestRetry_PolicyValidation(t *testing.T) {
 	must(t, behavior.UseStandard(m, behavior.Config{}))
 	if err := m.Build(); err == nil || !strings.Contains(err.Error(), "MaxAttempts") {
 		t.Fatalf("Build = %v", err)
+	}
+}
+
+// keyedRetryNoUow passes the core's Build check (RetryPolicy with
+// NoUnitOfWork is allowed there when IdempotencyKey exists) and must still
+// be rejected by the Retry behavior's Prepare through the standard set.
+type keyedRetryNoUow struct {
+	mediator.Command[mediator.Void]
+	Key string `json:"key"`
+}
+
+func (keyedRetryNoUow) RetryPolicy() retry.Policy { return retry.Policy{MaxAttempts: 2} }
+func (keyedRetryNoUow) NoUnitOfWork()             {}
+func (c keyedRetryNoUow) IdempotencyKey() string  { return c.Key }
+
+func TestRetry_RejectsNoUnitOfWorkAtBuild(t *testing.T) {
+	m := mediator.New()
+	must(t, mediator.HandleFunc(m, func(context.Context, keyedRetryNoUow) (mediator.Void, error) { return mediator.Void{}, nil }))
+	must(t, behavior.UseStandard(m, behavior.Config{}))
+	err := m.Build()
+	if err == nil || !strings.Contains(err.Error(), "keyedRetryNoUow has RetryPolicy() and NoUnitOfWork(): retry without a unit of work can repeat effects; remove NoUnitOfWork or RetryPolicy") {
+		t.Fatalf("Build = %v", err)
+	}
+	if strings.Contains(err.Error(), "no IdempotencyKey") {
+		t.Fatalf("the core rule must not fire for a keyed request: %v", err)
 	}
 }
 

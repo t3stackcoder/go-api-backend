@@ -78,7 +78,11 @@ func TestMetrics_NotificationHandlers(t *testing.T) {
 	}
 }
 
-func TestMetrics_ConsumerProcessed(t *testing.T) {
+// TestMetrics_Consumer: deliveries are recorded as requests of kind
+// consumer; mediator.consumer.processed is left to the transport observer
+// (otel.NewConsumersObserver), so a duplicate or a failure shows up in the
+// duration histogram only.
+func TestMetrics_Consumer(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()
 	env := mediator.Envelope{ID: mediator.NewID(h.clock.Now())}
@@ -93,10 +97,18 @@ func TestMetrics_ConsumerProcessed(t *testing.T) {
 		t.Fatal("want error")
 	}
 	rm := h.tel.collect(t)
-	for outcome, n := range map[string]int64{"ok": 1, "dedup": 1, "error": 1} {
-		if p := point(t, rm, "mediator.consumer.processed", map[string]string{"group": consumerGroup, "outcome": outcome}); p.Int != n {
-			t.Errorf("%s = %d, want %d", outcome, p.Int, n)
-		}
+	if pts := points(rm, "mediator.consumer.processed"); len(pts) != 0 {
+		t.Fatalf("the behavior must not emit mediator.consumer.processed (the transport observer does): %v", pts)
+	}
+	consumer := map[string]string{"name": "thingStored", "kind": "consumer"}
+	if p := point(t, rm, "mediator.request.duration", map[string]string{"name": "thingStored", "kind": "consumer", "outcome": behavior.OutcomeOK}); p.Count != 2 {
+		t.Errorf("ok count %d, want 2 (the inbox duplicate is an ok delivery)", p.Count)
+	}
+	if p := point(t, rm, "mediator.request.duration", map[string]string{"name": "thingStored", "kind": "consumer", "outcome": behavior.OutcomeError}); p.Count != 1 {
+		t.Errorf("error count %d, want 1", p.Count)
+	}
+	if p := point(t, rm, "mediator.request.inflight", consumer); p.Int != 0 {
+		t.Errorf("inflight %d after completion", p.Int)
 	}
 }
 

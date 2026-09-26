@@ -42,12 +42,23 @@ func NewID(now time.Time) uuid.UUID {
 }
 
 // scope bundles the per-call identifiers so one context derivation per Send
-// carries all of them.
+// carries all of them. A correlation ID the framework generated for a
+// top-level Send is kept as the UUID (corrID) and formatted only when read,
+// so a cold Send does not pay for a string nobody asked for (G17).
 type scope struct {
 	correlation string
+	corrID      uuid.UUID // generated correlation ID when correlation is ""
 	current     uuid.UUID // the request or event being processed
 	parent      uuid.UUID // what caused it
 	depth       int
+}
+
+// correlationID returns the correlation ID, formatting a generated one.
+func (s *scope) correlationID() string {
+	if s.correlation == "" && s.corrID != uuid.Nil {
+		return s.corrID.String()
+	}
+	return s.correlation
 }
 
 type (
@@ -69,7 +80,7 @@ func scopeFrom(ctx context.Context) *scope {
 // any call.
 func CorrelationID(ctx context.Context) string {
 	if s := scopeFrom(ctx); s != nil {
-		return s.correlation
+		return s.correlationID()
 	}
 	return ""
 }
@@ -81,7 +92,7 @@ func WithCorrelationID(ctx context.Context, id string) context.Context {
 	if s := scopeFrom(ctx); s != nil {
 		next = *s
 	}
-	next.correlation = id
+	next.correlation, next.corrID = id, uuid.Nil
 	return context.WithValue(ctx, scopeKey{}, &next)
 }
 
@@ -93,7 +104,7 @@ func WithCausation(ctx context.Context, corr string, cause uuid.UUID) context.Co
 	if s := scopeFrom(ctx); s != nil {
 		next = *s
 	}
-	next.correlation = corr
+	next.correlation, next.corrID = corr, uuid.Nil
 	next.current = cause
 	return context.WithValue(ctx, scopeKey{}, &next)
 }

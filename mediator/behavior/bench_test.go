@@ -14,16 +14,18 @@ import (
 )
 
 // Allocation budgets of the default chain with no I/O behaviors active,
-// measured by TestSend_DefaultChainAllocations (G17). Spec 4.12 targets 6;
-// the core alone spends 4 (ambient correlation ID) to 6 (cold context), the
-// Timeout behavior's context.WithTimeout costs 4 (timer context, timer,
-// timer callback closure, cancel closure), and the tracer's ContextWithSpan
-// costs 1; every other behavior allocates nothing. The numbers below are
-// therefore the floor of this chain over the standard library context, and
-// they gate regressions.
+// measured by TestSend_DefaultChainAllocations (G17). Spec 4.12 targets 6
+// and the chain meets it: the core spends 4 (request box, scope, WithValue,
+// response box; a generated correlation ID is kept as a UUID and formatted
+// only when read), the Timeout behavior's deadlineCtx costs 1 (its timer and
+// Done channel are created on the first Done call, which no-I/O handlers
+// never make), and the no-op tracer's ContextWithSpan costs 1; every other
+// behavior allocates nothing. The numbers below are the measured floor of
+// this chain and gate regressions. Before the G17 work they were 9 warm and
+// 10 cold: context.WithTimeout cost 4 and the cold correlation string 1.
 const (
-	defaultChainAllocsWarm = 9
-	defaultChainAllocsCold = 10
+	defaultChainAllocsWarm = 6
+	defaultChainAllocsCold = 6
 )
 
 // benchConfig is the no-I/O configuration: discard logger, no-op tracer and

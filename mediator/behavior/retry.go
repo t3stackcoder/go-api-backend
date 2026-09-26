@@ -19,9 +19,17 @@ import (
 // error (a commit whose outcome is unknown) is retried only when the
 // request carries an idempotency key, from the trait or the context. The
 // delay comes from retry.Policy.Delay (exponential, full jitter) and sleeps
-// on the clock's After racing ctx.Done. Prepare rejects a policy on a
-// NoUnitOfWork() request without IdempotencyKey(), a policy on anything but
-// a command, and invalid delays.
+// on the clock's After racing ctx.Done. Prepare rejects a policy on any
+// NoUnitOfWork() request, a policy on anything but a command, and invalid
+// delays.
+//
+// The NoUnitOfWork rule is stricter than the core's Build check, which lets
+// RetryPolicy() and NoUnitOfWork() coexist when the request has
+// IdempotencyKey(). That combination is only safe when something reserves
+// the key before the handler runs, and in the standard set the Idempotency
+// behavior is scoped to commands with a unit of work (it needs the
+// transaction for the reservation row), so here a retry outside a unit of
+// work could repeat the handler's effects and is refused at Build.
 func NewRetry(cfg Config) mediator.Behavior {
 	return &retryBehavior{clock: cfg.clock(), after: cfg.after(), logger: cfg.logger()}
 }
@@ -45,8 +53,8 @@ func (b *retryBehavior) Prepare(infos []*mediator.RequestInfo) error {
 			errs = append(errs, fmt.Errorf("behavior: %s is a %s; RetryPolicy() applies to commands only", info.RequestType, info.Kind))
 			continue
 		}
-		if info.Traits.NoUnitOfWork && !info.Traits.IdempotencyKey {
-			errs = append(errs, fmt.Errorf("behavior: %s has RetryPolicy() and NoUnitOfWork() but no IdempotencyKey()", info.RequestType))
+		if info.Traits.NoUnitOfWork {
+			errs = append(errs, fmt.Errorf("behavior: %s has RetryPolicy() and NoUnitOfWork(): retry without a unit of work can repeat effects; remove NoUnitOfWork or RetryPolicy", info.RequestType))
 		}
 		p := reflect.Zero(info.RequestType).Interface().(mediator.Retrier).RetryPolicy()
 		if err := validatePolicy(p); err != nil {
