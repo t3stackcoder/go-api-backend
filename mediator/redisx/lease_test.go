@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -501,5 +502,157 @@ func TestLease_BeginEndMarks(t *testing.T) {
 	}
 	if (leaseKey{"g", "t", 3}).String() != "g/t/p3" {
 		t.Fatal("key string")
+	}
+}
+
+// TestLeaseManager_WorkerOwnsSurplusRelease covers the release protocol of
+// spec 7.2 with a worker attached: the manager only marks the surplus lease
+// and interrupts the worker's read; the lease stays held and renewed until
+// the worker has finished what it holds and releases it itself, so a new
+// owner can never start while the old one still has a read outstanding.
+func TestLeaseManager_WorkerOwnsSurplusRelease(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		store := newFakeLeaseStore(testkit.RealClock{})
+		fence := &counterFencing{}
+		a := newTestManager(store, fence, "a", 4)
+		b := newTestManager(store, fence, "b", 4)
+		var mu sync.Mutex
+		var events []string
+		record := func(s string) {
+			mu.Lock()
+			events = append(events, s)
+			mu.Unlock()
+		}
+		// The entry in hand outlives two renew intervals and ends between ticks.
+		const handler = 2*testRenew + time.Second
+		a.onAcquire = func(l *lease) {
+			l.attachWorker()
+			go func() {
+				// The worker: blocked in XREADGROUP until the read is
+				// interrupted, then it finishes the entry in hand, which
+				// takes longer than a renew interval, then releases.
+				<-l.workCtx.Done()
+				if l.ctx.Err() != nil {
+					return
+				}
+				record("interrupted p" + strconv.Itoa(l.key.partition))
+				if !l.begin(time.Now(), testTTL) {
+					t.Errorf("p%d: worker refused work while releasing", l.key.partition)
+				}
+				time.Sleep(handler)
+				a.finish(ctx, l)
+				holder, _ := store.holder(Keys{Prefix: "t"}.Lease("g", "orders", l.key.partition))
+				if l.ctx.Err() != nil || holder != "a" {
+					t.Errorf("p%d: released before the worker was done (holder %q)", l.key.partition, holder)
+				}
+				record("release p" + strconv.Itoa(l.key.partition))
+				a.release(ctx, l, LeaseEndSurplus)
+			}()
+		}
+		t.Cleanup(func() {
+			// End the remaining leases so every worker goroutine leaves the
+			// bubble.
+			a.stopAcquiring()
+			a.releaseAll(ctx)
+			synctest.Wait()
+		})
+		a.tick(ctx)
+		b.tick(ctx) // joins: live=2, desired=2, nothing free yet
+		time.Sleep(testRenew)
+		a.tick(ctx) // marks p3 and p2 surplus
+		synctest.Wait()
+		if store.held() != 4 || len(a.snapshot()) != 4 {
+			t.Fatalf("manager released a lease with a worker attached: held=%d owned=%d", store.held(), len(a.snapshot()))
+		}
+		for _, l := range a.snapshot() {
+			surplus := l.key.partition >= 2
+			if l.isReleasing() != surplus || (l.workCtx.Err() != nil) != surplus || l.ctx.Err() != nil {
+				t.Fatalf("p%d: releasing=%v work=%v ctx=%v", l.key.partition, l.isReleasing(), l.workCtx.Err(), l.ctx.Err())
+			}
+		}
+		// The releasing leases keep being renewed while the workers drain,
+		// and the joining node cannot take them.
+		time.Sleep(testRenew)
+		a.tick(ctx)
+		b.tick(ctx)
+		for _, l := range a.snapshot() {
+			if !l.fresh(time.Now(), testTTL) {
+				t.Fatalf("p%d not renewed while releasing", l.key.partition)
+			}
+		}
+		if len(b.snapshot()) != 0 || store.held() != 4 {
+			t.Fatalf("b acquired before the workers released: b=%d held=%d", len(b.snapshot()), store.held())
+		}
+		// The workers finish and release; only then does b acquire, with
+		// higher epochs. Both nodes keep ticking meanwhile.
+		time.Sleep(testRenew)
+		a.tick(ctx)
+		b.tick(ctx)
+		if len(b.snapshot()) != 0 || store.held() != 4 {
+			t.Fatalf("b acquired before the workers released: b=%d held=%d", len(b.snapshot()), store.held())
+		}
+		time.Sleep(handler - 2*testRenew)
+		synctest.Wait()
+		if store.held() != 2 || len(a.snapshot()) != 2 {
+			t.Fatalf("after the workers released: held=%d owned=%d", store.held(), len(a.snapshot()))
+		}
+		mu.Lock()
+		got := append([]string(nil), events...)
+		mu.Unlock()
+		sort.Strings(got)
+		want := []string{"interrupted p2", "interrupted p3", "release p2", "release p3"}
+		if len(got) != len(want) {
+			t.Fatalf("events %v", got)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("events %v, want %v", got, want)
+			}
+		}
+		before := epochsOf(a)
+		time.Sleep(testRenew)
+		a.tick(ctx)
+		b.tick(ctx)
+		if len(b.snapshot()) != 2 || len(a.snapshot()) != 2 {
+			t.Fatalf("a owns %d, b owns %d, want 2 each", len(a.snapshot()), len(b.snapshot()))
+		}
+		for p, e := range epochsOf(b) {
+			if _, still := before[p]; still || e <= 4 {
+				t.Fatalf("partition %d epoch %d", p, e)
+			}
+		}
+	})
+}
+
+func TestLease_WorkerAttachedSemantics(t *testing.T) {
+	now := time.Now()
+	l := newLease(context.Background(), leaseKey{"g", "orders", 1}, 7, "a:7", now)
+	defer l.cancel()
+	l.attachWorker()
+	if l.markRelease() {
+		t.Fatal("a lease with a worker must not be released by the manager")
+	}
+	if l.workCtx.Err() == nil || l.ctx.Err() != nil {
+		t.Fatal("markRelease must interrupt the work context and keep the lease live")
+	}
+	if !l.begin(now, testTTL) {
+		t.Fatal("the worker keeps processing the entries it holds while releasing")
+	}
+	if l.end() {
+		t.Fatal("end must not request a manager release with a worker attached")
+	}
+	if l.begin(now.Add(testTTL), testTTL) {
+		t.Fatal("stale lease accepted work")
+	}
+	// Ending the lease cancels the work context with it, and markRelease on
+	// a lease built without contexts (older tests) is a no-op cancel.
+	l.cancel()
+	if l.workCtx.Err() == nil {
+		t.Fatal("work context must descend from the lease context")
+	}
+	bare := &lease{lastRenew: now}
+	if !bare.markRelease() {
+		t.Fatal("idle lease without a worker releases immediately")
 	}
 }

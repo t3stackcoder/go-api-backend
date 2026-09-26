@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -420,8 +422,10 @@ func (c *Consumers) opCtx() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(c.base, opTimeout)
 }
 
-// startWorker is the lease manager's onAcquire callback. It runs under the
-// manager's lock so wg.Add cannot race with the shutdown wg.Wait.
+// startWorker is the lease manager's onAcquire callback. It runs in the lease
+// loop goroutine; a worker started after Run began stopping exits at once.
+// The worker is attached to the lease before it starts so that a surplus
+// release is always performed by the worker, never under its feet.
 func (c *Consumers) startWorker(l *lease) {
 	c.obs.LeaseAcquired(l.key.group, l.key.topic, l.key.partition, l.epoch)
 	if c.stopping.Load() {
@@ -431,6 +435,7 @@ func (c *Consumers) startWorker(l *lease) {
 		c: c, l: l, group: l.key.group, topic: l.key.topic, partition: l.key.partition,
 		stream: c.keys.Stream(l.key.topic, l.key.partition),
 	}
+	l.attachWorker()
 	c.wg.Add(1)
 	go w.run()
 }
@@ -531,6 +536,7 @@ func (w *partitionWorker) key() leaseKey { return w.l.key }
 
 func (w *partitionWorker) run() {
 	defer w.c.wg.Done()
+	defer w.exit()
 	c := w.c
 	log := c.logger.With("group", w.group, "stream", w.stream, "node", c.node, "epoch", w.l.epoch)
 	if !w.ensureGroup(log) {
@@ -540,6 +546,10 @@ func (w *partitionWorker) run() {
 	cursor := "0-0"
 	for {
 		if w.stopNow() {
+			return
+		}
+		if w.l.isReleasing() {
+			w.drainForRelease(log)
 			return
 		}
 		var msgs []redis.XMessage
@@ -559,16 +569,14 @@ func (w *partitionWorker) run() {
 					// for ClaimMinIdle: wait for them rather than read past
 					// them, which would reorder the key (spec 7.2).
 					log.Debug("waiting for foreign pending entries", "count", foreign)
-					if !w.wait(c.cfg.ReadBlock) {
-						return
-					}
+					w.wait(c.cfg.ReadBlock)
 					continue
 				}
 				phase = phasePending
 				continue
 			}
 		case phasePending:
-			msgs, err = w.read("0", -1)
+			msgs, err = w.read(w.l.workCtx, "0", -1)
 			if err == nil && len(msgs) == 0 {
 				phase = phaseNew
 				continue
@@ -581,11 +589,14 @@ func (w *partitionWorker) run() {
 				continue
 			}
 			needCounts = false
-			msgs, err = w.read(">", c.cfg.ReadBlock)
+			msgs, err = w.read(w.l.workCtx, ">", c.cfg.ReadBlock)
+			if err == nil && len(msgs) > 0 {
+				msgs, needCounts = w.claimForeignBefore(log, msgs)
+			}
 		}
 		if err != nil {
-			if w.stopNow() {
-				return
+			if w.stopNow() || w.l.isReleasing() {
+				continue // the loop head exits or drains
 			}
 			if isNoGroup(err) {
 				if !w.ensureGroup(log) {
@@ -594,9 +605,7 @@ func (w *partitionWorker) run() {
 				continue
 			}
 			log.Warn("stream read failed", "phase", int(phase), "error", err)
-			if !w.wait(c.backoff.jittered(1)) {
-				return
-			}
+			w.wait(c.backoff.jittered(1))
 			continue
 		}
 		if len(msgs) == 0 {
@@ -608,24 +617,86 @@ func (w *partitionWorker) run() {
 	}
 }
 
+// exit runs when the worker goroutine ends. A surplus lease is released
+// here, after the worker has finished the entries it held and its blocking
+// read has returned, so the next owner never starts while this consumer can
+// still take entries (spec 7.2, G6). Shutdown releases nothing here: Run
+// releases every lease after joining the workers. A lost lease is gone
+// already.
+func (w *partitionWorker) exit() {
+	if !w.l.isReleasing() {
+		return
+	}
+	ctx, cancel := w.c.opCtx()
+	defer cancel()
+	w.c.lm.release(ctx, w.l, LeaseEndSurplus)
+}
+
+// drainForRelease runs before a surplus release, once markRelease has
+// canceled the work context: the worker takes no new entries, but it
+// processes what was already delivered to this consumer, which is anything
+// the interrupted blocking read put into the PEL (the rest of a batch in
+// hand was finished by process). The next owner then starts from an empty
+// PEL instead of waiting ClaimMinIdle for it, and per-key order holds
+// across the handover. An entry that fails, or a read failure, leaves the
+// rest pending for the next owner's drain-first pass.
+func (w *partitionWorker) drainForRelease(log *slog.Logger) {
+	drained := 0
+	last := ""
+	for {
+		if w.stopNow() {
+			return
+		}
+		msgs, err := w.read(w.l.ctx, "0", -1)
+		if err != nil {
+			log.Warn("own pending read failed before the surplus release; entries stay pending", "error", err)
+			return
+		}
+		if len(msgs) == 0 || msgs[0].ID == last {
+			// Empty, or an entry whose XACK failed came back: leave it.
+			break
+		}
+		last = msgs[0].ID
+		if !w.process(log, msgs, true) {
+			return
+		}
+		drained += len(msgs)
+	}
+	log.Info("surplus lease drained; releasing", "drained", drained)
+}
+
 // stopNow reports whether the worker must exit: shutdown or lease end. A
-// surplus lease is released by the manager itself while the worker is idle,
-// or by finish right after the in-flight entry, so the worker only ever
-// observes the canceled lease context.
+// surplus release is not an exit condition; the worker sees it through
+// isReleasing, drains, and releases the lease itself before it returns.
 func (w *partitionWorker) stopNow() bool {
 	return w.c.stopping.Load() || w.l.ctx.Err() != nil
 }
 
-// wait sleeps d unless shutdown or lease loss interrupts; it returns false
-// when interrupted.
+// wait sleeps d unless shutdown, lease loss, or a pending surplus release
+// interrupts; it returns false when interrupted.
 func (w *partitionWorker) wait(d time.Duration) bool {
 	select {
 	case <-w.c.clock.After(d):
 		return true
 	case <-w.c.readCtx.Done():
 		return false
-	case <-w.l.ctx.Done():
+	case <-w.l.workCtx.Done():
 		return false
+	}
+}
+
+// readCtx derives the context of one stream read from parent (the lease's
+// work context, or the lease context itself while draining for a surplus
+// release), bounded by timeout and canceled by shutdown as well. go-redis
+// closes the connection of a blocking read whose context is canceled; an
+// entry Redis delivered at that moment sits in this consumer's PEL, where
+// drainForRelease or the next owner's drain-first pass finds it.
+func (w *partitionWorker) readCtx(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	stop := context.AfterFunc(w.c.readCtx, cancel)
+	return ctx, func() {
+		stop()
+		cancel()
 	}
 }
 
@@ -645,7 +716,7 @@ func (w *partitionWorker) ensureGroup(log *slog.Logger) bool {
 }
 
 func (w *partitionWorker) autoclaim(cursor string) ([]redis.XMessage, string, error) {
-	ctx, cancel := context.WithTimeout(w.c.readCtx, opTimeout)
+	ctx, cancel := w.readCtx(w.l.workCtx, opTimeout)
 	defer cancel()
 	if err := testkit.Fault(ctx, "redis.xautoclaim"); err != nil {
 		return nil, cursor, err
@@ -663,13 +734,13 @@ func (w *partitionWorker) autoclaim(cursor string) ([]redis.XMessage, string, er
 	return msgs, next, nil
 }
 
-// read is XREADGROUP from id; block < 0 means no BLOCK clause.
-func (w *partitionWorker) read(id string, block time.Duration) ([]redis.XMessage, error) {
+// read is XREADGROUP from id under parent; block < 0 means no BLOCK clause.
+func (w *partitionWorker) read(parent context.Context, id string, block time.Duration) ([]redis.XMessage, error) {
 	timeout := opTimeout
 	if block > 0 {
 		timeout = block + opTimeout
 	}
-	ctx, cancel := context.WithTimeout(w.c.readCtx, timeout)
+	ctx, cancel := w.readCtx(parent, timeout)
 	defer cancel()
 	if err := testkit.Fault(ctx, "redis.xreadgroup"); err != nil {
 		return nil, err
@@ -702,6 +773,107 @@ func (w *partitionWorker) foreignPending() (int64, error) {
 		}
 	}
 	return n, nil
+}
+
+// claimForeignBefore closes the involuntary handover race (spec 7.2, G6). A
+// previous owner whose lease expired while it was paused may still have a
+// blocking XREADGROUP outstanding; Redis serves the older blocked reader
+// first, so an entry with an ID below this batch can land in that consumer's
+// PEL after this owner's drain-first pass found nothing. Before a fresh
+// batch is processed, every pending entry of another consumer with a lower
+// ID is claimed with no idle requirement and processed first, in ID order;
+// the stale owner's own late attempt becomes an inbox duplicate. The cost is
+// one XPENDING summary per batch. A failure falls back to the periodic claim
+// pass, which preserves order at the price of ClaimMinIdle latency, so the
+// batch is left unprocessed in that case.
+func (w *partitionWorker) claimForeignBefore(log *slog.Logger, msgs []redis.XMessage) ([]redis.XMessage, bool) {
+	stolen, err := w.foreignBefore(msgs[0].ID)
+	if err != nil {
+		log.Warn("foreign pending check failed; leaving the batch pending for the claim pass", "error", err)
+		return nil, false
+	}
+	if len(stolen) == 0 {
+		return msgs, false
+	}
+	log.Info("claimed entries a stale owner read past the handover", "count", len(stolen), "first", stolen[0].ID, "batch", msgs[0].ID)
+	return append(stolen, msgs...), true
+}
+
+// foreignBefore claims, in ID order, every pending entry of another consumer
+// whose ID is below id (XPENDING, then XCLAIM with min-idle 0). Fault point
+// redis.xautoclaim.
+func (w *partitionWorker) foreignBefore(id string) ([]redis.XMessage, error) {
+	ctx, cancel := w.c.opCtx()
+	defer cancel()
+	summary, err := w.c.client.XPending(ctx, w.stream, w.group).Result()
+	if err != nil {
+		return nil, err
+	}
+	foreign := false
+	for consumer, n := range summary.Consumers {
+		if consumer != w.c.node && n > 0 {
+			foreign = true
+			break
+		}
+	}
+	if !foreign {
+		return nil, nil
+	}
+	var ids []string
+	start := "-"
+	for {
+		pending, err := w.c.client.XPendingExt(ctx, &redis.XPendingExtArgs{
+			Stream: w.stream, Group: w.group, Start: start, End: id, Count: int64(w.c.cfg.ReadBatch),
+		}).Result()
+		if err != nil {
+			return nil, err
+		}
+		for _, e := range pending {
+			if e.Consumer != w.c.node && e.ID != id {
+				ids = append(ids, e.ID)
+			}
+		}
+		if len(pending) < w.c.cfg.ReadBatch {
+			break
+		}
+		next, ok := nextStreamID(pending[len(pending)-1].ID)
+		if !ok {
+			break
+		}
+		start = next
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	if err := testkit.Fault(ctx, "redis.xautoclaim"); err != nil {
+		return nil, err
+	}
+	return w.c.client.XClaim(ctx, &redis.XClaimArgs{
+		Stream: w.stream, Group: w.group, Consumer: w.c.node, MinIdle: 0, Messages: ids,
+	}).Result()
+}
+
+// nextStreamID returns the smallest stream ID above id ("<ms>-<seq>").
+func nextStreamID(id string) (string, bool) {
+	i := strings.IndexByte(id, '-')
+	if i < 0 {
+		return "", false
+	}
+	ms, err := strconv.ParseUint(id[:i], 10, 64)
+	if err != nil {
+		return "", false
+	}
+	seq, err := strconv.ParseUint(id[i+1:], 10, 64)
+	if err != nil {
+		return "", false
+	}
+	if seq == math.MaxUint64 {
+		if ms == math.MaxUint64 {
+			return "", false
+		}
+		return strconv.FormatUint(ms+1, 10) + "-0", true
+	}
+	return id[:i+1] + strconv.FormatUint(seq+1, 10), true
 }
 
 // deliveryCounts returns the XPENDING delivery counter of each entry.
@@ -747,9 +919,9 @@ func (w *partitionWorker) process(log *slog.Logger, msgs []redis.XMessage, needC
 			return false
 		}
 		if !w.l.begin(c.clock.Now(), c.cfg.LeaseTTL) {
-			if w.l.ctx.Err() != nil || w.l.isReleasing() {
-				// Lease ended or about to be released: the remaining entries
-				// stay pending for the next owner.
+			if w.l.ctx.Err() != nil {
+				// Lease ended: the remaining entries stay pending for the
+				// next owner.
 				return false
 			}
 			// Stale: renewals have been failing. Wait for the next tick,

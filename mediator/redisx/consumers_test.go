@@ -226,3 +226,24 @@ func TestNopObserver(t *testing.T) {
 	o.Pending("g", "t", 0, 1, time.Second)
 	o.DLQSize("g", 0)
 }
+
+func TestNextStreamID(t *testing.T) {
+	cases := []struct {
+		in, want string
+		ok       bool
+	}{
+		{"5-3", "5-4", true},
+		{"1700000000000-0", "1700000000000-1", true},
+		{"5-18446744073709551615", "6-0", true},
+		{"18446744073709551615-18446744073709551615", "", false},
+		{"nodash", "", false},
+		{"5-x", "", false},
+		{"x-1", "", false},
+	}
+	for _, c := range cases {
+		got, ok := nextStreamID(c.in)
+		if got != c.want || ok != c.ok {
+			t.Errorf("nextStreamID(%q) = %q %v, want %q %v", c.in, got, ok, c.want, c.ok)
+		}
+	}
+}

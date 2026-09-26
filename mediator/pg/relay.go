@@ -310,6 +310,11 @@ type slot struct {
 	unpublished atomic.Int64
 	oldestAge   atomic.Int64
 	lastErr     atomic.Pointer[string]
+	// lastStreamID mirrors the cursor's last_stream_id (set from the cursor
+	// by checkDataLoss and from the batch after each commit) so relayOnce
+	// can compare the stream tail with it before every append (7.7 under
+	// load). Nil until a cursor exists.
+	lastStreamID atomic.Pointer[string]
 }
 
 func newSlot(store slotStore, sink StreamSink, cfg *RelayConfig, counters *relayCounters, topic string, partition int) *slot {
@@ -329,7 +334,10 @@ func (s *slot) stats() SlotStats {
 }
 
 // run is the per-slot loop of 6.4: drain batches, then wait for a wake-up
-// or the poll interval; the poll also runs the data-loss check of 7.7.
+// or the poll interval. The poll runs the data-loss check of 7.7 for idle
+// slots; a busy slot runs it inside relayOnce before every append, because
+// under load the wake-up arrives first and appending to a stream Redis has
+// lost would move its tail past the cursor and hide the loss for good.
 func (s *slot) run(ctx context.Context) {
 	s.check(ctx)
 	for {
@@ -387,9 +395,17 @@ func (s *slot) fail(err error) {
 }
 
 // relayOnce relays one batch: BEGIN and SELECT ... FOR UPDATE SKIP LOCKED,
-// append to the sink, UPDATE published_at, upsert the cursor, COMMIT. Any
-// failure rolls back so no row is marked that was not appended; entries
-// already appended become duplicates the inbox handles.
+// compare the stream tail with the cursor (7.7), append to the sink, UPDATE
+// published_at, upsert the cursor, COMMIT. Any failure rolls back so no row
+// is marked that was not appended; entries already appended become
+// duplicates the inbox handles.
+//
+// The tail check costs one XREVRANGE COUNT 1 per non-empty batch. It cannot
+// be skipped when the previous append was the last thing that happened to
+// the stream, because the loss can occur between two appends: the check is
+// what makes the second append safe. The residual window is the round trip
+// between the tail reply and the XADD; a loss inside it is invisible to the
+// cursor comparison, as it would be to the poll of 7.7.
 func (s *slot) relayOnce(ctx context.Context) (int, error) {
 	b, err := s.store.BeginBatch(ctx, s.topic, s.partition, s.cfg.BatchSize)
 	if err != nil {
@@ -398,6 +414,19 @@ func (s *slot) relayOnce(ctx context.Context) (int, error) {
 	entries := b.Entries()
 	if len(entries) == 0 {
 		return 0, b.Rollback(ctx)
+	}
+	if last := s.lastStreamID.Load(); last != nil && *last != "" {
+		tailID, _, tailOK, err := s.sink.Tail(ctx, s.topic, s.partition)
+		if err != nil {
+			_ = b.Rollback(ctx)
+			return 0, fmt.Errorf("relay: stream tail: %w", err)
+		}
+		if needsReplay(*last, tailID, tailOK) {
+			if _, err := s.checkDataLoss(ctx); err != nil {
+				_ = b.Rollback(ctx)
+				return 0, err
+			}
+		}
 	}
 	lastID, err := s.sink.Append(ctx, s.topic, s.partition, entries)
 	if err != nil {
@@ -411,6 +440,7 @@ func (s *slot) relayOnce(ctx context.Context) (int, error) {
 	if err := b.Commit(ctx); err != nil {
 		return 0, fmt.Errorf("relay: commit: %w", err)
 	}
+	s.lastStreamID.Store(&lastID)
 	s.counters.published.Add(int64(len(entries)))
 	return len(entries), nil
 }
@@ -424,6 +454,7 @@ func (s *slot) checkDataLoss(ctx context.Context) (int, error) {
 	if err != nil || !ok {
 		return 0, err
 	}
+	s.lastStreamID.Store(&cur.LastStreamID)
 	tailID, tailOutbox, tailOK, err := s.sink.Tail(ctx, s.topic, s.partition)
 	if err != nil {
 		return 0, fmt.Errorf("relay: stream tail: %w", err)
@@ -463,6 +494,7 @@ func (s *slot) checkDataLoss(ctx context.Context) (int, error) {
 		if err := s.store.SaveCursor(ctx, s.topic, s.partition, lastOutbox, lastStream); err != nil {
 			return replayed, err
 		}
+		s.lastStreamID.Store(&lastStream)
 	}
 	if s.cfg.KnownGroups != nil {
 		if groups := s.cfg.KnownGroups(); len(groups) > 0 {

@@ -191,30 +191,14 @@ func (g Gap) String() string {
 // Completeness is the gate of spec 11.8: every catalogued point that is not
 // in allowed (point -> reason) must have been exercised by every kind. It
 // returns the gaps sorted by point, and the allowed points that were in fact
-// fully covered, so a stale allowance can be reported and removed.
+// fully covered, so a stale allowance can be reported and removed. See
+// CompletenessWith for per-kind allowances.
 func Completeness(catalogue []string, cov *Coverage, kinds []string, allowed map[string]string) (gaps []Gap, staleAllowed []string) {
-	for _, p := range catalogue {
-		var missing []string
-		for _, k := range kinds {
-			if !cov.Has(p, k) {
-				missing = append(missing, k)
-			}
-		}
-		if _, ok := allowed[p]; ok {
-			if len(missing) == 0 {
-				staleAllowed = append(staleAllowed, p)
-			}
-			continue
-		}
-		if len(missing) == len(kinds) {
-			gaps = append(gaps, Gap{Point: p})
-		} else if len(missing) > 0 {
-			gaps = append(gaps, Gap{Point: p, Missing: missing})
-		}
+	conv := make(map[string]Allowance, len(allowed))
+	for p, reason := range allowed {
+		conv[p] = Allow(reason)
 	}
-	sort.Slice(gaps, func(i, j int) bool { return gaps[i].Point < gaps[j].Point })
-	sort.Strings(staleAllowed)
-	return gaps, staleAllowed
+	return CompletenessWith(catalogue, cov, kinds, conv)
 }
 
 // Environment variable names of a child process run.

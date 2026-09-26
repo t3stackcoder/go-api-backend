@@ -121,48 +121,85 @@ func (k leaseKey) String() string {
 
 // lease is one owned partition lease. ctx is canceled when the lease is lost
 // or released, which cancels the in-flight handler of that partition.
+// workCtx is a child of ctx that is canceled as soon as the lease is marked
+// surplus: it interrupts the worker's blocking read so the worker stops
+// taking new entries, while ctx, and with it the lease, stays live until the
+// worker has finished what it holds.
+//
+// Release protocol (spec 7.2, G6): a lease with a worker attached is
+// released by that worker, after its outstanding read has returned and the
+// entries it held are processed or left pending on purpose; the manager
+// only marks it. A lease without a worker (none was started because the
+// node is stopping) is released by the manager as soon as no message is in
+// flight. Releasing a lease while its owner still has a blocking XREADGROUP
+// outstanding lets that read deliver an entry into a PEL nobody drains
+// until ClaimMinIdle, and the new owner reads past it.
 type lease struct {
-	key    leaseKey
-	epoch  int64
-	value  string
-	ctx    context.Context
-	cancel context.CancelFunc
+	key      leaseKey
+	epoch    int64
+	value    string
+	ctx      context.Context
+	cancel   context.CancelFunc
+	workCtx  context.Context
+	stopWork context.CancelFunc
 
 	mu        sync.Mutex
 	busy      bool      // a message is in flight
-	releasing bool      // surplus: release after the current message
+	releasing bool      // surplus: release once the worker has drained
+	worker    bool      // a partition worker owns the release
 	ended     bool      // lost or released
 	lastRenew time.Time // last successful acquire or renew
 }
 
-// begin marks a message in flight. It returns false when the lease is
-// releasing, ended, or stale (last renewal older than ttl), in which case the
-// caller must not process the entry.
+// newLease builds a live lease whose contexts descend from base.
+func newLease(base context.Context, key leaseKey, epoch int64, value string, now time.Time) *lease {
+	lctx, cancel := context.WithCancel(base)
+	wctx, stopWork := context.WithCancel(lctx)
+	return &lease{key: key, epoch: epoch, value: value, ctx: lctx, cancel: cancel, workCtx: wctx, stopWork: stopWork, lastRenew: now}
+}
+
+// attachWorker records that a partition worker serves the lease and will
+// perform its surplus release; the manager then never releases it directly.
+func (l *lease) attachWorker() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.worker = true
+}
+
+// begin marks a message in flight. It returns false when the lease is ended
+// or stale (last renewal older than ttl), or releasing without a worker, in
+// which case the caller must not process the entry. A worker keeps
+// processing the entries it already holds while the lease is releasing.
 func (l *lease) begin(now time.Time, ttl time.Duration) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.releasing || l.ended || now.Sub(l.lastRenew) >= ttl {
+	if l.ended || (l.releasing && !l.worker) || now.Sub(l.lastRenew) >= ttl {
 		return false
 	}
 	l.busy = true
 	return true
 }
 
-// end clears the in-flight mark and reports whether a deferred release is due.
+// end clears the in-flight mark and reports whether a deferred release is
+// due; with a worker attached the worker releases, so this is always false.
 func (l *lease) end() (releaseNow bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.busy = false
-	return l.releasing && !l.ended
+	return l.releasing && !l.ended && !l.worker
 }
 
-// markRelease flags the lease as surplus and reports whether it can be
-// released right away (no message in flight).
+// markRelease flags the lease as surplus, interrupts the worker's read, and
+// reports whether the manager may release it right away: only when no
+// worker is attached and no message is in flight.
 func (l *lease) markRelease() (releaseNow bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.releasing = true
-	return !l.busy && !l.ended
+	if l.stopWork != nil {
+		l.stopWork()
+	}
+	return !l.worker && !l.busy && !l.ended
 }
 
 // fresh reports whether the lease is live and was renewed within ttl.
@@ -379,12 +416,11 @@ func (lm *leaseManager) acquire(ctx context.Context, key leaseKey) bool {
 	if !ok {
 		return false
 	}
-	lctx, cancel := context.WithCancel(lm.base)
-	l := &lease{key: key, epoch: epoch, value: value, ctx: lctx, cancel: cancel, lastRenew: lm.clock.Now()}
+	l := newLease(lm.base, key, epoch, value, lm.clock.Now())
 	lm.mu.Lock()
 	if lm.stopped {
 		lm.mu.Unlock()
-		cancel()
+		l.cancel()
 		_, _ = lm.store.release(ctx, lm.keys.Lease(key.group, key.topic, key.partition), value)
 		return false
 	}
@@ -436,8 +472,9 @@ func (lm *leaseManager) end(l *lease, reason string) {
 	}
 }
 
-// finish is called by a worker after each message: it clears the busy mark
-// and performs a deferred surplus release when one is due.
+// finish is called after each message: it clears the busy mark and, for a
+// lease without a worker, performs a deferred surplus release when one is
+// due. A worker releases its own surplus lease when it exits instead.
 func (lm *leaseManager) finish(ctx context.Context, l *lease) {
 	if l.end() {
 		lm.release(ctx, l, LeaseEndSurplus)

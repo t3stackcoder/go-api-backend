@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -472,4 +473,125 @@ func TestRelay_ConstructionAndWake(t *testing.T) {
 	if c.Partitions != 1 || c.BatchSize != 100 || c.PollInterval != time.Second || c.MinBackoff != 100*time.Millisecond || c.MaxBackoff != 10*time.Second || c.Logger == nil || c.Clock == nil {
 		t.Fatalf("defaults: %+v", c)
 	}
+}
+
+// TestSlot_TailCheckPerBatch is 7.7 under load: a loss between two batches
+// is detected before the next append, at the cost of one Tail per non-empty
+// batch, and a failing check or replay rolls the batch back.
+func TestSlot_TailCheckPerBatch(t *testing.T) {
+	ctx := context.Background()
+	store := &fakeSlotStore{}
+	sink := memstore.NewStreams(nil)
+	var tails atomic.Int32
+	sink.Hooks.Tail = func(string, int) error { tails.Add(1); return nil }
+	s := newSlot(store, sink, pg.RelayConfig{BatchSize: 10, KnownGroups: func() []string { return []string{"proj"} }})
+
+	// The first batch has no cursor to compare with: no check.
+	store.add(1)
+	if n, err := s.RelayOnce(ctx); n != 1 || err != nil || tails.Load() != 0 {
+		t.Fatalf("first batch: n=%d err=%v tails=%d", n, err, tails.Load())
+	}
+	// Every following non-empty batch checks the tail once.
+	store.add(2)
+	if n, err := s.RelayOnce(ctx); n != 1 || err != nil || tails.Load() != 1 {
+		t.Fatalf("second batch: n=%d err=%v tails=%d", n, err, tails.Load())
+	}
+	if n, err := s.RelayOnce(ctx); n != 0 || err != nil || tails.Load() != 1 {
+		t.Fatalf("empty batch must not check: n=%d err=%v tails=%d", n, err, tails.Load())
+	}
+	// Redis loses everything between two batches: the check before the
+	// third append replays rows 1 and 2, recreates the groups, then the
+	// batch is appended. checkDataLoss adds its own Tail.
+	sink.Drop("t", 0)
+	store.add(3)
+	if n, err := s.RelayOnce(ctx); n != 1 || err != nil || tails.Load() != 3 {
+		t.Fatalf("batch after loss: n=%d err=%v tails=%d", n, err, tails.Load())
+	}
+	entries := sink.Entries("t", 0)
+	if len(entries) != 3 || entries[0].Entry.ID != 1 || entries[1].Entry.ID != 2 || entries[2].Entry.ID != 3 || s.Replayed() != 2 {
+		t.Fatalf("sink after loss: %+v replayed=%d", entries, s.Replayed())
+	}
+	if g := sink.Groups("t", 0); len(g) != 1 || g[0] != "proj" {
+		t.Fatalf("groups: %v", g)
+	}
+	if store.cursor.LastOutboxID != 3 || store.cursor.LastStreamID != entries[2].ID {
+		t.Fatalf("cursor: %+v", store.cursor)
+	}
+	// A restore from an old snapshot (tail behind the cursor) is caught
+	// the same way.
+	sink.Truncate("t", 0, 1)
+	store.add(4)
+	if n, err := s.RelayOnce(ctx); n != 1 || err != nil || s.Replayed() != 4 {
+		t.Fatalf("batch after restore: n=%d err=%v replayed=%d", n, err, s.Replayed())
+	}
+	if entries = sink.Entries("t", 0); len(entries) != 4 || entries[3].Entry.ID != 4 {
+		t.Fatalf("sink after restore: %+v", entries)
+	}
+	// The check failing rolls the batch back: nothing marked, nothing appended.
+	sink.Hooks.Tail = func(string, int) error { return errors.New("info failed") }
+	store.add(5)
+	if _, err := s.RelayOnce(ctx); err == nil {
+		t.Fatal("tail error must fail the batch")
+	}
+	if u := store.unpublished(); len(u) != 1 || u[0] != 5 || len(sink.Entries("t", 0)) != 4 {
+		t.Fatalf("after tail error: unpublished=%v sink=%d", u, len(sink.Entries("t", 0)))
+	}
+	// A replay failing inside the batch rolls it back too, and the retry
+	// replays and appends.
+	sink.Hooks.Tail = nil
+	sink.Drop("t", 0)
+	store.failAfter = errors.New("select failed")
+	if _, err := s.RelayOnce(ctx); err == nil {
+		t.Fatal("replay error must fail the batch")
+	}
+	if u := store.unpublished(); len(u) != 1 || u[0] != 5 {
+		t.Fatalf("after replay error: unpublished=%v", u)
+	}
+	store.failAfter = nil
+	if n, err := s.RelayOnce(ctx); n != 1 || err != nil || s.Replayed() != 8 {
+		t.Fatalf("retry: n=%d err=%v replayed=%d", n, err, s.Replayed())
+	}
+	if entries = sink.Entries("t", 0); len(entries) != 5 || entries[4].Entry.ID != 5 {
+		t.Fatalf("sink after retry: %+v", entries)
+	}
+}
+
+// TestSlot_RunLoop_DetectsLossOnWake drives the loop with wake-ups only (the
+// poll never comes) and loses the stream between two of them.
+func TestSlot_RunLoop_DetectsLossOnWake(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		store := &fakeSlotStore{}
+		store.add(1)
+		sink := memstore.NewStreams(nil)
+		cfg := pg.RelayConfig{BatchSize: 10, PollInterval: time.Hour, KnownGroups: func() []string { return []string{"proj"} }}
+		s := newSlot(store, sink, cfg)
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			s.Run(ctx)
+		}()
+		t.Cleanup(func() {
+			cancel()
+			<-done
+		})
+		synctest.Wait()
+		if len(sink.Entries("t", 0)) != 1 {
+			t.Fatal("initial drain")
+		}
+		sink.Drop("t", 0) // FLUSHALL
+		store.add(2)
+		s.Wake()
+		synctest.Wait()
+		entries := sink.Entries("t", 0)
+		if len(entries) != 2 || entries[0].Entry.ID != 1 || entries[1].Entry.ID != 2 || s.Replayed() != 1 {
+			t.Fatalf("loss undetected on the wake-up path: %+v replayed=%d", entries, s.Replayed())
+		}
+		if g := sink.Groups("t", 0); len(g) != 1 {
+			t.Fatalf("groups not recreated: %v", g)
+		}
+		if st := s.Stats(); st.LastError != "" || s.Errors() != 0 {
+			t.Fatalf("replay must not count as an error: %+v", st)
+		}
+	})
 }
