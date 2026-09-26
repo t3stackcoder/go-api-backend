@@ -285,6 +285,7 @@ too; this list is the index.
   separate inner behavior after `Idempotency`; `Cache` (queries) sits
   outside the unit of work.
 * Idempotency is scoped to commands that have a unit of work
+  (`mediator.Where(hasUnitOfWork)`), which makes
   the core's "RetryPolicy with NoUnitOfWork is allowed when IdempotencyKey exists"
   rule vacuous for the standard chain. The core keeps allowing it (an
   application may wire its own key-based idempotency without a transaction),
