@@ -3,21 +3,19 @@
 # commands are defined once in tools/task.
 #
 # Push and pull request: static, unit, fuzz-short, integration, sweep, openapi.
-# Nightly (03:00 UTC) or manual dispatch with `nightly=true`: fuzz for 30 min
-# per target, mutation testing, benchmarks with the benchstat gate, and the
-# chaos matrix against the compose `chaos` profile.
+# Manual dispatch with `nightly=true` only (there is no cron schedule): fuzz
+# for 30 min per target, mutation testing, benchmarks with the benchstat
+# gate, and the chaos matrix against the compose `chaos` profile.
 name: ci
 
 on:
   push:
     branches: [main]
   pull_request:
-  schedule:
-    - cron: "0 3 * * *"
   workflow_dispatch:
     inputs:
       nightly:
-        description: "Also run the nightly jobs (fuzz 30m, mutate, bench, chaos matrix)"
+        description: "Also run the long tiers (fuzz 30m, mutate, bench, chaos matrix)"
         type: boolean
         default: false
 
@@ -183,10 +181,10 @@ jobs:
             npx --yes -p typescript tsc --noEmit /tmp/api.d.ts
           '
 
-  # ---------------------------------------------------------------- nightly
+  # ------------------------------------------- long tiers, manual dispatch only
   nightly-fuzz:
-    name: nightly fuzz (30m per target)
-    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.nightly)
+    name: long fuzz (30m per target)
+    if: github.event_name == 'workflow_dispatch' && inputs.nightly
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
@@ -206,8 +204,8 @@ jobs:
           if-no-files-found: ignore
 
   nightly-mutate:
-    name: nightly mutation testing (gremlins, efficacy >= 95)
-    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.nightly)
+    name: mutation testing (gremlins, efficacy >= 95)
+    if: github.event_name == 'workflow_dispatch' && inputs.nightly
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
@@ -222,8 +220,8 @@ jobs:
         run: go run ./tools/task mutate
 
   nightly-bench:
-    name: nightly benchmarks (benchstat gate, 10% on the median)
-    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.nightly)
+    name: benchmarks (benchstat gate, 10% on the median)
+    if: github.event_name == 'workflow_dispatch' && inputs.nightly
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -258,8 +256,8 @@ jobs:
           key: bench-baseline-${{ github.sha }}
 
   nightly-chaos:
-    name: nightly chaos ${{ matrix.workload }} (seeds 1-3, 20m each)
-    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.nightly)
+    name: chaos ${{ matrix.workload }} (seeds 1-3, 20m each)
+    if: github.event_name == 'workflow_dispatch' && inputs.nightly
     runs-on: ubuntu-latest
     timeout-minutes: 150
     strategy:

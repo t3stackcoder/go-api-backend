@@ -12,8 +12,13 @@ fix, the full gate run, and the 95 percent gate).
 ## 1. Where things stand
 
 Module `github.com/t3stackcoder/go-api-backend`, `go 1.27`. The branch is
-`main`; there is no git remote, so CI (`.github/workflows/ci.yml`) has never
-run. The whole tree builds, vets, and is gofmt-clean under every build tag
+`main`, pushed to `origin` (github.com/t3stackcoder/go-api-backend, public)
+in the eighth session; CI (`.github/workflows/ci.yml`) ran for the first
+time on that push. The workflow has no cron schedule: the user removed it,
+because there is nothing substantial to soak nightly until there is a
+front end, so the long tiers (fuzz 30 m, mutation, bench, chaos matrix)
+run only by manual dispatch with `nightly=true`. The whole tree builds,
+vets, and is gofmt-clean under every build tag
 (`integration`, `faultinject`, `faultsweep`, `chaos`), and `go mod tidy` is
 a no-op.
 
@@ -81,21 +86,23 @@ deliverables exist, every tier is green locally, and the mutation triage is
 closed. What remains is the acceptance tail that needs a remote or calendar
 time.
 
-1. **CI.** No remote exists. The first push exercises tiers 0 to 4 and the
-   openapi job for the first time, including the race detector, which has
-   never run anywhere (no C compiler on this machine), and the nightly
-   mutation and benchmark jobs. The `mutate` job runs on Linux, where the
-   gremlins path bug of design-notes 8.13 does not apply, and now gates at
-   95; the first nightly run there is the first measurement of the gate on
-   a machine other than this one (timeouts are not counted against
-   efficacy, but a slower runner may turn kills into timeouts and lower
-   the killed count that efficacy is computed from; if the job fails
-   narrowly, compare its LIVED list with 8.14 before touching the gate).
-2. **Chaos at spec scale.** The nightly matrix is 5 minutes per cell over
-   seeds 1 to 3 (`task chaos-matrix`, `CHAOS_DURATION`); every cell has
-   passed at 60 s; the definition of done wants two weeks of green
-   nightlies, which is calendar time. Soak mode (`-soak`) exists and has
-   not been exercised.
+1. **CI.** The first push run (the eighth session) exercised tiers 0 to 4
+   and the openapi job for the first time, including the race detector,
+   which had never run anywhere (no C compiler on this machine): openapi
+   and integration passed; tier 0 static and tier 1 unit failed on that
+   run and were under triage when this was written, with the sweep and
+   short fuzz still running. The long tiers have not run in CI. When the
+   `mutate` job is dispatched it runs on Linux, where the gremlins path
+   bug of design-notes 8.13 does not apply, and gates at 95; a slower
+   runner may turn kills into timeouts and lower the killed count that
+   efficacy is computed from, so if it fails narrowly, compare its LIVED
+   list with 8.14 before touching the gate.
+2. **Chaos at spec scale.** The matrix is 5 minutes per cell over seeds 1
+   to 3 (`task chaos-matrix`, `CHAOS_DURATION`; 20 minutes per cell in the
+   CI job); every cell has passed at 60 s. spec 14 wants two weeks of
+   green nightly runs; the schedule is off by the user's decision, so this
+   is on demand until there is something substantial to soak. Soak mode
+   (`-soak`) exists and has not been exercised.
 3. **Commit** only when the user asks, with the attribution line the session
    specifies.
 
