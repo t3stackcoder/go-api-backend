@@ -750,8 +750,12 @@ func TestConsumers_LeaseLossCancelsHandler(t *testing.T) {
 	if d.epoch <= before {
 		t.Fatalf("epoch %d not above %d", d.epoch, before)
 	}
-	st := n.c.Stats()
-	if st.Processed[OutcomeKey{testGroup, OutcomeOK}] != 1 || st.Processed[OutcomeKey{testGroup, OutcomeError}] != 0 {
+	// The handler records the delivery before the worker acknowledges and
+	// counts it, so the counter follows the record by a moment.
+	eventually(t, 5*time.Second, "delivery counted", func() bool {
+		return n.c.Stats().Processed[OutcomeKey{testGroup, OutcomeOK}] == 1
+	})
+	if st := n.c.Stats(); st.Processed[OutcomeKey{testGroup, OutcomeError}] != 0 {
 		t.Fatalf("stats %+v", st.Processed)
 	}
 }

@@ -247,3 +247,33 @@ func TestNextStreamID(t *testing.T) {
 		}
 	}
 }
+
+func TestCompareStreamIDs(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want int
+		ok   bool
+	}{
+		{"5-3", "5-3", 0, true},
+		{"5-3", "5-4", -1, true},
+		{"5-4", "5-3", 1, true},
+		{"5-9", "6-0", -1, true},
+		{"10-0", "9-99", 1, true}, // numeric, not lexical
+		{"1700000000000-0", "1700000000001-0", -1, true},
+		{"18446744073709551615-18446744073709551615", "18446744073709551615-18446744073709551614", 1, true},
+		{"5", "5-0", 0, true}, // a missing sequence reads as 0
+		{"5", "5-1", -1, true},
+		{"", "5-0", 0, false},
+		{"5-0", "", 0, false},
+		{"x-1", "5-0", 0, false},
+		{"5-x", "5-0", 0, false},
+		{"5-0", "5-", 0, false},
+		{"-5", "5-0", 0, false},
+	}
+	for _, c := range cases {
+		got, ok := compareStreamIDs(c.a, c.b)
+		if got != c.want || ok != c.ok {
+			t.Errorf("compareStreamIDs(%q, %q) = %d %v, want %d %v", c.a, c.b, got, ok, c.want, c.ok)
+		}
+	}
+}

@@ -143,12 +143,13 @@ type lease struct {
 	workCtx  context.Context
 	stopWork context.CancelFunc
 
-	mu        sync.Mutex
-	busy      bool      // a message is in flight
-	releasing bool      // surplus: release once the worker has drained
-	worker    bool      // a partition worker owns the release
-	ended     bool      // lost or released
-	lastRenew time.Time // last successful acquire or renew
+	mu           sync.Mutex
+	busy         bool      // a message is in flight
+	releasing    bool      // surplus: release once the worker has drained
+	worker       bool      // a partition worker owns the release
+	workerExited bool      // the attached worker has returned (workerDone)
+	ended        bool      // lost or released
+	lastRenew    time.Time // last successful acquire or renew
 }
 
 // newLease builds a live lease whose contexts descend from base.
@@ -227,6 +228,15 @@ const (
 // count ceil(P / liveMembers), acquisition with a fencing epoch, renewal,
 // graceful surplus release, and loss detection. It is driven by tick, which
 // run calls every renew interval.
+//
+// Same-node re-acquire (design notes 8.7): stream commands run under the
+// node ID as consumer name, and canceling a lease context does not
+// interrupt the worker's blocking XREADGROUP (go-redis takes only the
+// socket deadline from the context). An ended lease whose worker has not
+// exited yet is kept in ending, and rebalance treats its partition as taken
+// until workerDone reports the worker gone; otherwise the node would start a
+// second reader in the same name while the first one can still take the
+// next entry into the shared PEL, and per-key order would break.
 type leaseManager struct {
 	store      leaseStore
 	fencing    pg.FencingSource
@@ -245,7 +255,8 @@ type leaseManager struct {
 
 	mu        sync.Mutex
 	owned     map[leaseKey]*lease
-	live      map[string]int // group -> live members
+	ending    map[leaseKey]*lease // ended, worker not exited: not acquirable
+	live      map[string]int      // group -> live members
 	handovers map[leaseScope]int64
 	lastTick  time.Time
 	stopped   bool // no more acquisitions
@@ -257,6 +268,7 @@ func newLeaseManager(store leaseStore, fencing pg.FencingSource, clock testkit.C
 		ttl: ttl, renew: renew, partitions: partitions, scopes: scopes, logger: logger,
 		base:      context.Background(),
 		owned:     map[leaseKey]*lease{},
+		ending:    map[leaseKey]*lease{},
 		live:      map[string]int{},
 		handovers: map[leaseScope]int64{},
 	}
@@ -345,7 +357,11 @@ func (lm *leaseManager) renewAll(ctx context.Context, now time.Time) {
 	}
 }
 
-// rebalance releases surplus leases and acquires missing ones per scope.
+// rebalance releases surplus leases and acquires missing ones per scope. A
+// partition whose ended lease still has a worker attached (ending) is not
+// available: its old reader may still be blocked in XREADGROUP under this
+// node's consumer name. It does not count toward mine either, so the node
+// takes other free partitions meanwhile and this one at a later tick.
 func (lm *leaseManager) rebalance(ctx context.Context) {
 	lm.mu.Lock()
 	stopped := lm.stopped
@@ -365,6 +381,11 @@ func (lm *leaseManager) rebalance(ctx context.Context) {
 			ownedAny[k.partition] = true
 			if !l.isReleasing() {
 				mine = append(mine, l)
+			}
+		}
+		for k := range lm.ending {
+			if k.scope() == sc {
+				ownedAny[k.partition] = true
 			}
 		}
 		lm.mu.Unlock()
@@ -421,7 +442,15 @@ func (lm *leaseManager) acquire(ctx context.Context, key leaseKey) bool {
 	if lm.stopped {
 		lm.mu.Unlock()
 		l.cancel()
-		_, _ = lm.store.release(ctx, lm.keys.Lease(key.group, key.topic, key.partition), value)
+		// The node stopped while this acquisition was in flight: give the
+		// key straight back. Not under ctx: the tick's context is canceled
+		// as soon as Run has released the owned leases, and a key that
+		// slipped past that point would otherwise sit unowned until its TTL.
+		rctx, rcancel := context.WithTimeout(lm.base, opTimeout)
+		defer rcancel()
+		if _, err := lm.store.release(rctx, lm.keys.Lease(key.group, key.topic, key.partition), value); err != nil {
+			lm.logger.Warn("lease acquired after stop could not be released; it will expire", "lease", key.String(), "epoch", epoch, "error", err)
+		}
 		return false
 	}
 	lm.owned[key] = l
@@ -452,6 +481,10 @@ func (lm *leaseManager) release(ctx context.Context, l *lease, reason string) {
 }
 
 // end cancels the lease context, forgets the lease, and notifies the owner.
+// A lease whose worker is attached and has not exited moves to ending, which
+// keeps its partition out of rebalance until workerDone; a lease without a
+// worker, or whose worker already left (shutdown releases after the workers
+// were joined), is simply forgotten.
 func (lm *leaseManager) end(l *lease, reason string) {
 	l.mu.Lock()
 	if l.ended {
@@ -465,11 +498,45 @@ func (lm *leaseManager) end(l *lease, reason string) {
 	if cur, ok := lm.owned[l.key]; ok && cur == l {
 		delete(lm.owned, l.key)
 	}
+	// The park decision and workerDone's exited mark are both taken under
+	// lm.mu, so a worker that returns between the cancel above and this
+	// point cannot slip past: either it marked itself exited first and the
+	// lease is not parked, or it is parked here and workerDone unparks it.
+	l.mu.Lock()
+	park := l.worker && !l.workerExited
+	l.mu.Unlock()
+	if park {
+		lm.ending[l.key] = l
+	}
 	onEnd := lm.onEnd
 	lm.mu.Unlock()
 	if onEnd != nil {
 		onEnd(l, reason)
 	}
+}
+
+// workerDone records that the partition worker attached to l has returned:
+// its last blocking read is back, so nothing can deliver into the PEL under
+// this node's name on l's behalf any more. The partition becomes available
+// for acquisition again. The worker calls it after exit, whose surplus
+// release ends the lease and parks it here first.
+func (lm *leaseManager) workerDone(l *lease) {
+	lm.mu.Lock()
+	l.mu.Lock()
+	l.workerExited = true
+	l.mu.Unlock()
+	if cur, ok := lm.ending[l.key]; ok && cur == l {
+		delete(lm.ending, l.key)
+	}
+	lm.mu.Unlock()
+}
+
+// endingCount returns the number of ended leases whose worker has not
+// exited (tests and diagnostics).
+func (lm *leaseManager) endingCount() int {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	return len(lm.ending)
 }
 
 // finish is called after each message: it clears the busy mark and, for a

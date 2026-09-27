@@ -73,7 +73,7 @@ func TestParseCatalogue_GoldenFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	points := ParseCatalogue(string(src))
-	if len(points) != 39 {
+	if len(points) != 40 {
 		t.Fatalf("catalogue has %d points: %v", len(points), points)
 	}
 	for _, p := range points {

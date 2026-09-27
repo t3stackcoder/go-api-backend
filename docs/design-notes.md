@@ -249,6 +249,8 @@ func WriteProblem(w http.ResponseWriter, r *http.Request, err error)
 | Shutdown on SIGTERM only | Also on stdin EOF when `SHUTDOWN_ON_STDIN_EOF=1` (`examples/orders`) | Windows cannot deliver SIGTERM to a child process; integration tests close the child's stdin to trigger the same drain |
 | Behavior constructors named after the behavior (`behavior.Cache`) | `behavior.New*` constructors; the bare names are the name constants (`behavior.Cache == mediator.NameCache`) | The name constants are re-exported from the core and are what `Use` options and logs refer to |
 | Timeout "applies `context.WithTimeout`" (5.6) | `behavior.deadlineCtx`: one allocation, observably equivalent, lazily backed by `context.WithDeadline` on the first `Done()` | G17: saves 4 allocations on the no-I/O path; children derived by pgx, go-redis, or errgroup still attach without a watcher goroutine (`TestDeadlineCtx_NoWatcherGoroutines`) |
+| Spec 6.2 table list | Migration `0002_partition_epoch.sql` adds `mediator_partition_epoch (consumer_group, topic, partition, epoch, updated_at)`, primary key `(consumer_group, topic, partition)` | Fencing at the effect (G14, 8.7): the lease store cannot close the window between Redis forgetting a lease key and the old owner's next renewal tick, so the consumer's token is checked in the transaction that applies the effect |
+| `pg.Tx` interface frozen | `FencePartition(ctx, group, topic, partition, token) (ok bool, err error)` added, fault point `pg.inbox.fence`; `Inbox()` calls it before `InboxInsert` whenever `mediator.FencingToken(ctx)` is present and returns `CodeConflict` wrapping `pg.ErrStaleLease` (not transient) when the token is below the stored epoch | The token has to be checked where the effect happens, which is Postgres (G14, 8.7); the upsert's row lock also serializes the two owners' transactions |
 
 ## 7. Decisions recorded by the package agents
 
@@ -462,43 +464,56 @@ minutes, dominated by `SweepConsumer` (156 s), `SweepRemote` (97 s), and
 `SweepRelay` (75 s). `tools/task test-sweep` passes `-timeout 60m` because
 the full matrix exceeds go test's default ten minutes.
 
-### 8.7 Chaos findings, second round (not yet fixed)
+### 8.7 Chaos findings, second round (fixed in the fifth session)
 
 `events`, 60 s, seeds 1 to 4 on the node image that carries the 8.5 fixes:
-seeds 3 and 4 pass; seeds 1 and 2 fail I6 (seed 1 also I3, seed 2 also the
+seeds 3 and 4 passed; seeds 1 and 2 failed I6 (seed 1 also I3, seed 2 also the
 fencing checkers). Run directories `test/chaos/runs/events-seed1-20260926-165740`
 and `events-seed2-20260926-165925` hold the evidence. Two defects in the
-`redisx` lease protocol, both still open; the fix plans below were worked
-out from the logs and are what the next session should implement.
+`redisx` lease protocol, both fixed as described below; the analysis is kept
+because the fixes are only understandable against it.
 
 **Same-node re-acquire overlaps the old reader.** Stream commands run under
 the node ID as consumer name. When Redis forgets a lease key (FLUSHALL,
 restore) the next renewal reports "lost to another owner", and `rebalance`
-in the same tick re-acquires the partition with a new epoch and starts a new
-worker. The old worker's `XREADGROUP ... BLOCK` is still outstanding: go-redis
-9.22 runs a command synchronously on its connection and takes only the socket
-deadline from the context, so cancelling the lease context does not interrupt
-the read (the comment on `partitionWorker.readCtx` claiming the connection is
-closed is wrong). Redis serves the older blocked reader first, so the next
-entry lands in the node's PEL under the same consumer name; the new worker's
-`claimForeignBefore` skips own entries, reads past it, and the entry waits
-for the periodic claim pass (ClaimMinIdle, 30 s) or the next surplus drain.
-Seed 1, node3: e2 seq 217 was created at 21:58:46.049 and applied at
+in the same tick re-acquired the partition with a new epoch and started a
+new worker. The old worker's `XREADGROUP ... BLOCK` is still outstanding:
+go-redis 9.22 runs a command synchronously on its connection and takes only
+the socket deadline from the context, so cancelling the lease context does
+not interrupt the read. Redis serves the older blocked reader first, so the
+next entry lands in the node's PEL under the same consumer name; the new
+worker's claim-before pass skipped own entries, read past it, and the entry
+waited for the periodic claim pass (ClaimMinIdle, 30 s) or the next surplus
+drain. Seed 1, node3: e2 seq 217 was created at 21:58:46.049 and applied at
 21:58:50.460 (audit, epoch 672, at the surplus drain) and 21:59:16.108
 (read_model, epoch 696, 30 s after 218), while 218 was applied at
 21:58:46.222; the leases were lost and re-acquired between 21:58:45.18 and
-45.26. Fix: (a) the lease manager keeps the ended leases whose worker has
-not exited and `rebalance` skips their partitions until it has; (b) the
-claim-before pass claims every pending entry below the batch, own name
-included, using the XPENDING summary's lowest ID so the common path stays at
-one round trip; (c) correct the comment. Tests: a synctest lease-manager
-test for (a); an integration test that issues a ghost read in the node's own
-name (the existing `ghostRead` helper) for (b).
+45.26. Fix, in `mediator/redisx`: (a) `leaseManager.ending` keeps an ended
+lease whose worker has not exited; `end` parks it there when a worker is
+attached and has not reported back, `workerDone` (deferred by the worker so
+that it runs after `exit`) unparks it, and `rebalance` treats a parked
+partition as taken without counting it toward the desired number, so the
+node takes other free partitions meanwhile and this one at a later tick.
+The park decision and the exited mark are both taken under the manager
+lock, so a worker that returns between the lease cancel and the park cannot
+leave the partition parked forever. (b) `claimPendingBefore` /
+`pendingBefore` (formerly `claimForeignBefore` / `foreignBefore`) claim every
+pending entry below the batch, whichever consumer holds it and the node's
+own name included; the XPENDING summary's lowest ID decides in one round
+trip whether the range scan is needed at all. The worker skips the pass once
+it is stopping, since the batch then stays pending for the next owner and a
+claim would only reset the idle time its drain-first pass waits on. (c) The
+`readCtx` comment states the go-redis behaviour correctly. Tests:
+`TestLeaseManager_LostLeaseWaitsForWorkerExit` and
+`TestLeaseManager_EndingTracksWorkerExit` (synctest),
+`TestCompareStreamIDs`, and the integration test
+`TestConsumers_ClaimsOwnStaleReaderEntriesBelowBatch`, which issues the
+ghost read in the node's own name.
 
 **A stale owner writes for up to LeaseRenew after Redis forgets its key.**
 After `redis-restore-old` (equally a flush, or a restart that loses the last
 second of AOF) the lease keys are gone; another node acquires them at once
-with higher tokens; the old owner learns at its next renewal tick and keeps
+with higher tokens; the old owner learns at its next renewal tick and kept
 reading and applying until then. Seed 2: node1 applied with 1414, 1428, and
 1474 from 22:00:24.08, when node2 acquired the same partitions with 1507,
 1523, and 1527, until its tick at 22:00:27.65. The two readers split the
@@ -506,19 +521,165 @@ entries, and the fencing checkers flag every lower token that applies after
 a higher one. The lease store cannot close this window; the token has to be
 checked where the effect happens, which for the framework is Postgres. Fix:
 migration `0002_partition_epoch.sql` with
-`mediator_partition_epoch (consumer_group, topic, partition, epoch)`;
+`mediator_partition_epoch (consumer_group, topic, partition, epoch, updated_at)`;
 `pg.Tx.FencePartition(ctx, group, topic, partition, token) (ok bool, err error)`
 as `INSERT ... ON CONFLICT DO UPDATE SET epoch = EXCLUDED.epoch WHERE
-mediator_partition_epoch.epoch <= EXCLUDED.epoch RETURNING 1` (the row lock
-also serializes the two owners' transactions); the Inbox behavior calls it
+mediator_partition_epoch.epoch <= EXCLUDED.epoch RETURNING 1` (Postgres
+locks the conflicting row even when the WHERE rejects the update, which is
+what serializes the two owners' transactions); the Inbox behavior calls it
 before `InboxInsert` whenever `mediator.FencingToken(ctx)` is present and
-returns `mediator.Wrap(CodeConflict, ..., pg.ErrStaleLease)` when no row
-comes back; `redisx` `handle` recognizes `pg.ErrStaleLease`, ends the lease
-(`LeaseEndLost`) and stops the worker instead of retrying or dead-lettering;
-`testkit/memstore` and `pg/storetest` gain the method and a conformance
-test; new fault point `pg.inbox.fence` (a `testkit.Fault` call only, so the
-ambiguous kind is excused by construction). The table and the `Tx` method
-are additions to spec 6.2 and to the frozen `pg.Tx` interface: add both to
-the section 6 table when they land. Seed 2's I6 violations (e6, e0) fit the
+returns `mediator.Wrap(CodeConflict, ..., pg.ErrStaleLease)` (not
+transient) when no row comes back; `redisx` `handle` recognizes
+`pg.ErrStaleLease`, releases the lease with reason `LeaseEndLost` (a
+compare-and-delete, so a key Redis still holds with this node's old value
+after a snapshot restore is freed at once instead of blocking the
+re-acquire until the TTL) and stops the worker without counting an error;
+the entry stays pending for the new owner's claim pass. `testkit/memstore`
+and `pg/storetest` gained the method and the `PartitionEpochFence`
+conformance test; new fault point `pg.inbox.fence` (a `testkit.Fault` call
+only, so the ambiguous kind is excused by construction), swept by
+`SweepConsumer`. The table and the `Tx` method are recorded in the section 6
+table. Tests: `TestInbox_FencesStaleLease` (memstore) and the integration
+test `TestConsumers_StaleLeaseFenceEndsLeaseAndReacquires`, which also pins
+the re-acquire under LeaseTTL. Seed 2's I6 violations (e6, e0) fit the
 first defect: node2 lost and re-acquired its leases within one tick at
 21:59:58.97 and 22:00:24.06.
+
+The chaos results after both fixes are in 8.8.
+
+### 8.8 Chaos results after the 8.7 fixes
+
+`events`, 60 s, on the node image rebuilt with both fixes (fifth session,
+2026-09-26). Run directories under `test/chaos/runs/` (gitignored).
+
+| Seed | Run | Nemeses drawn | Result |
+|---|---|---|---|
+| 1 | `events-seed1-20260926-182859` | bandwidth, handler-rotate, latency, pause, redis-flush | pass (was I3, I6) |
+| 2 | `events-seed2-20260926-183044` | graceful-restart, latency, pause, redis-restore-old x2 | pass (was I6, fencing_db, fencing_logs) |
+| 3 | `events-seed3-20260926-183247` | graceful-restart, latency, partition-pg, partition-redis, reset | pass |
+| 4 | `events-seed4-20260926-183429` | bandwidth, pause, relay-kill, reset x2 | pass |
+| 5 | `events-seed5-20260926-183721` | bandwidth, handler-rotate x2, partition-pg, partition-redis, redis-flush | pass |
+| 6 | `events-seed6-20260926-183952` | bandwidth, handler-rotate, partition-redis, redis-flush, reset | pass |
+| 7 | `events-seed7-20260926-184133` | kill, latency, partition-pg, pg-restart, relay-kill x2 | pass |
+| 8 | `events-seed8-20260926-184259` | handler-rotate x2, pg-restart, redis-flush, redis-restore-old | pass |
+
+Every run passes all fifteen checkers (I1 to I6, L1, L2, DLQ, fencing_db,
+fencing_logs, logscan, shutdown, workload, workload_db). The fixes are
+visible in the node logs: seed 2 shows `delivery rejected by the partition
+fence; giving the lease up` 10 times (node1 4, node2 6) and `claimed pending
+entries below the batch` 15 times across the three nodes; seed 1 shows 32
+`lease lost to another owner` lines and neither message, because after a
+flush the workers' blocked reads return at once (Redis unblocks a reader
+whose stream key is deleted), so the workers exit and unpark their
+partitions before the same tick's rebalance, and the re-acquired worker
+finds nothing foreign to claim; the synctest tests cover the case where
+the worker is still blocked. Seeds 5, 6, and 8 exercised both paths too
+(fence rejections 2, 2, and 0; claim-below passes 13, 10, and 7); seed 7
+lost only 3 leases and needed neither. Seeds 7 and 8 are the first live
+runs to draw `kill` (seed 7) and `pg-restart` (both); both pass.
+
+### 8.9 Fault sweep, second round
+
+Quick matrix (`SWEEP_QUICK=1`, first hit of every point, no resource
+variants) after the 8.7 fixes, with the catalogue at 40 points: all eight
+scenarios ran in 543 s, `TestFaultSweepCompleteness` passes (`cancel`,
+`crash`, `delay`, `error`, `permanent`, `timeout` 38/40 each, the two
+outright exclusions; `ambiguous` 8/40 with 30 points excused for having no
+`FaultAfter` site), and `pg.inbox.fence` is swept by `SweepConsumer` and
+`SweepShutdown` under every kind (its ambiguous cell is excused by
+construction, its crash cell is a `crash-before`). One cell failed:
+`SweepShutdown/redis.xreadgroup#1/shutdown` reported `lease still held
+after shutdown: group=read_model partition=0 node=n1 epoch=6 ttl=1.19s`
+2 times in 4 reruns, always with the runtime returning about 290 ms after
+start.
+
+Root cause, pre-existing and unrelated to 8.7: the shutdown kind cancels
+the runtime while the first `XREADGROUP` is delayed, about 90 ms after
+start, and the lease loop's first tick can still be inside `acquire` for
+the second scope (the fencing token comes from Postgres, whose pool is cold
+while the runtime starts everything at once). `acquire` then finds
+`stopped` set after its `SET NX` and gives the key back with a
+compare-and-delete under the tick's context; `Consumers.Run` cancels that
+context (`stopLoop`) right after `releaseAll`, which released only the
+leases that were owned by then, so the late delete was skipped and the key
+sat unowned until its TTL. The surviving key's remaining TTL dated its
+`SET` to about 300 ms before the check, i.e. just after the stop. Fix: the
+post-stop release in `acquire` runs under a detached, `opTimeout`-bounded
+context derived from the manager's base context, and a failure is logged.
+Test: `TestLeaseManager_AcquireAfterStopReleasesUnderDetachedContext`, with
+the fake lease store now honouring context cancellation like go-redis and
+offering an `afterAcquire` hook to land the stop between the write and the
+stopped check. After the fix the cell passed 4 of 4 reruns (it had failed 2
+of 4 before) and the whole `redisx` integration package stays green.
+
+Full matrix (`go test -tags faultsweep,faultinject -count=1 -timeout 60m -v
+./test/faultsweep/`, the sweep task's command with the single package path
+so the output streams): `SweepConsumer` failed 3 of 495 cells,
+`redis.xautoclaim#4`, `redis.xreadgroup#13`, and `redis.xreadgroup#14`,
+all `crash-before`, all with `G16: group poison acknowledged entry ... (key
+poison seq 1) without an inbox row` in the state check after the crash.
+That is a gap in the harness, not in the framework: `checkAckedImpliesInbox`
+flagged every delivered, non-pending entry without an inbox row, and a dead
+letter is acknowledged after its copy was added to the group's DLQ with no
+inbox row by design (spec 7.3), so any crash cell late enough for the
+`poison` group's third failed attempt to have dead-lettered the entry
+failed the check. The quick matrix only runs first hits, which crash before
+that, which is why the gap never showed. The check now exempts entries whose
+original stream ID is in the group's DLQ (`redisx.DLQList`).
+The full matrix otherwise passed: 2992 s, every other scenario green
+(`SweepShutdown` 433 s including every cell of the point that leaked
+before), `TestFaultSweepCompleteness` passing with the same per-kind
+coverage as the quick run, and the resource variants green except
+`SweepConsumer/pool1` at `pg.tx.rollback#1` (`error` and `timeout`), which
+failed in the recovery build with `redis client: redisx: ping
+localhost:32826: context deadline exceeded` after 240 s each: the Redis
+test container stopped answering for about eight minutes and the cells
+after it passed, so that is the test host, not the framework (the same
+cells pass without the variant and the other scenarios' `pool1` variants
+pass). That reading was wrong: the cells before and after ran at normal
+speed, and both failing cells are the two kinds the `pool1` variant runs at
+`pg.tx.rollback`. The fault fired before the driver call, so `pgTx.Rollback`
+returned the injected error without ever issuing ROLLBACK, the unit of work
+logged the failure and dropped the transaction, and the pool's only
+connection stayed checked out in an open transaction; the node hung for the
+rest of the four-minute cell budget and the recovery step then failed on
+the first thing it tried under the exhausted deadline, the Redis ping. A
+real failed ROLLBACK breaks the connection and pgxpool releases it, so the
+injection modelled a leak the driver does not have. `pgTx.Rollback` now
+tears the transaction down under a detached context when the fault fires
+and still returns the injected error; the first fault-injection test of the
+`pg` package, `TestFault_RollbackFaultReleasesConnection` (integration and
+faultinject tags, pool of one, `error` and `timeout` kinds), pins it and
+fails without the fix. Re-runs: the two `pool1` cells failed again on the
+binary built before the fix (240 s each, deterministic), and all 18
+`SweepConsumer` crash-before cells at `redis.xautoclaim` and
+`redis.xreadgroup` pass with the corrected check (50 s); with the fix the
+two `pool1` cells pass in 1.4 s and 3.4 s, twice.
+
+### 8.10 Coverage gate with the integration tags
+
+`task cover` now measures `./mediator/...` with the `integration` and
+`faultinject` tags (fourth session) and ran for the first time in that form
+in the fifth. Its first run failed before the gate: the CLI integration
+test of `mediator/ctl` hard-coded one migration; it now derives the expected
+version from the embedded files. With the profile complete, the three
+packages held at 100 percent (`mediator`, `behavior`, `validate`) are at
+100, `redisx` rose from 92.5 to 95.7 percent with the 8.7 tests, and five
+packages sat below the 95 percent default: `pg` 89.8, `pg/storetest` 80.1,
+`testkit` 94.2, `testkit/invariants` 94.8, `testkit/workload` 93.9.
+`testkit`'s gap was four one-line classification methods of
+`InjectedError` that no test called; `TestInjectedError_Classification`
+covers them (97.5 percent). The other four are held by documented
+thresholds at their measured levels, `coverThresholds` in
+`tools/task/tasks.go`, so the numbers can only go up: `pg`'s uncovered
+statements are the Postgres error branches of relay (`BeginBatch`,
+`SaveCursor`, `Mark`, `check`), janitor (`sweep`), migrate (`withMigrateLock`,
+`inTx`, `MigrateDown`), outbox (`OutboxReshard`, `scanOutboxEntry`,
+`encodeOutboxHeaders`) and the statement failures of `tx.go`, which need
+connection-level faults the fault points do not inject; `pg/storetest` is a
+conformance suite whose failure branches run only when a store does not
+conform; `invariants` and `workload` are chaos and sweep support whose
+uncovered lines are error returns that only a failing Postgres reaches. An
+explicit `-thresholds` argument to `task cover` replaces the defaults.
+With the regenerated profile the gate passes: all 19 packages at or above
+their thresholds (`coverage/summary.md`).

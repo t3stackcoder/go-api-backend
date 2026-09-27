@@ -1,6 +1,7 @@
 package redisx
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -534,8 +535,13 @@ type partitionWorker struct {
 
 func (w *partitionWorker) key() leaseKey { return w.l.key }
 
+// run is the worker goroutine. Its deferred calls run in reverse order:
+// exit first (a surplus lease is released there, which ends and parks it),
+// then workerDone, which tells the lease manager that no read is outstanding
+// in this node's name for the lease any more, then the WaitGroup.
 func (w *partitionWorker) run() {
 	defer w.c.wg.Done()
+	defer w.c.lm.workerDone(w.l)
 	defer w.exit()
 	c := w.c
 	log := c.logger.With("group", w.group, "stream", w.stream, "node", c.node, "epoch", w.l.epoch)
@@ -590,8 +596,11 @@ func (w *partitionWorker) run() {
 			}
 			needCounts = false
 			msgs, err = w.read(w.l.workCtx, ">", c.cfg.ReadBlock)
-			if err == nil && len(msgs) > 0 {
-				msgs, needCounts = w.claimForeignBefore(log, msgs)
+			if err == nil && len(msgs) > 0 && !w.stopNow() {
+				// Not after shutdown or lease end: the batch stays pending
+				// for the next owner, and claiming would only reset the
+				// idle time its drain-first pass waits on.
+				msgs, needCounts = w.claimPendingBefore(log, msgs)
 			}
 		}
 		if err != nil {
@@ -687,10 +696,15 @@ func (w *partitionWorker) wait(d time.Duration) bool {
 
 // readCtx derives the context of one stream read from parent (the lease's
 // work context, or the lease context itself while draining for a surplus
-// release), bounded by timeout and canceled by shutdown as well. go-redis
-// closes the connection of a blocking read whose context is canceled; an
-// entry Redis delivered at that moment sits in this consumer's PEL, where
-// drainForRelease or the next owner's drain-first pass finds it.
+// release), bounded by timeout and canceled by shutdown as well. Canceling
+// it does not interrupt a blocking read: go-redis runs the command
+// synchronously on its connection and takes only the socket deadline from
+// the context, so the read returns when Redis replies or BLOCK expires. An
+// entry Redis delivers meanwhile sits in this consumer's PEL, where the
+// claim-before pass (own name included), drainForRelease, or the next
+// owner's drain-first pass finds it; and the lease manager keeps the
+// partition out of rebalance until this worker has exited, so a same-node
+// re-acquire never starts a second reader beside the outstanding one.
 func (w *partitionWorker) readCtx(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	stop := context.AfterFunc(w.c.readCtx, cancel)
@@ -775,48 +789,50 @@ func (w *partitionWorker) foreignPending() (int64, error) {
 	return n, nil
 }
 
-// claimForeignBefore closes the involuntary handover race (spec 7.2, G6). A
-// previous owner whose lease expired while it was paused may still have a
-// blocking XREADGROUP outstanding; Redis serves the older blocked reader
-// first, so an entry with an ID below this batch can land in that consumer's
-// PEL after this owner's drain-first pass found nothing. Before a fresh
-// batch is processed, every pending entry of another consumer with a lower
-// ID is claimed with no idle requirement and processed first, in ID order;
-// the stale owner's own late attempt becomes an inbox duplicate. The cost is
-// one XPENDING summary per batch. A failure falls back to the periodic claim
+// claimPendingBefore closes the handover races (spec 7.2, G6; design notes
+// 8.7). A blocking XREADGROUP can still be outstanding after its owner's
+// lease ended: a previous owner's read whose lease expired while it was
+// paused, or this node's own earlier reader after Redis forgot the lease key
+// and the partition was re-acquired under the same consumer name. Redis
+// serves the older blocked reader first, so an entry with an ID below this
+// batch can land in that consumer's PEL after this owner's drain-first pass
+// found nothing. Before a fresh batch is processed, every pending entry with
+// a lower ID, whichever consumer holds it and this node's own name included,
+// is claimed with no idle requirement and processed first, in ID order; a
+// stale owner's own late attempt becomes an inbox duplicate. The cost is one
+// XPENDING summary per batch. A failure falls back to the periodic claim
 // pass, which preserves order at the price of ClaimMinIdle latency, so the
 // batch is left unprocessed in that case.
-func (w *partitionWorker) claimForeignBefore(log *slog.Logger, msgs []redis.XMessage) ([]redis.XMessage, bool) {
-	stolen, err := w.foreignBefore(msgs[0].ID)
+func (w *partitionWorker) claimPendingBefore(log *slog.Logger, msgs []redis.XMessage) ([]redis.XMessage, bool) {
+	stolen, err := w.pendingBefore(msgs[0].ID)
 	if err != nil {
-		log.Warn("foreign pending check failed; leaving the batch pending for the claim pass", "error", err)
+		log.Warn("pending check before the batch failed; leaving the batch pending for the claim pass", "error", err)
 		return nil, false
 	}
 	if len(stolen) == 0 {
 		return msgs, false
 	}
-	log.Info("claimed entries a stale owner read past the handover", "count", len(stolen), "first", stolen[0].ID, "batch", msgs[0].ID)
+	log.Info("claimed pending entries below the batch", "count", len(stolen), "first", stolen[0].ID, "batch", msgs[0].ID)
 	return append(stolen, msgs...), true
 }
 
-// foreignBefore claims, in ID order, every pending entry of another consumer
-// whose ID is below id (XPENDING, then XCLAIM with min-idle 0). Fault point
+// pendingBefore claims, in ID order, every pending entry of the group whose
+// ID is below id, whichever consumer holds it (XPENDING, then XCLAIM with
+// min-idle 0). The summary's lowest pending ID decides in one round trip
+// whether anything is below the batch, which just entered this consumer's
+// PEL itself; the range scan runs only when there is. Fault point
 // redis.xautoclaim.
-func (w *partitionWorker) foreignBefore(id string) ([]redis.XMessage, error) {
+func (w *partitionWorker) pendingBefore(id string) ([]redis.XMessage, error) {
 	ctx, cancel := w.c.opCtx()
 	defer cancel()
 	summary, err := w.c.client.XPending(ctx, w.stream, w.group).Result()
 	if err != nil {
 		return nil, err
 	}
-	foreign := false
-	for consumer, n := range summary.Consumers {
-		if consumer != w.c.node && n > 0 {
-			foreign = true
-			break
-		}
+	if summary.Count == 0 {
+		return nil, nil
 	}
-	if !foreign {
+	if order, ok := compareStreamIDs(summary.Lower, id); ok && order >= 0 {
 		return nil, nil
 	}
 	var ids []string
@@ -829,7 +845,7 @@ func (w *partitionWorker) foreignBefore(id string) ([]redis.XMessage, error) {
 			return nil, err
 		}
 		for _, e := range pending {
-			if e.Consumer != w.c.node && e.ID != id {
+			if e.ID != id {
 				ids = append(ids, e.ID)
 			}
 		}
@@ -851,6 +867,42 @@ func (w *partitionWorker) foreignBefore(id string) ([]redis.XMessage, error) {
 	return w.c.client.XClaim(ctx, &redis.XClaimArgs{
 		Stream: w.stream, Group: w.group, Consumer: w.c.node, MinIdle: 0, Messages: ids,
 	}).Result()
+}
+
+// compareStreamIDs orders two stream IDs ("<ms>-<seq>") numerically, as
+// Redis does: -1, 0, or +1 like cmp.Compare, and false when either does not
+// parse. A missing sequence part reads as 0, like an incomplete ID in a
+// Redis range.
+func compareStreamIDs(a, b string) (int, bool) {
+	ams, aseq, ok := splitStreamID(a)
+	if !ok {
+		return 0, false
+	}
+	bms, bseq, ok := splitStreamID(b)
+	if !ok {
+		return 0, false
+	}
+	if ams != bms {
+		return cmp.Compare(ams, bms), true
+	}
+	return cmp.Compare(aseq, bseq), true
+}
+
+// splitStreamID parses "<ms>-<seq>" or "<ms>" (sequence 0).
+func splitStreamID(id string) (ms, seq uint64, ok bool) {
+	msPart, seqPart := id, "0"
+	if i := strings.IndexByte(id, '-'); i >= 0 {
+		msPart, seqPart = id[:i], id[i+1:]
+	}
+	ms, err := strconv.ParseUint(msPart, 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	seq, err = strconv.ParseUint(seqPart, 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	return ms, seq, true
 }
 
 // nextStreamID returns the smallest stream ID above id ("<ms>-<seq>").
@@ -952,7 +1004,9 @@ func (w *partitionWorker) process(log *slog.Logger, msgs []redis.XMessage, needC
 	return true
 }
 
-// handle delivers one entry with in-place retries (spec 7.3).
+// handle delivers one entry with in-place retries (spec 7.3). A delivery the
+// Postgres partition fence rejects (pg.ErrStaleLease) ends the lease and
+// stops the worker instead of retrying or dead-lettering.
 func (w *partitionWorker) handle(log *slog.Logger, msg redis.XMessage, delivered int64) handleResult {
 	c := w.c
 	env, payload, _, decErr := DecodeEntry(msg.Values)
@@ -1008,6 +1062,22 @@ func (w *partitionWorker) handle(log *slog.Logger, msg redis.XMessage, delivered
 				log.Debug("entry processed", "id", msg.ID, "event", env.ID, "key", env.StreamKey, "seq", env.Seq, "outcome", outcome, "attempt", attempt)
 				return resContinue
 			}
+		}
+		if errors.Is(err, pg.ErrStaleLease) {
+			// The partition fence in Postgres saw a higher token (spec 7.2,
+			// G14): a newer owner has applied to this partition, and this
+			// lease is stale whatever Redis still says about its key. Give
+			// it up now instead of waiting for the next renewal, and stop
+			// the worker; the entry stays pending for the new owner's claim
+			// pass. The compare-and-delete is a no-op when the key already
+			// belongs to the new owner and frees the partition at once when
+			// Redis still holds this node's old value (a restore from an
+			// older snapshot). Not counted as a handler error: nothing ran.
+			log.Info("delivery rejected by the partition fence; giving the lease up", "id", msg.ID, "event", env.ID, "key", env.StreamKey, "seq", env.Seq, "epoch", w.l.epoch)
+			rctx, rcancel := c.opCtx()
+			c.lm.release(rctx, w.l, LeaseEndLost)
+			rcancel()
+			return resStop
 		}
 		if w.l.ctx.Err() != nil {
 			log.Info("delivery canceled by lease loss; entry stays pending", "id", msg.ID)

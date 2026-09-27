@@ -170,7 +170,7 @@ func (c *controller) reset(ctx context.Context) error {
 	if err := c.waitRedis(ctx, 60*time.Second); err != nil {
 		return err
 	}
-	if _, err := c.pool.Exec(ctx, `TRUNCATE mediator_outbox, mediator_stream_seq, mediator_inbox, mediator_idempotency, mediator_relay_cursor RESTART IDENTITY`); err != nil {
+	if _, err := c.pool.Exec(ctx, `TRUNCATE mediator_outbox, mediator_stream_seq, mediator_inbox, mediator_idempotency, mediator_relay_cursor, mediator_partition_epoch RESTART IDENTITY`); err != nil {
 		return fmt.Errorf("chaos: truncate framework tables: %w", err)
 	}
 	if err := workload.Truncate(ctx, c.pool); err != nil {

@@ -24,6 +24,12 @@ RETURNING next_seq`
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`
 	sqlInboxInsert = `INSERT INTO mediator_inbox (consumer_group, event_id) VALUES ($1, $2)
 ON CONFLICT DO NOTHING RETURNING 1`
+	sqlFencePartition = `INSERT INTO mediator_partition_epoch (consumer_group, topic, partition, epoch)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (consumer_group, topic, partition) DO UPDATE
+    SET epoch = EXCLUDED.epoch, updated_at = now()
+    WHERE mediator_partition_epoch.epoch <= EXCLUDED.epoch
+RETURNING 1`
 	sqlIdemReserve = `INSERT INTO mediator_idempotency (scope, key, request_hash, expires_at)
 VALUES ($1, $2, $3, now() + $4)
 ON CONFLICT (scope, key) DO UPDATE SET hits = mediator_idempotency.hits + 1
@@ -68,9 +74,14 @@ func (t *pgTx) Commit(ctx context.Context) error {
 }
 
 // Rollback discards the transaction. Rolling back a closed transaction is
-// not an error.
+// not an error. An injected failure at pg.tx.rollback is what the caller
+// sees, but the transaction is still torn down underneath: when a real
+// ROLLBACK fails the connection is broken and pgxpool releases it, so the
+// pool never shrinks, and modelling the fault as an abandoned transaction
+// would keep the connection checked out for good and starve a pool of one.
 func (t *pgTx) Rollback(ctx context.Context) error {
 	if err := testkit.Fault(ctx, "pg.tx.rollback"); err != nil {
+		_ = t.tx.Rollback(context.WithoutCancel(ctx))
 		return err
 	}
 	err := t.tx.Rollback(ctx)
@@ -118,6 +129,27 @@ func (t *pgTx) InboxInsert(ctx context.Context, group string, eventID uuid.UUID)
 	}
 	if err != nil {
 		return false, txErr("inbox insert", err)
+	}
+	return true, nil
+}
+
+// FencePartition upserts the epoch of (group, topic, partition) when token
+// is at least the stored one (7.2, G14). The DO UPDATE WHERE clause rejects
+// a lower token, and Postgres locks the conflicting row even then, so the
+// transaction of a second owner waits for the first to end and then sees
+// its epoch. Only a before fault point, deliberately: an equal token upserts
+// idempotently, so a lost acknowledgement has nothing to hide.
+func (t *pgTx) FencePartition(ctx context.Context, group, topic string, partition int, token int64) (bool, error) {
+	if err := testkit.Fault(ctx, "pg.inbox.fence"); err != nil {
+		return false, err
+	}
+	var one int
+	err := t.tx.QueryRow(ctx, sqlFencePartition, group, topic, partition, token).Scan(&one)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, txErr("fence partition", err)
 	}
 	return true, nil
 }

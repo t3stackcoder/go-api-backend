@@ -65,6 +65,12 @@ type Tx interface {
 	// InboxInsert records that the group processed the event. It returns
 	// false when the row already existed (6.5). Fault point pg.inbox.insert.
 	InboxInsert(ctx context.Context, group string, eventID uuid.UUID) (fresh bool, err error)
+	// FencePartition records token as the epoch of (group, topic, partition)
+	// when it is at least the stored one and reports whether it was accepted;
+	// false means a higher token has been applied since, so the caller's lease
+	// is stale (spec 7.2, G14). The row lock serializes the transactions of two
+	// owners. Fault point pg.inbox.fence.
+	FencePartition(ctx context.Context, group, topic string, partition int, token int64) (ok bool, err error)
 	// IdempotencyReserve performs the upsert of 6.6 and returns the row.
 	// Fault point pg.idem.reserve.
 	IdempotencyReserve(ctx context.Context, scope, key string, requestHash []byte, ttl time.Duration) (IdempotencyRow, error)

@@ -3,7 +3,7 @@
 pg.tx.begin            pg.tx.commit           pg.tx.rollback
 pg.outbox.seq          pg.outbox.insert       pg.outbox.notify
 pg.relay.lock          pg.relay.select        pg.relay.mark        pg.relay.cursor
-pg.inbox.insert        pg.idem.reserve        pg.idem.store
+pg.inbox.insert        pg.inbox.fence         pg.idem.reserve        pg.idem.store
 pg.janitor.delete      pg.migrate.apply       pg.lease.epoch
 redis.xadd             redis.xreadgroup       redis.xautoclaim     redis.xack
 redis.xadd.dlq         redis.lease.acquire    redis.lease.renew    redis.lease.release

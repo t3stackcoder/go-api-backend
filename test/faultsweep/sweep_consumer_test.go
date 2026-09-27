@@ -28,7 +28,7 @@ var (
 
 var scenarioConsumer = &scenario{
 	name:     "SweepConsumer",
-	patterns: []string{"redis.xreadgroup", "redis.xautoclaim", "redis.xack", "redis.xadd.dlq", "redis.stream.replay", "pg.inbox.insert", "pg.tx.*"},
+	patterns: []string{"redis.xreadgroup", "redis.xautoclaim", "redis.xack", "redis.xadd.dlq", "redis.stream.replay", "pg.inbox.insert", "pg.inbox.fence", "pg.tx.*"},
 	groups:   consumerGroups,
 	skipDLQ:  true,
 	variants: []string{"pool1", "stmt50", "oom"},

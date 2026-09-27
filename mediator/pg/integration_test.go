@@ -165,6 +165,9 @@ func TestIntegration_Migrations_UpDownUp(t *testing.T) {
 		if _, err := pool.Exec(ctx, `INSERT INTO mediator_relay_cursor (topic, partition, last_outbox_id, last_stream_id) VALUES ('t', 0, 1, '1-0')`); err != nil {
 			t.Fatal(err)
 		}
+		if _, err := pool.Exec(ctx, `INSERT INTO mediator_partition_epoch (consumer_group, topic, partition, epoch) VALUES ('g', 't', 0, 1)`); err != nil {
+			t.Fatal(err)
+		}
 		if _, err := pool.Exec(ctx, `SELECT nextval('mediator_fencing_seq')`); err != nil {
 			t.Fatal(err)
 		}
@@ -177,7 +180,7 @@ func TestIntegration_Migrations_UpDownUp(t *testing.T) {
 			t.Fatalf("down to %d: %v", v-1, err)
 		}
 		if v-1 == 0 {
-			for _, table := range []string{"mediator_outbox", "mediator_stream_seq", "mediator_inbox", "mediator_idempotency", "mediator_relay_cursor", "mediator_schema_version", "mediator_fencing_seq"} {
+			for _, table := range []string{"mediator_outbox", "mediator_stream_seq", "mediator_inbox", "mediator_idempotency", "mediator_relay_cursor", "mediator_schema_version", "mediator_fencing_seq", "mediator_partition_epoch"} {
 				if tableExists(t, pool, table) {
 					t.Fatalf("%s still exists after down", table)
 				}

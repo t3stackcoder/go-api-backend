@@ -26,6 +26,12 @@ var (
 	// ErrNoUnitOfWork is returned by behaviors that need the ambient
 	// transaction when the unit of work behavior did not run before them.
 	ErrNoUnitOfWork = errors.New("pg: no unit of work in context")
+	// ErrStaleLease is returned, wrapped in CodeConflict, by the inbox
+	// behavior when Tx.FencePartition rejects the consumer's fencing token:
+	// a newer owner has applied to the partition since (spec 7.2, G14). It
+	// is definite, never transient: a retry under the same lease cannot
+	// succeed, so the consumer must give the partition up.
+	ErrStaleLease = errors.New("pg: stale lease: the partition epoch is ahead of this consumer's fencing token")
 )
 
 // IsAmbiguous reports whether err describes a commit whose outcome is

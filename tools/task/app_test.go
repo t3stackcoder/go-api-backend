@@ -544,6 +544,15 @@ func TestCover(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(h.app.Root, "coverage")); err != nil {
 		t.Errorf("coverage dir not created: %v", err)
 	}
+	// Without an explicit -thresholds the documented defaults apply.
+	h = newHarness(t)
+	if code := h.run(t, "cover"); code != 0 {
+		t.Fatalf("exit %d: %s", code, h.stderr)
+	}
+	assertCmds(t, h.runner.strings(), []string{
+		"go test -tags integration,faultinject -covermode=atomic -coverpkg=./mediator/... -coverprofile=coverage/unit.out ./mediator/...",
+		"go run ./tools/covergate -profile coverage/unit.out -summary coverage/summary.md -thresholds " + coverThresholds,
+	})
 	h = newHarness(t)
 	h.runner.fails["go test -tags integration,faultinject -covermode=atomic -coverpkg=./mediator/... -coverprofile=coverage/unit.out ./mediator/..."] = errors.New("exit status 1")
 	if code := h.run(t, "cover"); code != 1 {
@@ -671,7 +680,7 @@ func TestCI(t *testing.T) {
 		"go env CGO_ENABLED CC",
 		"go test -shuffle=on -count=2 ./...",
 		"go test -tags integration,faultinject -covermode=atomic -coverpkg=./mediator/... -coverprofile=coverage/unit.out ./mediator/...",
-		"go run ./tools/covergate -profile coverage/unit.out -summary coverage/summary.md",
+		"go run ./tools/covergate -profile coverage/unit.out -summary coverage/summary.md -thresholds " + coverThresholds,
 	})
 
 	h = newHarness(t)

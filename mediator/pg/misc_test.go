@@ -70,6 +70,16 @@ func TestMigrationsEmbedded(t *testing.T) {
 	if strings.Contains(first.Up(), "DROP TABLE") || !strings.HasPrefix(first.Down(), "DROP SEQUENCE") {
 		t.Fatal("down section not split at the marker")
 	}
+	if len(ms) < 2 {
+		t.Fatal("0002_partition_epoch is missing")
+	}
+	second := ms[1]
+	if second.Version() != 2 || second.Name() != "partition_epoch" {
+		t.Fatalf("second migration %s/%d", second.Name(), second.Version())
+	}
+	if !strings.Contains(second.Up(), "CREATE TABLE mediator_partition_epoch") || !strings.HasPrefix(second.Down(), "DROP TABLE IF EXISTS mediator_partition_epoch") {
+		t.Fatal("0002 must create and drop mediator_partition_epoch")
+	}
 	for i := 1; i < len(ms); i++ {
 		if ms[i].Version() <= ms[i-1].Version() {
 			t.Fatal("migrations must be sorted")

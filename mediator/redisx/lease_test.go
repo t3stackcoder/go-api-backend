@@ -27,6 +27,11 @@ type fakeLeaseStore struct {
 	calls   map[string]int
 
 	acquireErr, renewErr, releaseErr, beatErr error
+
+	// afterAcquire runs after a successful SET NX, before acquire returns:
+	// tests use it to land a stop between the key write and the manager's
+	// stopped check.
+	afterAcquire func()
 }
 
 type fakeLease struct {
@@ -47,18 +52,27 @@ func (s *fakeLeaseStore) expire() {
 	}
 }
 
-func (s *fakeLeaseStore) acquire(_ context.Context, key, value string, ttl time.Duration) (bool, error) {
+func (s *fakeLeaseStore) acquire(ctx context.Context, key, value string, ttl time.Duration) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.calls["acquire"]++
 	if s.acquireErr != nil {
+		s.mu.Unlock()
 		return false, s.acquireErr
 	}
 	s.expire()
 	if _, held := s.leases[key]; held {
+		s.mu.Unlock()
 		return false, nil
 	}
 	s.leases[key] = fakeLease{value: value, expires: s.clock.Now().Add(ttl)}
+	hook := s.afterAcquire
+	s.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	return true, nil
 }
 
@@ -79,7 +93,10 @@ func (s *fakeLeaseStore) renew(_ context.Context, key, value string, ttl time.Du
 	return true, nil
 }
 
-func (s *fakeLeaseStore) release(_ context.Context, key, value string) (bool, error) {
+func (s *fakeLeaseStore) release(ctx context.Context, key, value string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls["release"]++
@@ -138,6 +155,14 @@ func (s *fakeLeaseStore) held() int {
 	defer s.mu.Unlock()
 	s.expire()
 	return len(s.leases)
+}
+
+// forget drops every lease key, as FLUSHALL or a restore from an older
+// snapshot does; the owners learn at their next renewal.
+func (s *fakeLeaseStore) forget() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.leases = map[string]fakeLease{}
 }
 
 // counterFencing is a pg.FencingSource backed by an atomic counter.
@@ -625,6 +650,203 @@ func TestLeaseManager_WorkerOwnsSurplusRelease(t *testing.T) {
 	})
 }
 
+// TestLeaseManager_LostLeaseWaitsForWorkerExit covers the same-node
+// re-acquire rule (design notes 8.7). When Redis forgets the lease keys, the
+// renewals report the leases lost and their contexts are canceled, but a
+// worker's blocking XREADGROUP stays outstanding until Redis replies or
+// BLOCK expires. The manager keeps those partitions out of rebalance until
+// each worker has exited, so it never starts a second reader under the same
+// consumer name beside the old one; a lost lease without a worker is
+// re-acquired in the same tick as before.
+func TestLeaseManager_LostLeaseWaitsForWorkerExit(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		store := newFakeLeaseStore(testkit.RealClock{})
+		fence := &counterFencing{}
+		a := newTestManager(store, fence, "a", 4)
+		var ends []string
+		a.onEnd = func(l *lease, reason string) { ends = append(ends, reason) }
+		// The outstanding read of a lost lease returns after two more ticks.
+		const blocked = 2*testRenew + time.Second
+		stop := make(chan struct{}) // shutdown: the workers exit before Run releases
+		a.onAcquire = func(l *lease) {
+			if l.key.partition == 0 {
+				return // no worker attached: the manager owns this lease
+			}
+			l.attachWorker()
+			go func() {
+				select {
+				case <-l.ctx.Done():
+					time.Sleep(blocked) // the blocking read is still out
+				case <-stop:
+				}
+				a.workerDone(l)
+			}()
+		}
+		a.tick(ctx)
+		before := epochsOf(a)
+		if len(before) != 4 || store.held() != 4 {
+			t.Fatalf("owned %d held %d", len(before), store.held())
+		}
+		old := a.snapshot()
+
+		// Redis forgets the keys. The next tick loses every lease; only p0,
+		// which has no worker, is re-acquired in the same tick.
+		store.forget()
+		time.Sleep(testRenew)
+		a.tick(ctx)
+		if len(ends) != 4 || ends[0] != LeaseEndLost || ends[3] != LeaseEndLost {
+			t.Fatalf("end reasons %v", ends)
+		}
+		for _, l := range old {
+			if l.ctx.Err() == nil {
+				t.Fatalf("p%d: lost lease context not canceled", l.key.partition)
+			}
+		}
+		if got := epochsOf(a); len(got) != 1 || got[0] <= before[0] || store.held() != 1 {
+			t.Fatalf("same tick: owned %v held %d, want only p0 re-acquired above %d", got, store.held(), before[0])
+		}
+		if n := a.endingCount(); n != 3 {
+			t.Fatalf("ending %d, want 3", n)
+		}
+		// Still blocked at the next two ticks: still not re-acquired.
+		time.Sleep(testRenew)
+		a.tick(ctx)
+		if len(a.snapshot()) != 1 || store.held() != 1 || a.endingCount() != 3 {
+			t.Fatalf("while blocked: owned %d held %d ending %d", len(a.snapshot()), store.held(), a.endingCount())
+		}
+		time.Sleep(testRenew)
+		a.tick(ctx)
+		if len(a.snapshot()) != 1 || store.held() != 1 {
+			t.Fatalf("while blocked: owned %d held %d", len(a.snapshot()), store.held())
+		}
+		// The reads return and the workers exit: ending empties, and the
+		// next tick re-acquires with higher epochs.
+		time.Sleep(time.Second)
+		synctest.Wait()
+		if n := a.endingCount(); n != 0 {
+			t.Fatalf("ending %d after the workers exited", n)
+		}
+		if len(a.snapshot()) != 1 {
+			t.Fatal("re-acquired without a tick")
+		}
+		time.Sleep(testRenew)
+		a.tick(ctx)
+		after := epochsOf(a)
+		if len(after) != 4 || store.held() != 4 {
+			t.Fatalf("after the workers exited: owned %v held %d", after, store.held())
+		}
+		for p, e := range after {
+			if e <= before[p] {
+				t.Fatalf("G14: partition %d epoch %d not above %d", p, e, before[p])
+			}
+		}
+		if h := a.handoverCounts()[testScopes[0]]; h != 8 {
+			t.Fatalf("handovers %d, want 8", h)
+		}
+		// Shutdown: the workers are joined before releaseAll, so nothing is
+		// parked in ending and every lease is released.
+		close(stop)
+		synctest.Wait()
+		a.stopAcquiring()
+		a.releaseAll(ctx)
+		if len(a.snapshot()) != 0 || store.held() != 0 || a.endingCount() != 0 {
+			t.Fatalf("shutdown: owned %d held %d ending %d", len(a.snapshot()), store.held(), a.endingCount())
+		}
+		if len(ends) != 8 || ends[7] != LeaseEndShutdown {
+			t.Fatalf("end reasons %v", ends)
+		}
+	})
+}
+
+// TestLeaseManager_EndingTracksWorkerExit pins the bookkeeping behind that
+// rule: end parks a lease only while a worker is attached and has not
+// exited, workerDone unparks exactly that lease, and the worker's order of
+// deferred calls (exit's surplus release, then workerDone) leaves nothing
+// behind while rebalance skips the partition in between.
+func TestLeaseManager_EndingTracksWorkerExit(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeLeaseStore(testkit.RealClock{})
+	fence := &counterFencing{}
+	fence.n.Store(5) // the hand-built leases below use epochs 1 to 5
+	a := newTestManager(store, fence, "a", 2)
+	key := leaseKey{"g", "orders", 1}
+	now := time.Now()
+
+	// No worker: ended and forgotten at once.
+	bare := newLease(ctx, key, 1, "a:1", now)
+	a.owned[key] = bare
+	a.end(bare, LeaseEndLost)
+	if a.endingCount() != 0 || len(a.snapshot()) != 0 {
+		t.Fatal("a lease without a worker must not be parked")
+	}
+
+	// Worker attached, not exited: parked until its own workerDone.
+	l := newLease(ctx, key, 2, "a:2", now)
+	l.attachWorker()
+	a.owned[key] = l
+	a.end(l, LeaseEndLost)
+	if a.endingCount() != 1 || len(a.snapshot()) != 0 {
+		t.Fatalf("ending %d owned %d", a.endingCount(), len(a.snapshot()))
+	}
+	other := newLease(ctx, key, 3, "a:3", now)
+	other.attachWorker()
+	a.workerDone(other)
+	if a.endingCount() != 1 {
+		t.Fatal("workerDone of a different lease unparked the key")
+	}
+	a.workerDone(l)
+	if a.endingCount() != 0 {
+		t.Fatal("workerDone did not unpark the lease")
+	}
+	a.end(l, LeaseEndLost)
+	if a.endingCount() != 0 {
+		t.Fatal("an ended lease was parked again")
+	}
+
+	// Worker already exited (shutdown joins the workers before releaseAll):
+	// not parked.
+	l2 := newLease(ctx, key, 4, "a:4", now)
+	l2.attachWorker()
+	a.owned[key] = l2
+	a.workerDone(l2)
+	a.end(l2, LeaseEndShutdown)
+	if a.endingCount() != 0 {
+		t.Fatal("a lease whose worker exited must not be parked")
+	}
+
+	// The worker's exit order: the surplus release parks the lease, a
+	// rebalance meanwhile leaves the partition alone, then workerDone frees
+	// it and the next tick may take it again.
+	l3 := newLease(ctx, key, 5, "a:5", now)
+	l3.attachWorker()
+	if ok, err := store.acquire(ctx, a.keys.Lease("g", "orders", 1), "a:5", testTTL); !ok || err != nil {
+		t.Fatalf("seed store: %v %v", ok, err)
+	}
+	a.owned[key] = l3
+	if l3.markRelease() {
+		t.Fatal("manager released a lease with a worker")
+	}
+	a.release(ctx, l3, LeaseEndSurplus) // what exit does
+	if a.endingCount() != 1 || store.held() != 0 || l3.ctx.Err() == nil {
+		t.Fatalf("after the worker's release: ending %d held %d ctx %v", a.endingCount(), store.held(), l3.ctx.Err())
+	}
+	a.tick(ctx) // live=1, desired=2: p0 is free, p1 is ending
+	if got := epochsOf(a); len(got) != 1 || got[0] == 0 {
+		t.Fatalf("rebalance while ending: owned %v, want p0 only", got)
+	}
+	a.workerDone(l3)
+	if a.endingCount() != 0 {
+		t.Fatal("workerDone after the release did not unpark the lease")
+	}
+	a.tick(ctx)
+	if got := epochsOf(a); len(got) != 2 || got[1] <= 5 {
+		t.Fatalf("after workerDone: owned %v, want p1 re-acquired above 5", got)
+	}
+	a.stopAcquiring()
+	a.releaseAll(ctx)
+}
+
 func TestLease_WorkerAttachedSemantics(t *testing.T) {
 	now := time.Now()
 	l := newLease(context.Background(), leaseKey{"g", "orders", 1}, 7, "a:7", now)
@@ -654,5 +876,37 @@ func TestLease_WorkerAttachedSemantics(t *testing.T) {
 	bare := &lease{lastRenew: now}
 	if !bare.markRelease() {
 		t.Fatal("idle lease without a worker releases immediately")
+	}
+}
+
+// TestLeaseManager_AcquireAfterStopReleasesUnderDetachedContext: an
+// acquisition whose SET NX lands after stopAcquiring gives the key back even
+// though the tick's context is canceled by then (Run cancels the loop right
+// after releaseAll), so no key outlives the node until its TTL.
+func TestLeaseManager_AcquireAfterStopReleasesUnderDetachedContext(t *testing.T) {
+	store := newFakeLeaseStore(testkit.RealClock{})
+	fence := &counterFencing{}
+	lm := newTestManager(store, fence, "a", 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store.afterAcquire = func() {
+		lm.stopAcquiring()
+		cancel()
+	}
+	key := leaseKey{"g", "orders", 0}
+	if lm.acquire(ctx, key) {
+		t.Fatal("acquired after stop")
+	}
+	if held := store.held(); held != 0 {
+		t.Fatalf("key leaked after a stop landed mid-acquisition: held=%d", held)
+	}
+	if n := len(lm.snapshot()); n != 0 {
+		t.Fatalf("owned %d, want 0", n)
+	}
+	// A canceled tick context before the write acquires nothing and leaves
+	// nothing behind either.
+	store.afterAcquire = nil
+	if lm.acquire(ctx, key) || store.held() != 0 {
+		t.Fatalf("acquire under a canceled context: held=%d", store.held())
 	}
 }

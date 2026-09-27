@@ -8,6 +8,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json/v2"
+	"fmt"
+	"io/fs"
 	"log"
 	"os"
 	"strings"
@@ -22,6 +24,7 @@ import (
 	"github.com/t3stackcoder/go-api-backend/mediator/ctl"
 	"github.com/t3stackcoder/go-api-backend/mediator/pg"
 	"github.com/t3stackcoder/go-api-backend/mediator/redisx"
+	"github.com/t3stackcoder/go-api-backend/migrations"
 )
 
 var (
@@ -127,17 +130,25 @@ func TestIntegration_Main(t *testing.T) {
 		stdout, _ := c.expect(ctl.ExitOK, "migrate", "status")
 		contains(t, stdout, "init", "false", "current version: 0")
 	})
+	// The latest version is the number of embedded migration files, so a
+	// new migration does not change these expectations.
+	latest := embeddedMigrations(t)
 	t.Run("migrate up", func(t *testing.T) {
 		stdout, _ := c.expect(ctl.ExitOK, "migrate", "up")
-		contains(t, stdout, "applied 0001_init", "current version: 1 (was 0)")
+		contains(t, stdout, "applied 0001_init", "applied 0002_partition_epoch", fmt.Sprintf("current version: %d (was 0)", latest))
 		stdout, _ = c.expect(ctl.ExitOK, "migrate", "up")
-		contains(t, stdout, "nothing to do: current version 1")
+		contains(t, stdout, fmt.Sprintf("nothing to do: current version %d", latest))
 	})
 	t.Run("migrate status after up", func(t *testing.T) {
 		v := c.json("migrate", "status")
 		ms := v["migrations"].([]any)
-		if v["current"] != 1.0 || len(ms) < 1 || ms[0].(map[string]any)["applied"] != true {
+		if v["current"] != float64(latest) || len(ms) != latest {
 			t.Fatalf("status = %v", v)
+		}
+		for _, m := range ms {
+			if m.(map[string]any)["applied"] != true {
+				t.Fatalf("status = %v", v)
+			}
 		}
 	})
 	t.Run("outbox stats empty", func(t *testing.T) {
@@ -331,11 +342,11 @@ VALUES ('inventory', gen_random_uuid(), now() - interval '10 days'), ('inventory
 	t.Run("migrate down and up again", func(t *testing.T) {
 		stdout, stderr := c.expect(ctl.ExitOK, "migrate", "down", "--to", "0")
 		contains(t, stderr, "warning: migrate down exists for tests")
-		contains(t, stdout, "reverted 0001_init", "current version: 0 (was 1)")
+		contains(t, stdout, "reverted 0002_partition_epoch", "reverted 0001_init", fmt.Sprintf("current version: 0 (was %d)", latest))
 		stdout, _ = c.expect(ctl.ExitOK, "migrate", "status")
 		contains(t, stdout, "current version: 0")
 		stdout, _ = c.expect(ctl.ExitOK, "migrate", "up")
-		contains(t, stdout, "applied 0001_init")
+		contains(t, stdout, "applied 0001_init", "applied 0002_partition_epoch")
 	})
 	t.Run("connection errors", func(t *testing.T) {
 		bad := newCLI(t)
@@ -346,4 +357,21 @@ VALUES ('inventory', gen_random_uuid(), now() - interval '10 days'), ('inventory
 		_, stderr = bad.expect(ctl.ExitFailure, "dlq", "list", "--group", "g")
 		contains(t, stderr, "error: connect to redis:")
 	})
+}
+
+// embeddedMigrations counts the NNNN_name.sql files of migrations.FS: the
+// version pg.Migrate reports once everything is applied.
+func embeddedMigrations(t *testing.T) int {
+	t.Helper()
+	entries, err := fs.ReadDir(migrations.FS, ".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".sql") {
+			n++
+		}
+	}
+	return n
 }

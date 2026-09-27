@@ -317,7 +317,7 @@ func terminateBackends(ctx context.Context, pool *pgxpool.Pool, pattern string) 
 }
 
 // frameworkTables are truncated between cells together with the workload's.
-var frameworkTables = []string{"mediator_outbox", "mediator_stream_seq", "mediator_inbox", "mediator_idempotency", "mediator_relay_cursor"}
+var frameworkTables = []string{"mediator_outbox", "mediator_stream_seq", "mediator_inbox", "mediator_idempotency", "mediator_relay_cursor", "mediator_partition_epoch"}
 
 // reset prepares the schema and a new prefix for the next cell.
 func (e *scenarioEnv) reset(ctx context.Context) error {
@@ -1287,7 +1287,9 @@ func checkLeasesReleased(ctx context.Context, v *verifier, groups []string) {
 
 // checkAckedImpliesInbox asserts G16's ordering: every entry a group
 // acknowledged (delivered and no longer pending) has an inbox row, so the
-// acknowledgement followed the commit.
+// acknowledgement followed the commit. A dead letter is the one exception:
+// it is acknowledged after its copy was added to the group's DLQ and never
+// reaches the inbox (spec 7.3), so the DLQ entry is its durable record.
 func checkAckedImpliesInbox(ctx context.Context, v *verifier, groups []string) {
 	v.t.Helper()
 	stream := v.cfg.Keys().Stream(workload.TopicBumped, 0)
@@ -1327,8 +1329,16 @@ func checkAckedImpliesInbox(ctx context.Context, v *verifier, groups []string) {
 		for _, p := range pend {
 			pending[p.ID] = true
 		}
+		deadLettered := map[string]bool{}
+		if dlq, err := redisx.DLQList(ctx, v.client, v.cfg, g); err != nil {
+			v.t.Errorf("dlq list %s: %v", g, err)
+		} else {
+			for _, e := range dlq {
+				deadLettered[e.StreamID] = true
+			}
+		}
 		for _, m := range msgs {
-			if compareStreamIDs(m.ID, last) > 0 || pending[m.ID] {
+			if compareStreamIDs(m.ID, last) > 0 || pending[m.ID] || deadLettered[m.ID] {
 				continue
 			}
 			env, _, _, derr := redisx.DecodeEntry(m.Values)

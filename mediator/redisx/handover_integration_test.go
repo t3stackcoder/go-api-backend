@@ -222,3 +222,65 @@ func TestConsumers_ClaimsForeignEntriesBelowBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestConsumers_ClaimsOwnStaleReaderEntriesBelowBatch is the same-node
+// variant of the involuntary handover (design notes 8.7): after Redis forgot
+// the lease key the node re-acquires the partition under the same consumer
+// name while an earlier blocking read of its own is still outstanding, and
+// that read takes the next entry into the node's own PEL. The claim-before
+// pass must claim the entry in the node's own name and process it before
+// the batch, well within ClaimMinIdle, instead of reading past it. The
+// ghost read stands in for the older reader; it is issued in the node's own
+// consumer name.
+func TestConsumers_ClaimsOwnStaleReaderEntriesBelowBatch(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cfg := testConfig("n")
+	cfg.ClaimMinIdle = 5 * time.Second // the periodic claim pass must not be what restores the order
+	client := newTestClient(t, cfg)
+	streams := NewStreams(client, cfg)
+	m, rec, _ := buildConsumerFixture(t, nil)
+	n := startNode(t, m, client, cfg, &counterFencing{})
+	eventually(t, 10*time.Second, "partitions leased", func() bool { return ownedTotal(n) == 4 })
+	p := mediator.Partition("k", cfg.PartitionsPerTopic)
+	stream := cfg.Keys().Stream("intEvent", p)
+	appendEvents(t, streams, cfg.PartitionsPerTopic, []intEvent{{Key: "k", Seq: 1}, {Key: "k", Seq: 2}, {Key: "k", Seq: 3}})
+	eventually(t, 10*time.Second, "first entries applied", func() bool { return rec.count("k") == 3 })
+
+	own := n.c.NodeID()
+	if own != cfg.NodeID {
+		t.Fatalf("consumer name %q, want the node ID %q", own, cfg.NodeID)
+	}
+	ghost := ghostRead(ctx, client, stream, own)
+	time.Sleep(2 * cfg.ReadBlock)
+	start := time.Now()
+	appendEvents(t, streams, cfg.PartitionsPerTopic, []intEvent{{Key: "k", Seq: 4}, {Key: "k", Seq: 5}})
+	msgs := <-ghost
+	if len(msgs) != 1 {
+		t.Fatalf("ghost read %v", msgs)
+	}
+	if env, _, _, err := DecodeEntry(msgs[0].Values); err != nil || env.Seq != 4 {
+		t.Fatalf("ghost took %+v %v, want seq 4", env, err)
+	}
+	eventually(t, cfg.ClaimMinIdle-time.Second, "entries applied without a claim wait", func() bool { return rec.count("k") == 5 })
+	t.Logf("claimed from own PEL and applied in %s", time.Since(start))
+	if got := rec.seqs("k"); fmt.Sprint(got) != "[1 2 3 4 5]" {
+		t.Fatalf("I6: applied sequence %v", got)
+	}
+	rec.mu.Lock()
+	claimed := rec.byKey["k"][3]
+	rec.mu.Unlock()
+	if claimed.attempt != 2 {
+		t.Fatalf("claimed entry attempt %d, want 2 (delivery count after XCLAIM)", claimed.attempt)
+	}
+	if claimed.node != own {
+		t.Fatalf("claimed entry applied by %q, want %q", claimed.node, own)
+	}
+	pend, err := client.XPending(ctx, stream, testGroup).Result()
+	if err != nil || pend.Count != 0 {
+		t.Fatalf("pending after the claim: %+v %v", pend, err)
+	}
+	if err := n.c.Healthy(); err != nil {
+		t.Fatal(err)
+	}
+}

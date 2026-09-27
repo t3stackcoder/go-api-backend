@@ -35,6 +35,7 @@ type Tx struct {
 	seqDelta   map[seqKey]int64
 	outbox     []pg.OutboxEntry
 	inbox      []inboxKey
+	epochs     map[PartitionKey]int64
 	idemInsert map[IdemKey]*IdemRow
 	idemHits   map[IdemKey]int
 	idemResp   map[IdemKey][]byte
@@ -123,6 +124,35 @@ func (t *Tx) InboxInsert(ctx context.Context, group string, eventID uuid.UUID) (
 		return false, nil
 	}
 	t.inbox = append(t.inbox, k)
+	return true, nil
+}
+
+// FencePartition records token as the epoch of (group, topic, partition)
+// unless the visible epoch, buffered in this transaction else committed,
+// is higher; an equal token is accepted (7.2, G14). Like the Postgres
+// upsert it locks the row until the transaction ends, so a concurrent fence
+// of the same row blocks and then sees the committed epoch.
+func (t *Tx) FencePartition(ctx context.Context, group, topic string, partition int, token int64) (bool, error) {
+	if err := t.check(ctx, true); err != nil {
+		return false, err
+	}
+	k := PartitionKey{Group: group, Topic: topic, Partition: partition}
+	if err := t.lock(ctx, k); err != nil {
+		return false, err
+	}
+	epoch, exists := t.epochs[k]
+	if !exists {
+		t.s.mu.Lock()
+		epoch, exists = t.s.epochs[k]
+		t.s.mu.Unlock()
+	}
+	if exists && epoch > token {
+		return false, nil
+	}
+	if t.epochs == nil {
+		t.epochs = map[PartitionKey]int64{}
+	}
+	t.epochs[k] = token
 	return true, nil
 }
 
@@ -228,6 +258,7 @@ func (t *Tx) Commit(ctx context.Context) error {
 	for _, k := range t.inbox {
 		s.inbox[k] = now
 	}
+	maps.Copy(s.epochs, t.epochs)
 	for k, row := range t.idemInsert {
 		cp := *row
 		s.idem[k] = &cp

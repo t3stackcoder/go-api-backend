@@ -2,13 +2,15 @@
 // the locking semantics of Postgres for the operations the behaviors use:
 // per-(topic, key) sequence row locks held until the transaction ends,
 // inbox primary-key semantics, idempotency upserts with row locks and a
-// lock timeout, and read-only transactions that reject writes. It does not
+// lock timeout, partition epoch upserts with row locks (fencing at the
+// effect, 7.2), and read-only transactions that reject writes. It does not
 // provide snapshot isolation: committed rows are visible as soon as they
 // commit. pg/storetest.Run keeps it honest against PgStore.
 package memstore
 
 import (
 	"context"
+	"maps"
 	"sort"
 	"sync"
 	"time"
@@ -59,6 +61,14 @@ type IdemRow struct {
 	ExpiresAt   time.Time
 }
 
+// PartitionKey identifies a partition epoch row: the (consumer group,
+// topic, partition) whose fencing token of 7.2 is recorded.
+type PartitionKey struct {
+	Group     string
+	Topic     string
+	Partition int
+}
+
 type seqKey struct{ topic, key string }
 
 type inboxKey struct {
@@ -77,6 +87,7 @@ type Store struct {
 	seq        map[seqKey]int64
 	inbox      map[inboxKey]time.Time
 	idem       map[IdemKey]*IdemRow
+	epochs     map[PartitionKey]int64
 	notes      []Notification
 	fencing    int64
 	begun      int
@@ -97,7 +108,7 @@ func New(cfg Config) *Store {
 	if cfg.DefaultLockTimeout <= 0 {
 		cfg.DefaultLockTimeout = pg.DefaultLockTimeout
 	}
-	return &Store{cfg: cfg, seq: map[seqKey]int64{}, inbox: map[inboxKey]time.Time{}, idem: map[IdemKey]*IdemRow{}}
+	return &Store{cfg: cfg, seq: map[seqKey]int64{}, inbox: map[inboxKey]time.Time{}, idem: map[IdemKey]*IdemRow{}, epochs: map[PartitionKey]int64{}}
 }
 
 // Clock returns the store's clock.
@@ -175,6 +186,13 @@ func (s *Store) Idempotency() map[IdemKey]IdemRow {
 		out[k] = IdemRow{RequestHash: cloneBytes(r.RequestHash), Response: cloneBytes(r.Response), Hits: r.Hits, CreatedAt: r.CreatedAt, ExpiresAt: r.ExpiresAt}
 	}
 	return out
+}
+
+// PartitionEpochs returns a copy of the committed partition epochs.
+func (s *Store) PartitionEpochs() map[PartitionKey]int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return maps.Clone(s.epochs)
 }
 
 // Notifications returns every pg_notify delivered by a committed transaction.

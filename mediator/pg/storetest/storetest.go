@@ -37,6 +37,7 @@ func Run(t *testing.T, factory Factory) {
 		{"OutboxPartitionAndKeys", testOutboxPartitionAndKeys},
 		{"InboxDuplicate", testInboxDuplicate},
 		{"InboxConcurrentBlocks", testInboxConcurrent},
+		{"PartitionEpochFence", testPartitionEpochFence},
 		{"IdempotencyReserveStoreReplay", testIdemReserveStoreReplay},
 		{"IdempotencyConcurrentBlocksThenReplays", testIdemConcurrent},
 		{"IdempotencyRollbackReleasesReservation", testIdemRollbackReleases},
@@ -297,6 +298,98 @@ func testInboxConcurrent(t *testing.T, s pg.Store) {
 	commit(t, tx4)
 }
 
+// testPartitionEpochFence checks FencePartition (7.2, G14): the epoch of a
+// (group, topic, partition) row only moves up, an equal token is accepted
+// again, rows are independent, a rolled-back fence leaves the committed
+// epoch, and a concurrent fence of the same row blocks until the first
+// transaction ends and then sees its epoch.
+func testPartitionEpochFence(t *testing.T, s pg.Store) {
+	ctx := context.Background()
+	fence := func(tx pg.Tx, group, topic string, partition int, token int64) bool {
+		t.Helper()
+		ok, err := tx.FencePartition(ctx, group, topic, partition, token)
+		if err != nil {
+			t.Fatalf("fence (%s, %s, %d) with %d: %v", group, topic, partition, token, err)
+		}
+		return ok
+	}
+	// Monotonic: 5, then 7; 6 is rejected; 7 again is accepted.
+	tx := begin(t, s, pg.TxOptions{})
+	if !fence(tx, "g", "t", 0, 5) {
+		t.Fatal("first token must be accepted")
+	}
+	commit(t, tx)
+	tx = begin(t, s, pg.TxOptions{})
+	if !fence(tx, "g", "t", 0, 7) {
+		t.Fatal("higher token must be accepted")
+	}
+	commit(t, tx)
+	tx = begin(t, s, pg.TxOptions{})
+	if fence(tx, "g", "t", 0, 6) {
+		t.Fatal("lower token must be rejected")
+	}
+	// A rejection leaves the transaction usable and other rows unaffected.
+	if !fence(tx, "g", "t", 1, 6) || !fence(tx, "g", "u", 0, 6) || !fence(tx, "h", "t", 0, 6) {
+		t.Fatal("another partition, topic, or group must accept its own token")
+	}
+	commit(t, tx)
+	tx = begin(t, s, pg.TxOptions{})
+	if !fence(tx, "g", "t", 0, 7) {
+		t.Fatal("equal token must be accepted")
+	}
+	commit(t, tx)
+	// Rollback keeps the committed epoch: 9 rolled back, then 8 is accepted.
+	tx = begin(t, s, pg.TxOptions{})
+	if !fence(tx, "g", "t", 0, 9) {
+		t.Fatal("9 must be accepted before the rollback")
+	}
+	rollback(t, tx)
+	tx = begin(t, s, pg.TxOptions{})
+	if !fence(tx, "g", "t", 0, 8) {
+		t.Fatal("after the rollback the committed epoch is 7, so 8 must be accepted")
+	}
+	commit(t, tx)
+	// Concurrent: the second owner's fence blocks on the row until the
+	// first commits, and its lower token is then rejected.
+	tx1 := begin(t, s, pg.TxOptions{})
+	if !fence(tx1, "g", "t", 0, 10) {
+		t.Fatal("10 must be accepted")
+	}
+	tx2 := begin(t, s, pg.TxOptions{})
+	done := make(chan struct{})
+	var ok2 bool
+	var err2 error
+	go func() {
+		defer close(done)
+		ok2, err2 = tx2.FencePartition(ctx, "g", "t", 0, 9)
+	}()
+	assertBlocked(t, done)
+	commit(t, tx1)
+	await(t, done)
+	if err2 != nil || ok2 {
+		t.Fatalf("token 9 after the first owner committed 10: ok=%v err=%v, want rejected", ok2, err2)
+	}
+	commit(t, tx2)
+	// A waiting higher token is accepted once the first owner commits.
+	tx3 := begin(t, s, pg.TxOptions{})
+	if !fence(tx3, "g", "t", 0, 11) {
+		t.Fatal("11 must be accepted")
+	}
+	tx4 := begin(t, s, pg.TxOptions{})
+	done = make(chan struct{})
+	go func() {
+		defer close(done)
+		ok2, err2 = tx4.FencePartition(ctx, "g", "t", 0, 12)
+	}()
+	assertBlocked(t, done)
+	commit(t, tx3)
+	await(t, done)
+	if err2 != nil || !ok2 {
+		t.Fatalf("token 12 after the first owner committed 11: ok=%v err=%v, want accepted", ok2, err2)
+	}
+	commit(t, tx4)
+}
+
 var (
 	hashA = bytes.Repeat([]byte{1}, 32)
 	hashB = bytes.Repeat([]byte{2}, 32)
@@ -421,6 +514,7 @@ func testReadOnly(t *testing.T, s pg.Store) {
 	}{
 		{"OutboxAppend", func(tx pg.Tx) error { return tx.OutboxAppend(ctx, env("t", "k"), []byte(`{}`)) }},
 		{"InboxInsert", func(tx pg.Tx) error { _, err := tx.InboxInsert(ctx, "g", uuid.New()); return err }},
+		{"FencePartition", func(tx pg.Tx) error { _, err := tx.FencePartition(ctx, "g", "t", 0, 1); return err }},
 		{"IdempotencyReserve", func(tx pg.Tx) error { _, err := tx.IdempotencyReserve(ctx, "C", "k", hashA, time.Hour); return err }},
 		{"IdempotencyStore", func(tx pg.Tx) error { return tx.IdempotencyStore(ctx, "C", "k", []byte(`1`)) }},
 	}
@@ -476,6 +570,9 @@ func testClosed(t *testing.T, s pg.Store) {
 	}
 	if _, err := tx.InboxInsert(ctx, "g", uuid.New()); !errors.Is(err, pg.ErrTxClosed) {
 		t.Fatalf("inbox after commit: want ErrTxClosed, got %v", err)
+	}
+	if _, err := tx.FencePartition(ctx, "g", "t", 0, 1); !errors.Is(err, pg.ErrTxClosed) {
+		t.Fatalf("fence after commit: want ErrTxClosed, got %v", err)
 	}
 	if _, err := tx.IdempotencyReserve(ctx, "C", "k", hashA, time.Hour); !errors.Is(err, pg.ErrTxClosed) {
 		t.Fatalf("reserve after commit: want ErrTxClosed, got %v", err)

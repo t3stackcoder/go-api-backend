@@ -3,6 +3,7 @@ package pg_test
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -100,6 +101,94 @@ func TestInbox_Errors(t *testing.T) {
 	})
 	if mediator.CodeOf(err) != mediator.CodeUnavailable || !mediator.IsTransient(err) || !pg.IsLockTimeout(err) {
 		t.Fatalf("want transient lock timeout, got %v", err)
+	}
+	_ = holder.Rollback(ctx)
+}
+
+func TestInbox_FencesStaleLease(t *testing.T) {
+	store := memstore.New(memstore.Config{})
+	calls := 0
+	m := build(t, func(m *mediator.Mediator) {
+		must(t, mediator.ConsumeFunc(m, "proj", func(ctx context.Context, e thingCreated) error {
+			calls++
+			return nil
+		}))
+	}, uow(store), pg.Inbox())
+	ctx := context.Background()
+	newEnv := func(key string, partition int) mediator.Envelope {
+		return mediator.Envelope{ID: mediator.NewID(time.Now()), Type: "thingCreated", Topic: "thingCreated", StreamKey: key, Partition: partition}
+	}
+	deliver := func(ctx context.Context, env mediator.Envelope) error {
+		return m.Deliver(ctx, "proj", env, []byte(`{"id":"`+env.StreamKey+`"}`))
+	}
+	row := memstore.PartitionKey{Group: "proj", Topic: "thingCreated", Partition: 0}
+
+	// The owner's token is recorded together with the effect.
+	if err := deliver(mediator.WithFencingToken(ctx, 5), newEnv("o1", 0)); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 || store.Committed() != 1 || store.PartitionEpochs()[row] != 5 {
+		t.Fatalf("token 5: calls=%d committed=%d epochs=%v", calls, store.Committed(), store.PartitionEpochs())
+	}
+	// A newer owner moves the epoch up.
+	if err := deliver(mediator.WithFencingToken(ctx, 7), newEnv("o2", 0)); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 || store.PartitionEpochs()[row] != 7 {
+		t.Fatalf("token 7: calls=%d epochs=%v", calls, store.PartitionEpochs())
+	}
+	// The stale owner is rejected before the handler runs: a definite
+	// conflict, not transient, the transaction rolled back, no inbox row.
+	env3 := newEnv("o3", 0)
+	err := deliver(mediator.WithFencingToken(ctx, 6), env3)
+	if !errors.Is(err, pg.ErrStaleLease) || mediator.CodeOf(err) != mediator.CodeConflict || mediator.IsTransient(err) {
+		t.Fatalf("token 6 after 7: want a non-transient conflict wrapping ErrStaleLease, got %v", err)
+	}
+	if calls != 2 || store.RolledBack() != 1 || store.Committed() != 2 {
+		t.Fatalf("stale delivery: calls=%d rolledBack=%d committed=%d", calls, store.RolledBack(), store.Committed())
+	}
+	if ids := store.Inbox()["proj"]; len(ids) != 2 || slices.Contains(ids, env3.ID) {
+		t.Fatalf("stale delivery must not keep its inbox row: %v", ids)
+	}
+	if store.PartitionEpochs()[row] != 7 {
+		t.Fatalf("epoch after a stale delivery: %v", store.PartitionEpochs())
+	}
+	// The same event under the current owner's token is applied.
+	if err := deliver(mediator.WithFencingToken(ctx, 7), env3); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 3 || len(store.Inbox()["proj"]) != 3 || store.PartitionEpochs()[row] != 7 {
+		t.Fatalf("redelivery with token 7: calls=%d inbox=%v epochs=%v", calls, store.Inbox(), store.PartitionEpochs())
+	}
+	// Without a fencing token there is no fence: the epoch table is untouched.
+	if err := deliver(ctx, newEnv("o4", 3)); err != nil {
+		t.Fatal(err)
+	}
+	if epochs := store.PartitionEpochs(); calls != 4 || len(epochs) != 1 || epochs[row] != 7 {
+		t.Fatalf("delivery without a token: calls=%d epochs=%v", calls, epochs)
+	}
+
+	// A lock timeout on the epoch row is reported as transient, like one on
+	// the inbox row.
+	b := pg.Inbox()
+	store2 := memstore.New(memstore.Config{})
+	holder, err := store2.Begin(ctx, pg.TxOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := holder.FencePartition(ctx, "g", "t", 0, 1); err != nil {
+		t.Fatal(err)
+	}
+	nextCalled := false
+	next := func(ctx context.Context, req any) (any, error) { nextCalled = true; return nil, nil }
+	consumer := &mediator.RequestInfo{Kind: mediator.KindConsumer, Group: "g"}
+	fenced := mediator.WithFencingToken(mediator.WithEnvelope(ctx, mediator.Envelope{ID: mediator.NewID(time.Now()), Topic: "t"}), 2)
+	err = pg.WithTx(fenced, store2, pg.TxOptions{LockTimeout: 30 * time.Millisecond}, func(ctx context.Context) error {
+		_, err := b.Handle(ctx, nil, consumer, next)
+		return err
+	})
+	if mediator.CodeOf(err) != mediator.CodeUnavailable || !mediator.IsTransient(err) || !pg.IsLockTimeout(err) || nextCalled {
+		t.Fatalf("want a transient lock timeout on the epoch row, got %v (next called: %v)", err, nextCalled)
 	}
 	_ = holder.Rollback(ctx)
 }
