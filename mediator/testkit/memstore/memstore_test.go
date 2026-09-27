@@ -433,3 +433,17 @@ func TestOutboxOrderedByID(t *testing.T) {
 		t.Fatal("ids are assigned at append time")
 	}
 }
+
+func TestNewDefaults(t *testing.T) {
+	// A zero or negative partition count means one partition, and a nil
+	// clock means the real clock.
+	for _, p := range []int{0, -1} {
+		s := memstore.New(memstore.Config{Partitions: p})
+		if s.Partitions() != 1 || s.Clock() == nil {
+			t.Fatalf("Partitions %d: got P=%d, clock=%v", p, s.Partitions(), s.Clock())
+		}
+	}
+	if s := memstore.New(memstore.Config{Partitions: 1}); s.Partitions() != 1 {
+		t.Fatalf("Partitions 1: got %d", s.Partitions())
+	}
+}

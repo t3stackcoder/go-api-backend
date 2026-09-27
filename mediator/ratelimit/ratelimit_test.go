@@ -46,6 +46,7 @@ func TestEmissionInterval(t *testing.T) {
 		{"negative rate", ratelimit.Policy{Rate: -5, Period: time.Second}, 0},
 		{"zero period", ratelimit.Policy{Rate: 5}, 0},
 		{"negative period", ratelimit.Policy{Rate: 5, Period: -time.Second}, 0},
+		{"nan rate zero period", ratelimit.Policy{Rate: math.NaN()}, 0},
 		{"one per second", ratelimit.Policy{Rate: 1, Period: time.Second}, time.Second},
 		{"ten per second", ratelimit.Policy{Rate: 10, Period: time.Second}, 100 * time.Millisecond},
 		{"fractional rate", ratelimit.Policy{Rate: 0.5, Period: time.Second}, 2 * time.Second},

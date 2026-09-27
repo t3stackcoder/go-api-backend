@@ -276,6 +276,39 @@ type vStatus struct {
 
 func (vStatus) Route() httpapi.Route { return httpapi.Route{Method: "POST", Path: "/v", Status: 500} }
 
+// The 2xx boundary: 199 and 300 are rejected, 200 and 299 accepted.
+type vStatus199 struct {
+	mediator.Command[mediator.Void]
+}
+
+func (vStatus199) Route() httpapi.Route {
+	return httpapi.Route{Method: "POST", Path: "/v199", Status: 199}
+}
+
+type vStatus300 struct {
+	mediator.Command[mediator.Void]
+}
+
+func (vStatus300) Route() httpapi.Route {
+	return httpapi.Route{Method: "POST", Path: "/v300", Status: 300}
+}
+
+type vStatus200 struct {
+	mediator.Command[mediator.Void]
+}
+
+func (vStatus200) Route() httpapi.Route {
+	return httpapi.Route{Method: "POST", Path: "/v200", Status: 200}
+}
+
+type vStatus299 struct {
+	mediator.Command[mediator.Void]
+}
+
+func (vStatus299) Route() httpapi.Route {
+	return httpapi.Route{Method: "POST", Path: "/v299", Status: 299}
+}
+
 type vConflictA struct {
 	mediator.Query[int]
 	A string `path:"a"`
@@ -333,6 +366,8 @@ func TestBuildCheck_Violations(t *testing.T) {
 		{"whitespace", func(t *testing.T, m *mediator.Mediator) { reg[vSpace](t, m) }, `path "/v x" contains whitespace`},
 		{"reserved", func(t *testing.T, m *mediator.Mediator) { reg[vReserved](t, m) }, `path "/healthz" is reserved`},
 		{"status", func(t *testing.T, m *mediator.Mediator) { reg[vStatus](t, m) }, "status 500 is not 2xx"},
+		{"status 199", func(t *testing.T, m *mediator.Mediator) { reg[vStatus199](t, m) }, "status 199 is not 2xx"},
+		{"status 300", func(t *testing.T, m *mediator.Mediator) { reg[vStatus300](t, m) }, "status 300 is not 2xx"},
 		{"conflict", func(t *testing.T, m *mediator.Mediator) { reg[vConflictA](t, m); reg[vConflictB](t, m) }, "conflicts with pattern"},
 		{"bad pattern", func(t *testing.T, m *mediator.Mediator) { reg[vBadPattern](t, m) }, `pattern "GET /v/{"`},
 		{"binding", func(t *testing.T, m *mediator.Mediator) { reg[vBinding](t, m) }, "2 binding sources"},
@@ -372,6 +407,8 @@ func TestBuildCheck_Violations(t *testing.T) {
 		m := mediator.New()
 		reg[vWildcard](t, m)
 		reg[vDollar](t, m)
+		reg[vStatus200](t, m)
+		reg[vStatus299](t, m)
 		reg[createOrder](t, m)
 		reg[getOrder](t, m)
 		reg[listOrders](t, m)

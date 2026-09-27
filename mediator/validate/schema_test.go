@@ -118,12 +118,14 @@ type mapping struct {
 	U     uint64               `json:"u" validate:"gt=0,lt=10"`
 	F     float32              `json:"f" validate:"min=1,gte=2,max=9,lte=8"`
 	S     string               `json:"s" validate:"len=3"`
+	E     string               `json:"e" validate:"email"`
 	T     time.Time            `json:"t"`
 	PT    *time.Time           `json:"pt"`
 	ID    uuid.UUID            `json:"id" validate:"required"`
 	Raw   []byte               `json:"raw"`
 	RawR  []byte               `json:"raw_r" validate:"required"`
 	Arr   [4]byte              `json:"arr"`
+	ArrR  [4]byte              `json:"arr_r" validate:"required"`
 	JSON  jsontext.Value       `json:"json"`
 	PJSON *jsontext.Value      `json:"pjson"`
 	Any   any                  `json:"any"`
@@ -170,19 +172,21 @@ func TestTypeMapping(t *testing.T) {
 	jsonEqual(t, body, `{
 	  "type": "object",
 	  "additionalProperties": false,
-	  "required": ["i", "id", "raw_r", "mr", "lr", "plr"],
+	  "required": ["i", "id", "raw_r", "arr_r", "mr", "lr", "plr"],
 	  "properties": {
 	    "b": {"type": "boolean"},
 	    "i": {"type": "integer"},
 	    "u": {"type": "integer", "exclusiveMinimum": 0, "exclusiveMaximum": 10},
 	    "f": {"type": "number", "minimum": 2, "maximum": 8},
 	    "s": {"type": "string", "minLength": 3, "maxLength": 3},
+	    "e": {"type": "string", "format": "email"},
 	    "t": {"type": "string", "format": "date-time"},
 	    "pt": {"type": ["string", "null"], "format": "date-time"},
 	    "id": {"type": "string", "format": "uuid"},
 	    "raw": {"type": ["string", "null"], "contentEncoding": "base64"},
 	    "raw_r": {"type": "string", "contentEncoding": "base64"},
 	    "arr": {"type": "string", "contentEncoding": "base64"},
+	    "arr_r": {"type": "string", "contentEncoding": "base64"},
 	    "json": {},
 	    "pjson": {},
 	    "any": {},
@@ -304,6 +308,11 @@ type Box[T any] struct {
 	V T `json:"v"`
 }
 
+// zAZ09 has a character at each end of the three ranges shortName keeps.
+type zAZ09 struct {
+	A int `json:"a"`
+}
+
 func TestSchemasNaming(t *testing.T) {
 	v := New()
 	reg := &Schemas{}
@@ -338,6 +347,11 @@ func TestSchemasNaming(t *testing.T) {
 		t.Fatal("foreign entry was overwritten")
 	}
 
+	// The counter keeps rising past a suffix that is taken too.
+	reg3 := &Schemas{Defs: map[string]*Schema{"Line": {}, "validate.Line": {}, "validate.Line_2": {}}}
+	fifth := mustSchema(t, v, reflect.TypeFor[Line](), reg3, SchemaOptions{})
+	jsonEqual(t, fifth, `{"$ref": "#/components/schemas/validate.Line_3"}`)
+
 	// Generic names are sanitized and their type arguments lose the package.
 	b := mustSchema(t, v, reflect.TypeFor[Box[time.Time]](), reg, SchemaOptions{})
 	jsonEqual(t, b, `{"$ref": "#/components/schemas/Box_Time_"}`)
@@ -368,6 +382,10 @@ func TestStripTypeArgPackages(t *testing.T) {
 		"Box[map[string]*a/b.X]":  "Box[map[string]*X]",
 		"Map[a/b.X,[]a/b.Wrapper[*gopkg.in/yaml.v3.Node]]": "Map[X,[]Wrapper[*Node]]",
 		"Box[struct { A int }]":                            "Box[struct { A int }]",
+		// Boundaries of the scanner itself: a bracket at index 0 and a
+		// qualifier that is only the dot.
+		"[a/b.X]": "[X]",
+		"Box[.X]": "Box[X]",
 	}
 	for in, want := range cases {
 		if got := stripTypeArgPackages(in); got != want {
@@ -376,6 +394,9 @@ func TestStripTypeArgPackages(t *testing.T) {
 	}
 	// Through reflect: the generic Box over types of this package and of
 	// package mediator.
+	if got := shortName(reflect.TypeFor[zAZ09]()); got != "zAZ09" {
+		t.Errorf("shortName = %q", got)
+	}
 	if got := shortName(reflect.TypeFor[Box[Line]]()); got != "Box_Line_" {
 		t.Errorf("shortName = %q", got)
 	}

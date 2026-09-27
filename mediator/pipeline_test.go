@@ -413,6 +413,9 @@ func TestPipeline_TypedBehaviorsPositionedAndNamed(t *testing.T) {
 	mustNil(t, mediator.UseFor(m, namedTyped{name: "tenant", log: &log}, mediator.After("B")))
 	mustNil(t, mediator.UseFor(m, typedRec[pCmd]("inner1", &log)))
 	mustNil(t, mediator.UseFor(m, typedRec[pCmd]("inner2", &log)))
+	// An unpositioned typed behavior takes a slot in the per-type counter, so
+	// the positioned q0 registered after it is typed:pQuery:1.
+	mustNil(t, mediator.UseFor(m, typedRec[pQuery]("qinner", &log)))
 	mustNil(t, mediator.UseFor(m, typedRec[pQuery]("q0", &log), mediator.After("A")))
 	// A named typed behavior that collides with an existing name is rejected.
 	wantContains(t, mediator.UseFor(m, namedTyped{name: "A", log: &log}, mediator.After("B")), "already registered")
@@ -421,10 +424,10 @@ func TestPipeline_TypedBehaviorsPositionedAndNamed(t *testing.T) {
 	if got := m.ChainFor(reflect.TypeFor[pCmd]()); !reflect.DeepEqual(got, []string{"typed:pCmd:1", "A", "typed:pCmd:0", "B", "tenant"}) {
 		t.Fatalf("command chain = %v", got)
 	}
-	if got := m.ChainFor(reflect.TypeFor[pQuery]()); !reflect.DeepEqual(got, []string{"A", "typed:pQuery:0", "B"}) {
+	if got := m.ChainFor(reflect.TypeFor[pQuery]()); !reflect.DeepEqual(got, []string{"A", "typed:pQuery:1", "B"}) {
 		t.Fatalf("query chain = %v", got)
 	}
-	if got := m.Order(); !reflect.DeepEqual(got, []string{"typed:pCmd:1", "A", "typed:pCmd:0", "typed:pQuery:0", "B", "tenant"}) {
+	if got := m.Order(); !reflect.DeepEqual(got, []string{"typed:pCmd:1", "A", "typed:pCmd:0", "typed:pQuery:1", "B", "tenant"}) {
 		t.Fatalf("order = %v", got)
 	}
 	res, err := mediator.Send(context.Background(), m, pCmd{N: 3})
@@ -438,7 +441,7 @@ func TestPipeline_TypedBehaviorsPositionedAndNamed(t *testing.T) {
 	if _, err := mediator.Send(context.Background(), m, pQuery{}); err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(log, ""); got != nesting([]string{"A", "q0", "B"}, "qhandler") {
+	if got := strings.Join(log, ""); got != nesting([]string{"A", "q0", "B", "qinner"}, "qhandler") {
 		t.Fatalf("query log = %s", got)
 	}
 }
@@ -601,5 +604,43 @@ func TestPipeline_BehaviorFuncAndUseErrors(t *testing.T) {
 	}
 	if res, err := mediator.Send(context.Background(), m, pCmd{}); err != nil || res != 5 {
 		t.Fatal(res, err)
+	}
+}
+
+// TestPipeline_HandlerResultBesideError pins what a behavior sees when the
+// handler returns a result together with an error. Without error handlers the
+// chain calls the handler directly and passes the pair through unchanged; an
+// error handler wraps it and hands an unhandled error on without the result.
+func TestPipeline_HandlerResultBesideError(t *testing.T) {
+	cases := []struct {
+		name     string
+		withErrh bool
+		wantSeen any
+	}{
+		{"no error handler", false, 7},
+		{"unhandled by an error handler", true, nil},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m := mediator.New()
+			mustNil(t, mediator.HandleFunc(m, func(context.Context, pCmd) (int, error) { return 7, errors.New("partial") }))
+			if c.withErrh {
+				mustNil(t, mediator.OnError(m, mediator.ErrorHandlerFunc[pCmd, int](func(context.Context, pCmd, error) (int, bool, error) { return 0, false, nil })))
+			}
+			var seen any
+			mustNil(t, mediator.Use(m, mediator.BehaviorFunc{N: "peek", F: func(ctx context.Context, req any, _ *mediator.RequestInfo, next mediator.Next) (any, error) {
+				res, err := next(ctx, req)
+				seen = res
+				return res, err
+			}}))
+			build(t, m)
+			res, err := m.SendAny(context.Background(), pCmd{})
+			if err == nil || err.Error() != "partial" || res != c.wantSeen || seen != c.wantSeen {
+				t.Fatalf("SendAny = (%v, %v), behavior saw %v, want result %v", res, err, seen, c.wantSeen)
+			}
+			if r, err := mediator.Send(context.Background(), m, pCmd{}); r != 0 || err == nil {
+				t.Fatalf("Send = (%d, %v), want the zero value and the error", r, err)
+			}
+		})
 	}
 }

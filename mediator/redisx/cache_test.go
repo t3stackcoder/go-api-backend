@@ -39,7 +39,13 @@ func TestCacheEntry_RoundTrip(t *testing.T) {
 }
 
 func TestCacheEntry_Malformed(t *testing.T) {
-	for _, bad := range []string{``, `{}`, `{"v":{}`, `{"v":{},"x":1}`, `{"v":{"a":"x"},"b":1}`, `{"v":{"a":1}}`, `{"v":{"unterminated`} {
+	for _, bad := range []string{
+		``, `{}`, `{"v":{}`, `{"v":{},"x":1}`, `{"v":{"a":"x"},"b":1}`, `{"v":{"a":1}}`, `{"v":{"unterminated`,
+		// Braces that never balance, and a string that never closes, with a
+		// closing brace at the end: the scan must run out of input without
+		// reading past it.
+		`{"v":{{}`, `{"v":{"unterminated}`,
+	} {
 		if _, _, err := decodeCacheEntry([]byte(bad)); err == nil {
 			t.Errorf("decodeCacheEntry(%q) accepted", bad)
 		}

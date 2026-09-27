@@ -159,13 +159,19 @@ func TestConfigDefaultsAndPool(t *testing.T) {
 	if pc.HealthCheckPeriod != 30*time.Second || pc.ConnConfig.ConnectTimeout != 5*time.Second || pc.ConnConfig.RuntimeParams["application_name"] != "mediator" {
 		t.Fatalf("pool defaults: %+v", pc.ConnConfig.RuntimeParams)
 	}
+	// Zero pool sizes and lifetimes keep what the URL (or pgxpool) set.
+	pc, _ = pgxpool.ParseConfig("postgres://u:p@localhost:5432/db?pool_max_conns=7&pool_min_conns=2&pool_max_conn_lifetime=2h&pool_max_conn_idle_time=45m")
+	pg.ApplyPoolConfig(pc, pg.PoolConfig{})
+	if pc.MaxConns != 7 || pc.MinConns != 2 || pc.MaxConnLifetime != 2*time.Hour || pc.MaxConnIdleTime != 45*time.Minute {
+		t.Fatalf("zero pool sizes must keep the URL's: max=%d min=%d lifetime=%s idle=%s", pc.MaxConns, pc.MinConns, pc.MaxConnLifetime, pc.MaxConnIdleTime)
+	}
 	if _, err := pg.NewPool(context.Background(), "://bad", pg.PoolConfig{}); err == nil {
 		t.Fatal("bad url must fail")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if _, err := pg.NewPool(ctx, "postgres://u:p@127.0.0.1:1/db", pg.PoolConfig{ConnectTimeout: 200 * time.Millisecond}); err == nil {
-		t.Fatal("unreachable database must fail the startup ping")
+	if _, err := pg.NewPool(ctx, "postgres://u:p@127.0.0.1:1/db", pg.PoolConfig{ConnectTimeout: 200 * time.Millisecond}); err == nil || !strings.Contains(err.Error(), "pg: ping") {
+		t.Fatalf("unreachable database must fail the startup ping: %v", err)
 	}
 	s := pg.NewStore(nil, pg.StoreConfig{})
 	if s.Partitions() != 1 || s.Pool() != nil {
@@ -173,5 +179,35 @@ func TestConfigDefaultsAndPool(t *testing.T) {
 	}
 	if pg.NewStore(nil, pg.StoreConfig{Partitions: 8}).Partitions() != 8 {
 		t.Fatal("store partitions")
+	}
+}
+
+// TestNewStore_LockTimeoutAndFencingSQL pins the two derived fields of a
+// store: the lock timeout at and around zero, and the fencing sequence
+// query with and without a schema.
+func TestNewStore_LockTimeoutAndFencingSQL(t *testing.T) {
+	const plain = "SELECT nextval('mediator_fencing_seq')"
+	cases := []struct {
+		name    string
+		cfg     pg.StoreConfig
+		lock    time.Duration
+		fencing string
+	}{
+		{"zero lock timeout takes the default", pg.StoreConfig{}, pg.DefaultLockTimeout, plain},
+		{"negative lock timeout takes the default", pg.StoreConfig{DefaultLockTimeout: -time.Second}, pg.DefaultLockTimeout, plain},
+		{"configured lock timeout is kept", pg.StoreConfig{DefaultLockTimeout: 2 * time.Second}, 2 * time.Second, plain},
+		{"schema qualifies the fencing sequence", pg.StoreConfig{Schema: "s"}, pg.DefaultLockTimeout, `SELECT nextval('"s"."mediator_fencing_seq"')`},
+		{"schema quotes are escaped", pg.StoreConfig{Schema: `o'k"`}, pg.DefaultLockTimeout, `SELECT nextval('"o''k"""."mediator_fencing_seq"')`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := pg.NewStore(nil, tc.cfg)
+			if got := s.LockTimeoutForTest(); got != tc.lock {
+				t.Fatalf("lock timeout %s, want %s", got, tc.lock)
+			}
+			if got := s.FencingSQLForTest(); got != tc.fencing {
+				t.Fatalf("fencing SQL\n got %s\nwant %s", got, tc.fencing)
+			}
+		})
 	}
 }

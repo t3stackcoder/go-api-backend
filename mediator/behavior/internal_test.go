@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/t3stackcoder/go-api-backend/mediator"
+	"github.com/t3stackcoder/go-api-backend/mediator/behavior/cachemodel"
 	"github.com/t3stackcoder/go-api-backend/mediator/testkit"
 	"github.com/t3stackcoder/go-api-backend/mediator/validate"
 )
@@ -68,6 +70,27 @@ func TestLogLimiter(t *testing.T) {
 	l.allow("fresh")
 	if len(l.last) > 2 {
 		t.Fatalf("expired keys not swept: %d", len(l.last))
+	}
+	// The sweep runs once the map holds exactly maxKeys entries: a full map
+	// of expired keys is emptied by the next new key; one short of full is
+	// not swept and grows by one.
+	for _, tc := range []struct {
+		name string
+		keys int
+		want int
+	}{
+		{"full", logLimiterMaxKeys, 1},
+		{"one short of full", logLimiterMaxKeys - 1, logLimiterMaxKeys},
+	} {
+		l = newLogLimiter(clock, time.Minute)
+		for i := 0; i < tc.keys; i++ {
+			l.allow(strconv.Itoa(i))
+		}
+		clock.Advance(time.Minute)
+		l.allow("fresh")
+		if len(l.last) != tc.want {
+			t.Errorf("%s: %d keys after a fresh one, want %d", tc.name, len(l.last), tc.want)
+		}
 	}
 }
 
@@ -136,12 +159,82 @@ func TestTimeoutErrorAndPhase(t *testing.T) {
 	if mediator.CodeOf(err) != mediator.CodeTimeout || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatal(err)
 	}
+	// An error that already carries CodeTimeout is returned as is, not
+	// wrapped a second time.
+	own := mediator.Wrap(mediator.CodeTimeout, "own", context.DeadlineExceeded)
+	if got := timeoutError(own, context.DeadlineExceeded); got != error(own) {
+		t.Fatalf("a timeout error must be returned unchanged, got %v", got)
+	}
 	if phase(true) != "post-commit" || phase(false) != "pre-commit" {
 		t.Fatal("phase")
 	}
 	tm := &timeout{def: time.Second}
 	if d := tm.durationFor(nil, &mediator.RequestInfo{Kind: mediator.KindConsumer}); d != time.Second {
 		t.Fatalf("no registrations: %s", d)
+	}
+}
+
+// tick is a durable event for the consumer registrations below.
+type tick struct {
+	mediator.Event
+	ID string `json:"id"`
+}
+
+func (e tick) StreamKey() string { return e.ID }
+
+// TestTimeout_OnBuildRecordsExplicitTimeoutsOnly: OnBuild records the
+// HandlerTimeout of the consumers that set one; a registration without one
+// (zero) gets no entry and durationFor falls back to the default for it.
+func TestTimeout_OnBuildRecordsExplicitTimeoutsOnly(t *testing.T) {
+	m := mediator.New()
+	noop := func(context.Context, tick) error { return nil }
+	if err := mediator.ConsumeFunc(m, "explicit", noop, mediator.HandlerTimeout(5*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := mediator.ConsumeFunc(m, "implicit", noop); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Build(); err != nil {
+		t.Fatal(err)
+	}
+	tm := &timeout{def: time.Second}
+	if err := tm.OnBuild(m); err != nil {
+		t.Fatal(err)
+	}
+	recorded := *tm.consumer.Load()
+	if len(recorded) != 1 {
+		t.Fatalf("recorded %v, want the explicit consumer only", recorded)
+	}
+	for _, c := range m.ConsumerRegistrations() {
+		want := map[string]time.Duration{"explicit": 5 * time.Second, "implicit": time.Second}[c.Group]
+		if d, ok := recorded[c.Info]; ok != (c.Group == "explicit") || (ok && d != want) {
+			t.Errorf("%s: recorded %v %s", c.Group, ok, d)
+		}
+		if got := tm.durationFor(tick{}, c.Info); got != want {
+			t.Errorf("%s: durationFor = %s, want %s", c.Group, got, want)
+		}
+	}
+}
+
+// TestCache_PrepareWarmsCachedQueries: Prepare precomputes the metric
+// attributes of every cached query (kind query with CacheTags) so Handle
+// never takes the slow path for one; other infos are left to the fallback.
+func TestCache_PrepareWarmsCachedQueries(t *testing.T) {
+	c := NewCache(Config{Cache: cachemodel.NewMemory()}).(*cache)
+	cached := &mediator.RequestInfo{Name: "cached", Kind: mediator.KindQuery, Traits: mediator.Traits{CacheTags: true}}
+	plain := &mediator.RequestInfo{Name: "plain", Kind: mediator.KindQuery}
+	tagged := &mediator.RequestInfo{Name: "tagged", Kind: mediator.KindCommand, Traits: mediator.Traits{CacheTags: true}}
+	if err := c.Prepare([]*mediator.RequestInfo{cached, plain, tagged}); err != nil {
+		t.Fatal(err)
+	}
+	warmed := c.attrs.m.Load()
+	if warmed == nil {
+		t.Fatal("Prepare must warm the attribute cache")
+	}
+	for info, want := range map[*mediator.RequestInfo]bool{cached: true, plain: false, tagged: false} {
+		if _, ok := (*warmed)[info]; ok != want {
+			t.Errorf("%s warmed at Prepare: %v, want %v", info.Name, ok, want)
+		}
 	}
 }
 
@@ -251,6 +344,12 @@ func TestRedactor_EdgeCases(t *testing.T) {
 		}
 		n = m["next"]
 	}
+	// Each node costs two levels (pointer, struct) and the head sits at
+	// depth 2, so exactly maxRedactDepth/2 nodes are expanded before the
+	// next pointer, at depth maxRedactDepth+1, is cut.
+	if depth != maxRedactDepth/2 {
+		t.Errorf("%d nodes expanded, want %d", depth, maxRedactDepth/2)
+	}
 	if _, ok := out["text"].(marshalsSelf); !ok {
 		t.Errorf("text %#v", out["text"])
 	}
@@ -282,5 +381,112 @@ func TestRedactor_EdgeCases(t *testing.T) {
 	}
 	if mapKey(reflect.ValueOf(struct{ k int }{3}).Field(0)) != "<int Value>" {
 		t.Error("read-only map key falls back to String()")
+	}
+}
+
+// ladder is a chain whose every rung flattens an embedded struct holding a
+// pointer, so the depth limit is exercised on the flatten path (fill) as
+// well as on the pointer and struct paths (value).
+type rungLeaf struct {
+	V int `json:"v"`
+}
+
+type rungFlat struct {
+	Leaf *rungLeaf `json:"leaf"`
+}
+
+type ladder struct {
+	rungFlat
+	Next *ladder `json:"next"`
+}
+
+// TestRedactor_DepthLimit pins where the limit cuts. Rung k's struct sits
+// at depth 2k (the next pointer at 2k-1); its flattened leaf is reached at
+// 2k+1, the leaf pointer at 2k+2 and the leaf struct at 2k+3. So with the
+// limit at 32: rung 14's leaf fits, rung 15's leaf struct (33) is cut, rung
+// 16 (struct at 32) is expanded but neither flattened (32 is not below the
+// limit) nor followed (its next pointer is at 33).
+func TestRedactor_DepthLimit(t *testing.T) {
+	r := &redactor{}
+	var head *ladder
+	for k := maxRedactDepth; k >= 0; k-- {
+		head = &ladder{rungFlat: rungFlat{Leaf: &rungLeaf{V: k}}, Next: head}
+	}
+	rungs := []map[string]any{r.Redact(*head).(map[string]any)}
+	for {
+		next, ok := rungs[len(rungs)-1]["next"].(map[string]any)
+		if !ok {
+			break
+		}
+		rungs = append(rungs, next)
+	}
+	const last = maxRedactDepth / 2
+	if len(rungs) != last+1 {
+		t.Fatalf("%d rungs expanded, want %d", len(rungs), last+1)
+	}
+	if rungs[last]["next"] != "[depth exceeded]" {
+		t.Errorf("rung %d next = %#v", last, rungs[last]["next"])
+	}
+	if leaf, _ := rungs[last-2]["leaf"].(map[string]any); leaf == nil || leaf["v"] != last-2 {
+		t.Errorf("rung %d leaf = %#v, want its value", last-2, rungs[last-2]["leaf"])
+	}
+	if rungs[last-1]["leaf"] != "[depth exceeded]" {
+		t.Errorf("rung %d leaf = %#v, want it cut", last-1, rungs[last-1]["leaf"])
+	}
+	if v, ok := rungs[last]["leaf"]; ok {
+		t.Errorf("rung %d was flattened at the limit: leaf = %#v", last, v)
+	}
+}
+
+// nestMap and nestList nest without an interface in between, so each level
+// costs exactly one depth.
+type (
+	nestMap  map[string]nestMap
+	nestList []nestList
+)
+
+// TestRedactor_DepthThroughMapsAndLists: map values and list elements count
+// one level each; levels 0 to maxRedactDepth are expanded and the next one
+// is cut, well before the leaf of a deeper nesting.
+func TestRedactor_DepthThroughMapsAndLists(t *testing.T) {
+	r := &redactor{}
+	const nesting = maxRedactDepth + 8
+	m, l := nestMap{}, nestList{}
+	for i := 0; i < nesting; i++ {
+		m, l = nestMap{"k": m}, nestList{l}
+	}
+	const want = maxRedactDepth + 1
+
+	depth := 0
+	for n := r.Redact(m); ; depth++ {
+		mm, ok := n.(map[string]any)
+		if !ok {
+			if n != "[depth exceeded]" {
+				t.Fatalf("map chain ended with %#v at depth %d", n, depth)
+			}
+			break
+		}
+		n = mm["k"]
+	}
+	if depth != want {
+		t.Errorf("%d map levels expanded, want %d", depth, want)
+	}
+
+	depth = 0
+	for n := r.Redact(l); ; depth++ {
+		ll, ok := n.([]any)
+		if !ok {
+			if n != "[depth exceeded]" {
+				t.Fatalf("list chain ended with %#v at depth %d", n, depth)
+			}
+			break
+		}
+		if len(ll) == 0 {
+			t.Fatalf("list chain reached its leaf at depth %d without being cut", depth)
+		}
+		n = ll[0]
+	}
+	if depth != want {
+		t.Errorf("%d list levels expanded, want %d", depth, want)
 	}
 }

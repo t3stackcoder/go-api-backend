@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -43,6 +45,16 @@ func TestConfig_WithDefaults(t *testing.T) {
 	first, again := DefaultNodeID(), DefaultNodeID()
 	if first == again {
 		t.Fatal("node ids should be unique")
+	}
+	// "<hostname>-<pid>-<8 hex>": the hostname is used whenever the OS
+	// reports one, and "node" stands in only when it does not.
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "node"
+	}
+	prefix := host + "-" + strconv.Itoa(os.Getpid()) + "-"
+	if !strings.HasPrefix(first, prefix) || len(first) != len(prefix)+8 {
+		t.Fatalf("node id %q, want prefix %q and an 8-hex suffix", first, prefix)
 	}
 	custom := Config{Prefix: "x", NodeID: "n", PartitionsPerTopic: 4}.WithDefaults()
 	if custom.Prefix != "x" || custom.NodeID != "n" || custom.PartitionsPerTopic != 4 || custom.Keys().Prefix != "x" {
@@ -109,8 +121,13 @@ func buildConsumerMediator(t *testing.T) *mediator.Mediator {
 func TestNewConsumers_Scopes(t *testing.T) {
 	m := buildConsumerMediator(t)
 	obs := &recordingObserver{}
+	fc := testkit.NewFakeClock(time.Date(2026, 9, 27, 0, 0, 0, 0, time.UTC))
+	lg := quietLogger()
 	c := NewConsumers(m, nil, Config{PartitionsPerTopic: 4}, &counterFencing{},
-		WithObserver(obs), WithClock(testkit.RealClock{}), WithLogger(quietLogger()), withBackoff(defaultBackoff))
+		WithObserver(obs), WithClock(fc), WithLogger(lg), withBackoff(defaultBackoff))
+	if c.clock != fc || c.logger != lg || c.obs != Observer(obs) {
+		t.Fatal("options were not applied")
+	}
 	want := []ScopeKey{{"g1", "shared"}, {"g1", "unitEvent"}, {"g2", "shared"}}
 	got := c.Scopes()
 	if len(got) != len(want) {
@@ -147,19 +164,29 @@ func TestNewConsumers_Scopes(t *testing.T) {
 	if c.Stats().Halted != 0 {
 		t.Fatal("unhalt")
 	}
-	// A running instance whose lease loop stopped ticking is unhealthy.
+	// A running instance whose lease loop stopped ticking is unhealthy: the
+	// stall threshold is three renew intervals, exclusive.
 	c.running.Store(true)
-	c.lm.mu.Lock()
-	c.lm.lastTick = time.Now().Add(-time.Hour)
-	c.lm.mu.Unlock()
+	setTick := func(at time.Time) {
+		c.lm.mu.Lock()
+		c.lm.lastTick = at
+		c.lm.mu.Unlock()
+	}
+	setTick(fc.Now().Add(-time.Hour))
 	if err := c.Healthy(); err == nil || !strings.Contains(err.Error(), "stalled") {
 		t.Fatalf("stalled loop: %v", err)
 	}
-	c.lm.mu.Lock()
-	c.lm.lastTick = time.Now()
-	c.lm.mu.Unlock()
+	setTick(fc.Now())
 	if err := c.Healthy(); err != nil {
 		t.Fatalf("fresh tick: %v", err)
+	}
+	fc.Advance(3 * c.cfg.LeaseRenew)
+	if err := c.Healthy(); err != nil {
+		t.Fatalf("tick exactly three renew intervals old: %v", err)
+	}
+	fc.Advance(time.Nanosecond)
+	if err := c.Healthy(); err == nil || !strings.Contains(err.Error(), "stalled") {
+		t.Fatalf("tick past three renew intervals: %v", err)
 	}
 	c.running.Store(false)
 	if ConsumerNodeFrom(withConsumerNode(context.Background(), "n1")) != "n1" || ConsumerNodeFrom(context.Background()) != "" {
@@ -169,6 +196,11 @@ func TestNewConsumers_Scopes(t *testing.T) {
 	explicit := NewConsumers(m, nil, Config{NodeID: "explicit"}, &counterFencing{}, WithObserver(nil), WithClock(nil), WithLogger(nil), withLeaseStore(fake))
 	if explicit.NodeID() != "explicit" || explicit.lm.store != leaseStore(fake) {
 		t.Fatal("explicit node id / lease store")
+	}
+	// Nil options keep the defaults: the wall clock, the mediator's logger,
+	// and the no-op observer.
+	if explicit.clock != testkit.Clock(testkit.RealClock{}) || explicit.logger != m.Logger() || explicit.obs != Observer(NopObserver{}) {
+		t.Fatalf("nil options replaced the defaults: clock %T logger %p obs %T", explicit.clock, explicit.logger, explicit.obs)
 	}
 }
 
@@ -193,6 +225,9 @@ func TestConsumers_IdleRun(t *testing.T) {
 	}
 	if !c.Stats().Running {
 		t.Fatal("running")
+	}
+	if !c.idle.Load() {
+		t.Fatal("no registrations: the consumers must run idle, without a lease loop")
 	}
 	cancel()
 	if err := <-done; err != nil {

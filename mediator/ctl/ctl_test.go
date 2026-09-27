@@ -1185,6 +1185,20 @@ func TestParseDuration(t *testing.T) {
 			t.Errorf("parseDuration(%q) = %s, %v; want %s, ok=%v", c.in, got, err, c.want, c.ok)
 		}
 	}
+	// A day count is parsed even when it is empty ("d..."), so the error
+	// names the whole input instead of handing "d12h" to time.ParseDuration.
+	messages := map[string]string{
+		"":     "empty duration",
+		"d":    `invalid duration "d"`,
+		"d12h": `invalid duration "d12h"`,
+		"1dx":  `invalid duration: time: invalid duration "x"`,
+		"0s":   "duration must be positive, got 0s",
+	}
+	for in, want := range messages {
+		if _, err := parseDuration(in); err == nil || err.Error() != want {
+			t.Errorf("parseDuration(%q) error = %v, want %q", in, err, want)
+		}
+	}
 }
 
 func TestRenderHelpers(t *testing.T) {

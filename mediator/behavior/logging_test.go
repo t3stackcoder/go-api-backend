@@ -82,6 +82,9 @@ func TestLogging_Outcomes(t *testing.T) {
 			if e.Attrs["outcome"] != c.outcome || e.Attrs["error_code"] != c.code {
 				t.Fatalf("end record %+v", e)
 			}
+			if _, ok := e.Attrs["items"]; ok {
+				t.Fatalf("items logged for a non-stream: %+v", e)
+			}
 			if !c.panics {
 				if msg, _ := e.Attrs["error"].(string); msg == "" {
 					t.Fatalf("error text missing: %+v", e)
@@ -101,6 +104,11 @@ func TestLogging_ConsumerAndNotification(t *testing.T) {
 	if len(ends) != 1 || ends[0].Attrs["group"] != consumerGroup || ends[0].Attrs["kind"] != "consumer" || ends[0].Attrs["correlation_id"] != "corr-c" {
 		t.Fatalf("consumer record %v", ends)
 	}
+	// The start record carries the group too.
+	starts := h.logs.find("request.start")
+	if len(starts) != 1 || starts[0].Attrs["group"] != consumerGroup {
+		t.Fatalf("consumer start record %v", starts)
+	}
 	h.logs.reset()
 	if err := mediator.Publish(ctx, h.m, thingEvent{ID: "e"}); err != nil {
 		t.Fatal(err)
@@ -112,6 +120,12 @@ func TestLogging_ConsumerAndNotification(t *testing.T) {
 	if _, ok := ends[0].Attrs["group"]; ok {
 		t.Fatal("group logged outside the consumer path")
 	}
+	if starts = h.logs.find("request.start"); len(starts) != 1 {
+		t.Fatalf("notification start record %v", starts)
+	}
+	if _, ok := starts[0].Attrs["group"]; ok {
+		t.Fatal("group logged on the start record outside the consumer path")
+	}
 }
 
 func TestLogging_Stream(t *testing.T) {
@@ -122,6 +136,14 @@ func TestLogging_Stream(t *testing.T) {
 	ends := h.logs.find("request.end")
 	if len(ends) != 1 || ends[0].Attrs["items"] != int64(4) || ends[0].Attrs["outcome"] != behavior.OutcomeOK || ends[0].Attrs["kind"] != "stream" {
 		t.Fatalf("stream record %v", ends)
+	}
+
+	// An empty stream still reports its item count, zero.
+	h.logs.reset()
+	for range mediator.Stream(ctx, h.m, numStream{N: 0}) {
+	}
+	if ends = h.logs.find("request.end"); len(ends) != 1 || ends[0].Attrs["items"] != int64(0) {
+		t.Fatalf("empty stream record %v", ends)
 	}
 
 	h.logs.reset()

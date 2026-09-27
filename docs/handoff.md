@@ -5,9 +5,9 @@ contract), `docs/design-notes.md` (decisions, deviations, and the hardening
 and tier outcomes in sections 7 and 8), then this file. Keep this file
 current: update it in the same commit as the work it describes.
 
-Last updated 2026-09-27 at the end of the sixth session (the one that raised
-the coverage thresholds, re-ran the seven remaining chaos workloads, recorded
-the benchmark baseline, and ran the mutation gate for the first time).
+Last updated 2026-09-27 at the end of the seventh session (the one that
+triaged the mutation survivors; it was cut short, so section 3 item 1 lists
+what it left unfinished and where its records are).
 
 ## 1. Where things stand
 
@@ -89,13 +89,44 @@ deliverables exist and every tier is green locally. What remains is the
 acceptance tail that needs a remote or calendar time, plus the survivors of
 the mutation gate.
 
-1. **Mutation survivors.** Spec 11.3 says surviving mutants are triaged into
-   new table rows. Design-notes 8.13 lists the 227 that lived by file and
-   mutator (165 are boundary conditions, `validate`'s length and range
-   checks first); each is either a missing assertion (add the table row)
-   or an equivalent mutant (record it as such). The gate's threshold rises
-   as the suite matures. To reproduce on Windows, build gremlins with the
-   one-line patch of section 2 into a scratch `GOBIN` and put it on `PATH`.
+1. **Mutation survivors: finish the triage.** The seventh session triaged
+   all 227 survivors of design-notes 8.13, plus four more that longer
+   per-package timeouts exposed: 156 killed by new unit-test rows in the
+   mutant's own package (36 test files, committed with this handoff; no
+   source file changed), 70 recorded as equivalent, 1 open. Every kill was
+   verified by applying the mutation by hand and watching the named test
+   fail. Per-package gremlins efficacy afterwards: validate 98.2, root
+   `mediator` 94.5, `retry` 83.3 (its four survivors are equivalent),
+   `ratelimit` 100, `behavior` 99.0, `httpapi` 99.0, `pg` 98.0, `ctl` 98.6,
+   `redisx` 91.3, `testkit/history` 97.0, `testkit/memstore` 97.5,
+   `testkit/workload` 100 percent. Left to do, in order:
+   * Move the triage record into design-notes 8.14. The per-mutant tables
+     (test name per kill, one-sentence reason per equivalent, timeouts
+     seen) are six files in the session scratchpad
+     `C:\Users\dwhit\AppData\Local\Temp\claude\c--Projects-go-api-backend\cd632d37-9699-4f87-9675-787c84548bf8\scratchpad\reports\`
+     and nowhere else; copy them before anything cleans that directory.
+   * Decide the open one, `send.go:293:15` (`CONDITIONALS_BOUNDARY`), a
+     suspected defect: `Publish` stores the call's options in the context
+     only when options were passed, so a nested `Publish` made from an
+     in-process handler without options inherits the enclosing call's
+     `Strategy` and `Headers`, while the option docs say an option
+     configures one call. The fix is to mask inherited options when the
+     nested call passes none (`else if ctx.Value(publishOptsKey{}) != nil`,
+     install an empty `publishOptions`); an unconditional install would add
+     an allocation to every `Publish` and fail `BenchmarkPublish_InProcess`
+     (36 ns, 0 allocs) under the 10 percent gate. Not applied; it needs a
+     pinning test in `publish_test.go` and a design-notes entry.
+   * Run the full gate once on a quiet machine (`task mutate` with the
+     patched gremlins of section 2 on `PATH`; the session's own full run was
+     interrupted) and raise `--threshold-efficacy` in `tools/task/tasks.go`
+     from 80 (with the assertion in `app_test.go` and the CI job name).
+     Expected efficacy is about 97 percent; 95 is the suggested gate.
+   * Facts for the next run: `gremlins -E` matches paths relative to the
+     target directory (`-E '^[a-z]+/'` restricts `./mediator` to the root
+     package); a per-package run needs `--timeout-coefficient 30` because
+     the timeout is sized from a sub-second coverage run; in Git Bash put
+     the gobin on `PATH` in `/c/...` form; concurrent runs make kills show
+     as TIMED OUT (not counted against efficacy), so run one at a time.
 2. **CI.** No remote exists. The first push exercises tiers 0 to 4 and the
    openapi job for the first time, including the race detector, which has
    never run anywhere (no C compiler on this machine), and the nightly
@@ -107,7 +138,7 @@ the mutation gate.
    nightlies, which is calendar time. Soak mode (`-soak`) exists and has
    not been exercised.
 4. **Commit** only when the user asks, with the attribution line the session
-   specifies. The sixth session is committed; the tree was clean at the
+   specifies. The seventh session is committed; the tree was clean at the
    end of it.
 
 ## 4. How to run each tier here

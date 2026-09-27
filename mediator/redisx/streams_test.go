@@ -90,6 +90,13 @@ func TestEntry_Defaults(t *testing.T) {
 	if _, _, _, err = DecodeEntry(fields2); err != nil {
 		t.Fatal(err)
 	}
+	// An empty object that is not the literal "{}" decodes to no headers
+	// either, so the envelope compares equal to one encoded without any.
+	fields2[FieldHeaders] = "{ }"
+	env, _, _, err = DecodeEntry(fields2)
+	if err != nil || env.Headers != nil {
+		t.Fatalf("headers %q: %#v %v", fields2[FieldHeaders], env.Headers, err)
+	}
 }
 
 func TestEntry_Garbage(t *testing.T) {
@@ -164,5 +171,15 @@ func TestDLQFields_Shape(t *testing.T) {
 	bad := parseDLQ(redis.XMessage{ID: "9-1", Values: map[string]any{DLQFieldError: "e", FieldID: "x"}}, "g")
 	if bad.DecodeErr == nil {
 		t.Fatal("expected decode error")
+	}
+	// The recorded group wins over the group the entry was listed under; an
+	// empty recorded group falls back to it.
+	f[DLQFieldGroup] = "other"
+	if e := parseDLQ(redis.XMessage{ID: "9-2", Values: f}, "proj"); e.Group != "other" {
+		t.Fatalf("recorded group ignored: %q", e.Group)
+	}
+	f[DLQFieldGroup] = ""
+	if e := parseDLQ(redis.XMessage{ID: "9-3", Values: f}, "proj"); e.Group != "proj" {
+		t.Fatalf("empty recorded group: %q", e.Group)
 	}
 }

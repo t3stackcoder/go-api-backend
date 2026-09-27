@@ -9,7 +9,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+
 	"github.com/t3stackcoder/go-api-backend/mediator"
+	"github.com/t3stackcoder/go-api-backend/mediator/pg"
 	"github.com/t3stackcoder/go-api-backend/mediator/validate"
 )
 
@@ -253,5 +257,74 @@ func TestPanicAndSlow(t *testing.T) {
 	_, err := mediator.Send(cctx, m, Slow{Millis: 10_000})
 	if mediator.CodeOf(err) != mediator.CodeTimeout || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("canceled slow: %v", err)
+	}
+}
+
+// recordingStore is a pg.Store whose transaction exposes a recording pgx.Tx
+// through PgxTx, so a handler runs inside pg.WithTx without a database and
+// the test sees the SQL arguments it binds.
+type recordingStore struct {
+	pg.Store // nil: only Begin is called
+	tx       *recordingTx
+}
+
+func (s *recordingStore) Begin(context.Context, pg.TxOptions) (pg.Tx, error) { return s.tx, nil }
+
+type recordingTx struct {
+	pg.Tx // nil: only Commit, Rollback, and ReadOnly are called
+	execs [][]any
+}
+
+func (t *recordingTx) Commit(context.Context) error   { return nil }
+func (t *recordingTx) Rollback(context.Context) error { return nil }
+func (t *recordingTx) ReadOnly() bool                 { return false }
+func (t *recordingTx) PgxTx() pgx.Tx                  { return &recordingPgxTx{tx: t} }
+
+type recordingPgxTx struct {
+	pgx.Tx // nil: only Exec is called
+	tx     *recordingTx
+}
+
+func (p *recordingPgxTx) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	p.tx.execs = append(p.tx.execs, append([]any{sql}, args...))
+	return pgconn.CommandTag{}, nil
+}
+
+func TestRegister_NodeID(t *testing.T) {
+	// The node written to wl_cmd_log is Deps.NodeID, else the mediator's node
+	// ID, else "node".
+	cases := []struct {
+		name string
+		opts []mediator.Option
+		deps Deps
+		want string
+	}{
+		{"explicit", []mediator.Option{mediator.WithNodeID("n7")}, Deps{NodeID: "explicit"}, "explicit"},
+		{"mediator", []mediator.Option{mediator.WithNodeID("n7")}, Deps{}, "n7"},
+		{"default", nil, Deps{}, "node"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m := mediator.New(c.opts...)
+			c.deps.Groups = []string{}
+			if err := Register(m, c.deps); err != nil {
+				t.Fatal(err)
+			}
+			if err := m.Build(); err != nil {
+				t.Fatal(err)
+			}
+			tx := &recordingTx{}
+			err := pg.WithTx(context.Background(), &recordingStore{tx: tx}, pg.TxOptions{}, func(ctx context.Context) error {
+				_, err := mediator.Send(ctx, m, Touch{Key: "k", CmdID: "c"})
+				return err
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			// wl_cmd_log binds (cmd_id, name, key, node, request_id).
+			if len(tx.execs) != 1 || len(tx.execs[0]) != 6 || tx.execs[0][1] != "c" || tx.execs[0][2] != NameTouch || tx.execs[0][4] != c.want {
+				t.Fatalf("wl_cmd_log exec = %v, want node %q", tx.execs, c.want)
+			}
+		})
 	}
 }

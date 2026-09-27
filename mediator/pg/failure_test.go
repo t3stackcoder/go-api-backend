@@ -2,7 +2,8 @@ package pg_test
 
 // Failure branches reachable without Postgres: a malformed migration
 // source, a relay whose pool is gone, a slot canceled while failing, the
-// janitor loop logging a failed sweep, and the codecs of the idempotency
+// janitor loop logging a failed sweep, the unit of work logging a failed
+// rollback and a hook panic, and the codecs of the idempotency
 // behavior.
 
 import (
@@ -353,5 +354,89 @@ func TestIdempotency_ReplayWithoutResponseType(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+// TestBeforeCommit_OutsideUnitOfWorkLogsOnlyAFailure: outside a unit of
+// work the hook runs at once, and only an error reaches the default logger.
+func TestBeforeCommit_OutsideUnitOfWorkLogsOnlyAFailure(t *testing.T) {
+	const msg = "unit of work: before-commit hook outside a transaction failed"
+	h := &recordingHandler{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(h))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	ran := 0
+	pg.BeforeCommit(context.Background(), func(context.Context) error { ran++; return nil })
+	if ran != 1 || h.has(msg) {
+		t.Fatalf("a succeeding hook must run once and log nothing: ran=%d logged=%v", ran, h.msgs)
+	}
+	pg.BeforeCommit(context.Background(), func(context.Context) error { ran++; return errors.New("veto") })
+	if ran != 2 || !h.has(msg) {
+		t.Fatalf("a failing hook must run once and be logged: ran=%d logged=%v", ran, h.msgs)
+	}
+}
+
+// TestUnitOfWork_LogsRollbackFailure: a ROLLBACK that fails is logged
+// through the configured logger; a clean one is not.
+func TestUnitOfWork_LogsRollbackFailure(t *testing.T) {
+	const msg = "unit of work: rollback failed"
+	boom := errors.New("boom")
+	cases := []struct {
+		name     string
+		rollback func() error
+		want     bool
+	}{
+		{"rollback succeeds", nil, false},
+		{"rollback fails", func() error { return errors.New("conn lost") }, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := memstore.New(memstore.Config{})
+			store.Hooks.Rollback = tc.rollback
+			h := &recordingHandler{}
+			m := build(t, func(m *mediator.Mediator) {
+				must(t, mediator.HandleFunc(m, func(ctx context.Context, c createThing) (thingResult, error) { return thingResult{}, boom }))
+			}, pg.UnitOfWork(store, pg.UnitOfWorkConfig{Logger: slog.New(h)}))
+			if _, err := mediator.Send(context.Background(), m, createThing{}); !errors.Is(err, boom) {
+				t.Fatalf("want boom, got %v", err)
+			}
+			if store.RolledBack() != 1 || h.has(msg) != tc.want {
+				t.Fatalf("rolledBack=%d logged=%v, want logged=%v", store.RolledBack(), h.msgs, tc.want)
+			}
+		})
+	}
+}
+
+// TestUnitOfWork_LogsOnCommitHookPanic: a hook panic is logged and the
+// remaining hooks still run; a hook that returns logs nothing.
+func TestUnitOfWork_LogsOnCommitHookPanic(t *testing.T) {
+	const msg = "unit of work: on-commit hook panicked"
+	cases := []struct {
+		name string
+		hook func(context.Context)
+		want bool
+	}{
+		{"hook returns", func(context.Context) {}, false},
+		{"hook panics", func(context.Context) { panic("hook exploded") }, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := memstore.New(memstore.Config{})
+			h := &recordingHandler{}
+			ran := 0
+			m := build(t, func(m *mediator.Mediator) {
+				must(t, mediator.HandleFunc(m, func(ctx context.Context, c createThing) (thingResult, error) {
+					pg.OnCommit(ctx, tc.hook)
+					pg.OnCommit(ctx, func(context.Context) { ran++ })
+					return thingResult{}, nil
+				}))
+			}, pg.UnitOfWork(store, pg.UnitOfWorkConfig{Logger: slog.New(h)}))
+			if _, err := mediator.Send(context.Background(), m, createThing{}); err != nil {
+				t.Fatal(err)
+			}
+			if store.Committed() != 1 || ran != 1 || h.has(msg) != tc.want {
+				t.Fatalf("committed=%d ran=%d logged=%v, want logged=%v", store.Committed(), ran, h.msgs, tc.want)
+			}
+		})
 	}
 }

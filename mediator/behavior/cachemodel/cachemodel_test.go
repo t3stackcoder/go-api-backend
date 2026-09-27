@@ -131,7 +131,8 @@ func TestScheduler_Model(t *testing.T) {
 	if len(h) != len(readerSteps)+len(writerSteps) || h[0].String() != "0:get(miss)" || h[3].String() != "0:set(0)" || h[4].String() != "1:begin" {
 		t.Fatalf("history %v", h)
 	}
-	if s.Step(0) != nil || s.Step(99) != nil || s.Step(-1) != nil {
+	// Finished, one past the last id, far out of range, negative.
+	if s.Step(0) != nil || s.Step(cfg.Readers+cfg.Writers) != nil || s.Step(99) != nil || s.Step(-1) != nil {
 		t.Fatal("stepping a finished or unknown actor is a no-op")
 	}
 
@@ -159,6 +160,19 @@ func TestScheduler_Model(t *testing.T) {
 	}
 	if len(s.Runnable()) != 0 {
 		t.Fatal("a served reader is finished")
+	}
+
+	// A hit whose value equals the bound is fresh: the writer returned
+	// (bound 1), a reader filled the cache with that write (value 1), and a
+	// second reader is served exactly the bound, which is not a violation.
+	s = New(ctx, NewMemory(), Config{Readers: 2, Writers: 1, Key: "k", Tags: []string{"t"}})
+	order = []int{2, 2, 2, 2, 2, 0, 0, 0, 0, 1}
+	i = 0
+	if err := s.Run(func([]int) int { i++; return order[i-1] }); err != nil || s.Violation() != nil {
+		t.Fatalf("a hit equal to the bound is fresh: %v", err)
+	}
+	if h := s.History(); h[len(h)-1].String() != "1:get(hit 1)" {
+		t.Fatalf("history %v", h)
 	}
 }
 

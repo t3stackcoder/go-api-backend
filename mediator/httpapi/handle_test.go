@@ -22,6 +22,11 @@ import (
 
 func TestDecode(t *testing.T) {
 	f := newFixture(t, httpapi.Config{MaxBodyBytes: 64})
+	// bodyOfLen is a valid createOrder body of exactly n bytes.
+	bodyOfLen := func(n int) string {
+		const frame = `{"customerId":""}`
+		return `{"customerId":"` + strings.Repeat("x", n-len(frame)) + `"}`
+	}
 	rows := []struct {
 		name, method, path, body, ct string
 		status                       int
@@ -57,6 +62,8 @@ func TestDecode(t *testing.T) {
 		{"empty body", "POST", "/orders", "", "", 201, "", "", "", ""},
 		{"null body", "POST", "/orders", `null`, "application/json", 201, "", "", "", ""},
 		{"too large", "POST", "/orders", `{"customerId":"` + strings.Repeat("x", 80) + `"}`, "application/json", 413, "payload_too_large", "", "", "body exceeds 64 bytes"},
+		{"body exactly at the limit", "POST", "/orders", bodyOfLen(64), "application/json", 201, "", "", "", ""},
+		{"body one byte over the limit", "POST", "/orders", bodyOfLen(65), "application/json", 413, "payload_too_large", "", "", "body exceeds 64 bytes"},
 		{"get with body decodes it", "GET", "/rpc/peek", `{"bogus":1}`, "application/json", 422, "validation", "/bogus", "unknown", ""},
 	}
 	for _, row := range rows {

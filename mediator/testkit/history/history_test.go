@@ -1,6 +1,7 @@
 package history
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"math"
@@ -85,6 +86,11 @@ func TestRecorder_OKFailAndExtra(t *testing.T) {
 		r.Invoke(9, "c", FGet, "k", nil)
 	}()
 	pend.OK(nil)
+	// Invoke(9) used exactly the number NextProcess would have handed out
+	// next; it is reserved too, so the next fresh number is 10.
+	if n := r.NextProcess(); n != 10 {
+		t.Fatalf("NextProcess after Invoke(9) = %d, want 10", n)
+	}
 	if r.Now() < 0 {
 		t.Fatal("clock")
 	}
@@ -142,9 +148,31 @@ func TestJSONL_Errors(t *testing.T) {
 	if _, err := ReadJSONL(strings.NewReader(`{"process":1,"type":"bogus","f":"x","time":1}`)); err == nil {
 		t.Fatal("bad type")
 	}
+	// Errors name the failing line, counted from one including blank lines,
+	// and the ops before it are returned.
+	valid := `{"process":1,"type":"ok","f":"get","time":1}` + "\n"
+	ops, err := ReadJSONL(strings.NewReader(valid + "\n{not json\n"))
+	if err == nil || !strings.Contains(err.Error(), "line 3:") || len(ops) != 1 {
+		t.Fatalf("bad line number: %v (%d ops)", err, len(ops))
+	}
+	// A line of one mebibyte is well inside the limit; one over 16 MiB is not,
+	// and the error names it.
+	mega := strings.Repeat("x", 1024*1024)
+	if ops, err := ReadJSONL(strings.NewReader(`{"process":1,"type":"ok","f":"` + mega + `","time":1}`)); err != nil || len(ops) != 1 || len(ops[0].F) != len(mega) {
+		t.Fatalf("1 MiB line: %v (%d ops)", err, len(ops))
+	}
 	long := strings.Repeat("x", 17*1024*1024)
-	if _, err := ReadJSONL(strings.NewReader(`{"process":1,"type":"ok","f":"` + long + `","time":1}`)); err == nil {
-		t.Fatal("too long")
+	ops, err = ReadJSONL(strings.NewReader(valid + `{"process":1,"type":"ok","f":"` + long + `","time":1}`))
+	if err == nil || !errors.Is(err, bufio.ErrTooLong) || !strings.Contains(err.Error(), "line 2 too long") || len(ops) != 1 {
+		t.Fatalf("too long: %v (%d ops)", err, len(ops))
+	}
+	// A reader that fails after serving its data: every op served is
+	// returned with the reader's error.
+	boom := errors.New("connection reset")
+	n := 200
+	ops, err = ReadJSONL(&oneShotReader{data: strings.Repeat(valid, n), err: boom})
+	if !errors.Is(err, boom) || len(ops) != n {
+		t.Fatalf("read error: %v (%d ops, want %d)", err, len(ops), n)
 	}
 	if err := WriteJSONL(failWriter{}, []Op{{Type: TypeOK}}); err == nil {
 		t.Fatal("write error")
@@ -157,6 +185,22 @@ func TestJSONL_Errors(t *testing.T) {
 type failWriter struct{}
 
 func (failWriter) Write([]byte) (int, error) { return 0, errors.New("disk full") }
+
+// oneShotReader serves as much of data as the first Read asks for and fails
+// every later Read with err, like a connection that is reset after one packet.
+type oneShotReader struct {
+	data   string
+	err    error
+	served bool
+}
+
+func (r *oneShotReader) Read(p []byte) (int, error) {
+	if r.served {
+		return 0, r.err
+	}
+	r.served = true
+	return copy(p, r.data), nil
+}
 
 func TestValues(t *testing.T) {
 	type named struct {
@@ -181,6 +225,19 @@ func TestValues(t *testing.T) {
 	for _, c := range cases {
 		if !Equal(Normalize(c.in), c.want) {
 			t.Errorf("Normalize(%#v) = %#v, want %#v", c.in, Normalize(c.in), c.want)
+		}
+	}
+	// Integral floats become int64 only below 2^62 in magnitude: 2^62 itself
+	// stays a float64 (Equal cannot tell, so the type is checked directly).
+	edge := math.Ldexp(1, 62)
+	for _, f := range []float64{edge, -edge} {
+		if _, ok := Normalize(f).(float64); !ok {
+			t.Errorf("Normalize(%v) = %T, want float64", f, Normalize(f))
+		}
+	}
+	for _, f := range []float64{math.Nextafter(edge, 0), -math.Nextafter(edge, 0)} {
+		if _, ok := Normalize(f).(int64); !ok {
+			t.Errorf("Normalize(%v) = %T, want int64", f, Normalize(f))
 		}
 	}
 	if n, ok := Int(4.0); !ok || n != 4 {
@@ -264,6 +321,15 @@ func TestToPorcupine(t *testing.T) {
 	}
 	if d := describeOp(all[1].Input, all[1].Output); d != "get(k) -> ?" {
 		t.Fatalf("describe info: %s", d)
+	}
+	// An op that returned in the same instant it was invoked (a coarse clock)
+	// is still a completed op, not an open one.
+	same := ToPorcupine([]Op{
+		{Process: 0, Type: TypeInvoke, F: FSet, Key: "k", Value: 1, Time: 5},
+		{Process: 0, Type: TypeOK, F: FSet, Key: "k", Value: 1, Time: 5},
+	}, nil)
+	if len(same) != 1 || same[0].Return != 5 || same[0].Output.(Output).Type != TypeOK {
+		t.Fatalf("same-instant op: %+v", same)
 	}
 }
 
@@ -400,10 +466,21 @@ func TestBankModel(t *testing.T) {
 		{{Process: 0, Type: TypeInvoke, F: FReadAll, Time: 1}, {Process: 0, Type: TypeOK, F: FReadAll, Value: map[string]any{"a": 1}, Time: 2}},
 		{{Process: 0, Type: TypeInvoke, F: FReadAll, Time: 1}, {Process: 0, Type: TypeOK, F: FReadAll, Value: map[string]any{"a": "x", "b": 1, "c": 1, "d": 1}, Time: 2}},
 		{{Process: 0, Type: TypeInvoke, F: FGet, Key: "a", Time: 1}, {Process: 0, Type: TypeOK, F: FGet, Key: "a", Time: 2}},
+		{{Process: 0, Type: TypeInvoke, F: FTransfer, Value: TransferValue{From: "a", To: "b", Amt: 0}, Time: 1}, {Process: 0, Type: TypeOK, F: FTransfer, Value: TransferValue{From: "a", To: "b", Amt: 0}, Time: 2}},
 	} {
 		if res, _ := Check(model, ToPorcupine(ops, nil), 0, ""); res.Linearizable {
 			t.Fatalf("malformed history accepted: %+v", ops)
 		}
+	}
+	// A transfer of exactly the balance empties the account and is legal.
+	exact := []Op{
+		{Process: 0, Type: TypeInvoke, F: FTransfer, Value: TransferValue{From: "a", To: "b", Amt: 100}, Time: 1},
+		{Process: 0, Type: TypeOK, F: FTransfer, Value: TransferValue{From: "a", To: "b", Amt: 100}, Time: 2},
+		{Process: 1, Type: TypeInvoke, F: FReadAll, Time: 3},
+		{Process: 1, Type: TypeOK, F: FReadAll, Value: balances(0, 200, 100, 100), Time: 4},
+	}
+	if res, _ := Check(model, ToPorcupine(exact, nil), 0, ""); !res.Linearizable {
+		t.Fatal("transfer of the whole balance must be linearizable")
 	}
 	// Info transfer without funds cannot have applied.
 	poor := []Op{
@@ -426,6 +503,16 @@ func TestBankModel(t *testing.T) {
 		}()
 		BankModel(make([]string, MaxBankAccounts+1), 1)
 	}()
+	// Exactly MaxBankAccounts accounts are supported.
+	eight := []string{"a", "b", "c", "d", "e", "f", "g", "h"}
+	full := BankModel(eight, 1)
+	all := map[string]any{}
+	for _, a := range eight {
+		all[a] = 1
+	}
+	if res, _ := Check(full, ToPorcupine([]Op{{Process: 0, Type: TypeInvoke, F: FReadAll, Time: 1}, {Process: 0, Type: TypeOK, F: FReadAll, Value: all, Time: 2}}, nil), 0, ""); !res.Linearizable {
+		t.Fatal("eight accounts must be accepted")
+	}
 	if vs := Conservation([]Op{{Type: TypeOK, F: FReadAll, Value: "junk"}, {Type: TypeOK, F: FReadAll, Value: map[string]any{"a": "x"}}}, 0); len(vs) != 2 {
 		t.Fatalf("conservation malformed: %v", vs)
 	}
@@ -568,6 +655,10 @@ func TestBoundedStaleness(t *testing.T) {
 	if (Window{Start: 5, End: 6}).Overlaps(7, 8, nil) || !(Window{Start: 5, End: 7}).Overlaps(7, 8, nil) {
 		t.Fatal("Overlaps")
 	}
+	// The interval is closed at both ends: a window starting at to overlaps.
+	if !(Window{Start: 8, End: 9}).Overlaps(7, 8, nil) || (Window{Start: 9, End: 10}).Overlaps(7, 8, nil) {
+		t.Fatal("Overlaps at to")
+	}
 }
 
 func TestLogScan(t *testing.T) {
@@ -592,8 +683,23 @@ func TestLogScan(t *testing.T) {
 	if !strings.Contains(vs[4].Msg, "goroutine") || vs[4].Details["baseline"] != 40 || vs[4].Details["final"] != 200 {
 		t.Fatalf("growth: %v", vs[4])
 	}
+	if vs[4].Details["baseline_line"] != 1 || vs[4].Details["final_line"] != 7 || vs[4].Details["slack"] != 100 {
+		t.Fatalf("growth lines: %v", vs[4])
+	}
 	if vs := LogScanWith(lines[5:7], LogScanOptions{GoroutineSlack: 500}); len(vs) != 0 {
 		t.Fatalf("slack: %v", vs)
+	}
+	// Growth of exactly the slack is tolerated; one more goroutine is not.
+	if vs := LogScan([]string{"goroutines=40", "goroutines=140"}); len(vs) != 0 {
+		t.Fatalf("growth equal to the slack: %v", vs)
+	}
+	if vs := LogScan([]string{"goroutines=40", "goroutines=141"}); len(vs) != 1 || vs[0].Details["final_line"] != 2 {
+		t.Fatalf("growth of slack+1: %v", vs)
+	}
+	// A first marker of zero goroutines is the baseline, not a missing one.
+	vs = LogScan([]string{"goroutines=0", "goroutines=150", "goroutines=101"})
+	if len(vs) != 1 || vs[0].Details["baseline"] != 0 || vs[0].Details["baseline_line"] != 1 || vs[0].Details["final"] != 101 {
+		t.Fatalf("zero baseline: %v", vs)
 	}
 	if vs := LogScanWith([]string{"all fine goroutines=10", "goroutines=12"}, LogScanOptions{Patterns: []string{"fine"}}); len(vs) != 1 {
 		t.Fatalf("custom pattern: %v", vs)
@@ -643,8 +749,21 @@ func TestFencingFromLogs(t *testing.T) {
 	if recs := ParseFencing([]string{"fencing=99999999999999999999 partition=0 group=g node=n"}); len(recs) != 0 {
 		t.Fatal("overflow must be skipped")
 	}
-	if unquote(`"a\"b"`) != `a"b` || unquote(`"bad`) != `"bad` || unquote(`"\q"`) != `\q` {
+	// The maximum token of a partition is remembered past a later, lower
+	// token: a new owner must beat the maximum, not just the last token.
+	climbed := []string{
+		"fencing=1 partition=0 group=g node=n1",
+		"fencing=5 partition=0 group=g node=n1",
+		"fencing=5 partition=0 group=g node=n2", // equal to the maximum: not greater
+	}
+	if vs := FencingFromLogs(climbed); len(vs) != 1 || !strings.Contains(vs[0].Msg, "new owner") || vs[0].Details["max_token"] != int64(5) {
+		t.Fatalf("new owner at the maximum: %v", vs)
+	}
+	if unquote(`"a\"b"`) != `a"b` || unquote(`"bad`) != `"bad` || unquote(`"\q"`) != `\q` || unquote(`""`) != "" || unquote(`"`) != `"` {
 		t.Fatal("unquote")
+	}
+	if recs := ParseFencing([]string{`fencing=1 partition=0 group="" node=n`}); len(recs) != 1 || recs[0].Group != "" {
+		t.Fatalf("empty quoted group: %+v", recs)
 	}
 }
 
@@ -688,5 +807,129 @@ func TestCheckTimeout(t *testing.T) {
 	case <-done:
 	case <-time.After(30 * time.Second):
 		t.Fatal("check did not return")
+	}
+}
+
+// TestAppendListChecker_Boundaries pins histories whose timestamps sit on the
+// edges the checker sorts and compares on: an op that returns in the same
+// instant it was invoked, two appends of one process invoked in the same
+// instant, an idempotent re-append of the same value, and a value from an
+// append that never returned.
+func TestAppendListChecker_Boundaries(t *testing.T) {
+	final := func(list []int64, at int64) []Op {
+		return []Op{
+			{Process: 9, Type: TypeInvoke, F: FReadList, Key: "k", Time: at},
+			{Process: 9, Type: TypeOK, F: FReadList, Key: "k", Value: list, Time: at + 1},
+		}
+	}
+	msgs := func(vs []Violation) []string {
+		out := make([]string, len(vs))
+		for i, v := range vs {
+			out[i] = v.Msg
+		}
+		return out
+	}
+	// An ok append that returned in the instant it was invoked is a definite
+	// append: its value missing from the list is a violation.
+	sameInstant := append([]Op{
+		{Process: 0, Type: TypeInvoke, F: FAppend, Key: "k", Value: 1, Time: 5},
+		{Process: 0, Type: TypeOK, F: FAppend, Key: "k", Value: 1, Time: 5},
+	}, final([]int64{}, 10)...)
+	if vs := AppendListChecker(sameInstant); len(vs) != 1 || !strings.Contains(vs[0].Msg, "exactly once") {
+		t.Fatalf("same-instant ok append missing: %v", msgs(vs))
+	}
+	// Two appends of one process invoked in the same instant keep their
+	// invocation order for the interleaving check.
+	twoAtOnce := append([]Op{
+		{Process: 0, Type: TypeInvoke, F: FAppend, Key: "k", Value: 1, Time: 5},
+		{Process: 0, Type: TypeOK, F: FAppend, Key: "k", Value: 1, Time: 5},
+		{Process: 0, Type: TypeInvoke, F: FAppend, Key: "k", Value: 2, Time: 5},
+		{Process: 0, Type: TypeOK, F: FAppend, Key: "k", Value: 2, Time: 6},
+	}, final([]int64{1, 2}, 10)...)
+	if vs := AppendListChecker(twoAtOnce); len(vs) != 0 {
+		t.Fatalf("two appends invoked in one instant: %v", msgs(vs))
+	}
+	// A process that re-appends the same value (an idempotent retry) and sees
+	// it once is in order: the value's position is not before itself.
+	retry := append([]Op{
+		{Process: 0, Type: TypeInvoke, F: FAppend, Key: "k", Value: 1, Time: 1},
+		{Process: 0, Type: TypeOK, F: FAppend, Key: "k", Value: 1, Time: 2},
+		{Process: 0, Type: TypeInvoke, F: FAppend, Key: "k", Value: 1, Time: 3},
+		{Process: 0, Type: TypeOK, F: FAppend, Key: "k", Value: 1, Time: 4},
+	}, final([]int64{1}, 10)...)
+	if vs := AppendListChecker(retry); len(vs) != 0 {
+		t.Fatalf("idempotent re-append: %v", msgs(vs))
+	}
+	// The value of an append that never returned may appear: it is an info
+	// append, not a value no append produced.
+	open := append([]Op{
+		{Process: 1, Type: TypeInvoke, F: FAppend, Key: "k", Value: 1, Time: 1},
+		{Process: 1, Type: TypeOK, F: FAppend, Key: "k", Value: 1, Time: 2},
+		{Process: 0, Type: TypeInvoke, F: FAppend, Key: "k", Value: 9, Time: 3},
+	}, final([]int64{1, 9}, 10)...)
+	if vs := AppendListChecker(open); len(vs) != 0 {
+		t.Fatalf("value of an open append: %v", msgs(vs))
+	}
+}
+
+// TestCheckStaleness_Boundaries pins the instants where the staleness check
+// changes its answer: a read invoked exactly when a write returned, two
+// writes returning in the same instant, tags absent from Extra, and ops that
+// return in the instant they were invoked.
+func TestCheckStaleness_Boundaries(t *testing.T) {
+	w := Write{Process: 0, Key: "k", Invoke: 10, Return: 20, Value: int64(1), Definite: true}
+	// A read invoked in the instant the write returned must see it.
+	atReturn := Read{Process: 1, Key: "k", Tags: []string{"k"}, Invoke: 20, Return: 25, Value: nil}
+	if s := CheckStaleness([]Read{atReturn}, []Write{w}, nil, 0); len(s) != 1 || s[0].Write.Process != 0 || s[0].Read.Process != 1 {
+		t.Fatalf("read invoked at the write's return: %+v", s)
+	}
+	// One instant earlier the read is concurrent with the write.
+	before := atReturn
+	before.Invoke = 19
+	if s := CheckStaleness([]Read{before}, []Write{w}, nil, 0); len(s) != 0 {
+		t.Fatalf("read invoked before the write returned: %+v", s)
+	}
+	// A degraded window that starts in the instant the read returned still
+	// excuses it; one starting an instant later does not.
+	if s := CheckStaleness([]Read{atReturn}, []Write{w}, []Window{{Start: 25, End: 30, Tags: []string{"k"}}}, 0); len(s) != 0 {
+		t.Fatalf("window starting at the read's return: %+v", s)
+	}
+	if s := CheckStaleness([]Read{atReturn}, []Write{w}, []Window{{Start: 26, End: 30, Tags: []string{"k"}}}, 0); len(s) != 1 {
+		t.Fatalf("window starting after the read's return: %+v", s)
+	}
+	// Two definite writes that returned in the same instant: the first in
+	// input order is the one reported as missed.
+	tie := []Write{
+		{Process: 0, Key: "k", Invoke: 10, Return: 20, Value: int64(1), Definite: true},
+		{Process: 1, Key: "k", Invoke: 11, Return: 20, Value: int64(2), Definite: true},
+	}
+	later := Read{Process: 2, Key: "k", Invoke: 30, Return: 35, Value: nil}
+	if s := CheckStaleness([]Read{later}, tie, nil, 0); len(s) != 1 || s[0].Write.Process != 0 {
+		t.Fatalf("tied writes: %+v", s)
+	}
+	// TagsOf falls back to the key when Extra has no tags, or empty tags.
+	for _, op := range []Op{
+		{Key: "k"},
+		{Key: "k", Extra: map[string]any{"other": 1}},
+		{Key: "k", Extra: map[string]any{"tags": []string{}}},
+		{Key: "k", Extra: map[string]any{"tags": nil}},
+	} {
+		if tags := TagsOf(op); len(tags) != 1 || tags[0] != "k" {
+			t.Fatalf("TagsOf(%+v) = %v", op, tags)
+		}
+	}
+	if tags := TagsOf(Op{Key: "k", Extra: map[string]any{"tags": []any{"a", "b"}}}); len(tags) != 2 || tags[0] != "a" {
+		t.Fatalf("TagsOf with tags = %v", tags)
+	}
+	// A set or get that returned in the instant it was invoked is a
+	// definite write or a completed read, not an in-flight one.
+	reads, writes := ReadsAndWrites([]Op{
+		{Process: 0, Type: TypeInvoke, F: FSet, Key: "k", Value: 1, Time: 5},
+		{Process: 0, Type: TypeOK, F: FSet, Key: "k", Value: 1, Time: 5},
+		{Process: 1, Type: TypeInvoke, F: FGet, Key: "k", Time: 7},
+		{Process: 1, Type: TypeOK, F: FGet, Key: "k", Value: 1, Time: 7},
+	})
+	if len(reads) != 1 || len(writes) != 1 || !writes[0].Definite || writes[0].Return != 5 || reads[0].Return != 7 {
+		t.Fatalf("same-instant ops: reads=%+v writes=%+v", reads, writes)
 	}
 }

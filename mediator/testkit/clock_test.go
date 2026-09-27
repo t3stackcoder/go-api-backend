@@ -85,8 +85,17 @@ func TestFakeClock_Set(t *testing.T) {
 	if _, ok := fired(ch); ok {
 		t.Fatal("backwards fired")
 	}
-	// Same time: no-op.
+	// Same time: nothing fires, but the clock still takes t itself: the same
+	// instant in another zone is reported in that zone afterwards.
 	c.Set(c.Now())
+	if _, ok := fired(ch); ok {
+		t.Fatal("same time fired")
+	}
+	zone := time.FixedZone("skewed", 3600)
+	c.Set(c.Now().In(zone))
+	if got := c.Now(); got.Location() != zone || !got.Equal(start.Add(-time.Hour)) {
+		t.Fatalf("Set to the same instant in another zone: Now = %v (%v)", got, got.Location())
+	}
 	// Forward past the timer (its due time is still start+1m).
 	c.Set(start.Add(time.Minute))
 	if v, ok := fired(ch); !ok || !v.Equal(start.Add(time.Minute)) {

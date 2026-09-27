@@ -146,6 +146,26 @@ func TestListener_ServeError(t *testing.T) {
 	}
 }
 
+// TestNewListener_Drain: zero and negative drains take the 15 s default; any
+// positive drain, however small, is kept.
+func TestNewListener_Drain(t *testing.T) {
+	rows := []struct {
+		name string
+		in   time.Duration
+		want time.Duration
+	}{
+		{"zero uses the default", 0, defaultDrain},
+		{"negative uses the default", -time.Second, defaultDrain},
+		{"smallest positive is kept", time.Nanosecond, time.Nanosecond},
+		{"explicit", time.Second, time.Second},
+	}
+	for _, row := range rows {
+		if got := NewListener(nil, ":0", row.in).drain; got != row.want {
+			t.Errorf("%s: drain = %s, want %s", row.name, got, row.want)
+		}
+	}
+}
+
 func TestPathParams(t *testing.T) {
 	got := pathParams("/a/{b}/{c...}/{$}/{}/x{y}")
 	if !reflect.DeepEqual(got, []string{"b", "c"}) {

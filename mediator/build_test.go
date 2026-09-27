@@ -77,6 +77,14 @@ type seenTwice struct {
 
 type chanResp struct{ mediator.Query[chan int] }
 
+// noUnmarshal marshals its zero value but refuses to unmarshal it, so only the
+// second half of Build's round-trip check can reject it.
+type noUnmarshal struct{ V int }
+
+func (*noUnmarshal) UnmarshalJSON([]byte) error { return errors.New("no way back") }
+
+type noUnmarshalQuery struct{ mediator.Query[noUnmarshal] }
+
 type retryNoUow struct {
 	mediator.Command[mediator.Void]
 }
@@ -414,6 +422,7 @@ func TestBuild_ReportsEveryProblemAtOnce(t *testing.T) {
 	mustNil(t, mediator.Handle(m, intHandler[dupB]()))
 	mustNil(t, mediator.Handle(m, voidHandler[twoMarkers]()))
 	mustNil(t, mediator.HandleFunc(m, func(context.Context, chanResp) (chan int, error) { return nil, nil }))
+	mustNil(t, mediator.HandleFunc(m, func(context.Context, noUnmarshalQuery) (noUnmarshal, error) { return noUnmarshal{}, nil }))
 	mustNil(t, mediator.Handle(m, voidHandler[retryNoUow]()))
 	mustNil(t, mediator.Handle(m, intHandler[retryQuery]()))
 	mustNil(t, mediator.Handle(m, voidHandler[cacheCmd]()))
@@ -436,6 +445,8 @@ func TestBuild_ReportsEveryProblemAtOnce(t *testing.T) {
 		`name "Dup" is used by both`,
 		"embeds 2 markers; exactly one of Command",
 		"does not round-trip",
+		"of mediator_test.noUnmarshalQuery does not round-trip through JSON",
+		"no way back",
 		"RetryPolicy() and NoUnitOfWork() but no IdempotencyKey()",
 		"RetryPolicy() applies to commands only",
 		"CacheTags() applies to queries only",
@@ -702,4 +713,52 @@ func sortedLines(err error) []string {
 	lines := strings.Split(err.Error(), "\n")
 	sort.Strings(lines)
 	return lines
+}
+
+// TestBuild_DuplicateConsumersKeepRegistrationOrder pins that the accessors
+// stay usable after a failed Build and list two consumers with the same group
+// and event name in registration order: the sorts treat equal keys as equal
+// instead of swapping them.
+func TestBuild_DuplicateConsumersKeepRegistrationOrder(t *testing.T) {
+	cases := []struct {
+		name string
+		reg  func(m *mediator.Mediator)
+		want []string
+	}{
+		{"B then C", func(m *mediator.Mediator) {
+			mustNil(t, mediator.ConsumeFunc(m, "g", noopEvent[evB]))
+			mustNil(t, mediator.ConsumeFunc(m, "g", noopEvent[evC]))
+		}, []string{"mediator_test.evB", "mediator_test.evC"}},
+		{"C then B", func(m *mediator.Mediator) {
+			mustNil(t, mediator.ConsumeFunc(m, "g", noopEvent[evC]))
+			mustNil(t, mediator.ConsumeFunc(m, "g", noopEvent[evB]))
+		}, []string{"mediator_test.evC", "mediator_test.evB"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m := mediator.New()
+			c.reg(m)
+			wantContains(t, m.Build(), `two consumers in group "g" handle event name "SameEv"`)
+			var regs []string
+			for _, r := range m.ConsumerRegistrations() {
+				if r.Group != "g" || r.EventName != "SameEv" {
+					t.Fatalf("registration = %+v", r)
+				}
+				regs = append(regs, r.EventType.String())
+			}
+			if !reflect.DeepEqual(regs, c.want) {
+				t.Fatalf("ConsumerRegistrations = %v, want %v", regs, c.want)
+			}
+			var names []string
+			for _, e := range m.Names() {
+				if e.Kind != mediator.KindConsumer || e.Name != "SameEv" || e.Group != "g" {
+					t.Fatalf("entry = %+v", e)
+				}
+				names = append(names, e.GoType)
+			}
+			if !reflect.DeepEqual(names, c.want) {
+				t.Fatalf("Names = %v, want %v", names, c.want)
+			}
+		})
+	}
 }

@@ -65,45 +65,52 @@ func TestListener_ServeAndShutdown(t *testing.T) {
 	}
 }
 
+// TestListener_DrainsInFlight: an in-flight request finishes during the
+// drain, with an explicit drain and with the zero value (the 15 s default,
+// not an immediate deadline).
 func TestListener_DrainsInFlight(t *testing.T) {
-	f := newFixture(t, httpapi.Config{})
-	l := httpapi.NewListener(f.srv, "127.0.0.1:0", 5*time.Second)
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- l.Run(ctx) }()
-	waitHealthy(t, l)
-	type result struct {
-		status int
-		err    error
-	}
-	res := make(chan result, 1)
-	go func() {
-		resp, err := http.Post("http://"+l.Addr()+"/rpc/slow", "", nil)
-		if err != nil {
-			res <- result{err: err}
-			return
-		}
-		resp.Body.Close()
-		res <- result{status: resp.StatusCode}
-	}()
-	<-f.slowStarted
-	cancel()
-	select {
-	case err := <-done:
-		t.Fatalf("Run returned %v while a request was in flight", err)
-	case <-time.After(200 * time.Millisecond):
-	}
-	close(f.slowRelease)
-	if r := <-res; r.err != nil || r.status != 204 {
-		t.Errorf("in-flight request: %+v", r)
-	}
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("Run = %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("Run did not return after drain")
+	for _, drain := range []time.Duration{5 * time.Second, 0} {
+		t.Run("drain "+drain.String(), func(t *testing.T) {
+			f := newFixture(t, httpapi.Config{})
+			l := httpapi.NewListener(f.srv, "127.0.0.1:0", drain)
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() { done <- l.Run(ctx) }()
+			waitHealthy(t, l)
+			type result struct {
+				status int
+				err    error
+			}
+			res := make(chan result, 1)
+			go func() {
+				resp, err := http.Post("http://"+l.Addr()+"/rpc/slow", "", nil)
+				if err != nil {
+					res <- result{err: err}
+					return
+				}
+				resp.Body.Close()
+				res <- result{status: resp.StatusCode}
+			}()
+			<-f.slowStarted
+			cancel()
+			select {
+			case err := <-done:
+				t.Fatalf("Run returned %v while a request was in flight", err)
+			case <-time.After(200 * time.Millisecond):
+			}
+			close(f.slowRelease)
+			if r := <-res; r.err != nil || r.status != 204 {
+				t.Errorf("in-flight request: %+v", r)
+			}
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("Run = %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("Run did not return after drain")
+			}
+		})
 	}
 }
 

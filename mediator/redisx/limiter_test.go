@@ -27,6 +27,12 @@ func TestLimiterArgs(t *testing.T) {
 	if err != nil || iv != int64(2*time.Minute/time.Microsecond) || capacity != 1 || exp != 2*time.Minute {
 		t.Fatalf("got %d %d %s %v", iv, capacity, exp, err)
 	}
+	// Rate below one per period with a burst above one: the expiry is the
+	// interval times the capacity (6 min), above Period*Burst (3 min).
+	iv, capacity, exp, err = limiterArgs(ratelimit.Policy{Rate: 0.5, Period: time.Minute, Burst: 3})
+	if err != nil || iv != int64(2*time.Minute/time.Microsecond) || capacity != 3 || exp != 6*time.Minute {
+		t.Fatalf("got %d %d %s %v", iv, capacity, exp, err)
+	}
 	// Sub-microsecond intervals clamp to 1 µs.
 	iv, _, _, _ = limiterArgs(ratelimit.Policy{Rate: 1e9, Period: time.Millisecond, Burst: 1})
 	if iv != 1 {

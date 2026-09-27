@@ -119,6 +119,39 @@ func TestLenWithMaxInSchema(t *testing.T) {
 	  "l": {"type": ["array", "null"], "items": {"type": "string"}, "minItems": 2, "maxItems": 2}}}`)
 }
 
+// TestZeroBoundsInSchema: a bound of 0 is a bound (unset is -1), so it
+// reaches the schema; len=0 sets both ends. The compiler does not check that
+// the rules of a field agree with each other, so max=0 beside len=3 is
+// rendered as given: len raises the lower end and the smaller max keeps the
+// upper end, exactly as Check would fail every value on one rule or the other.
+func TestZeroBoundsInSchema(t *testing.T) {
+	type zero struct {
+		SMin string         `json:"smin" validate:"min=0"`
+		SMax string         `json:"smax" validate:"max=0"`
+		SLen string         `json:"slen" validate:"len=0"`
+		SCap string         `json:"scap" validate:"max=0,len=3"`
+		LMin []string       `json:"lmin" validate:"min=0"`
+		LMax []string       `json:"lmax" validate:"max=0"`
+		LLen []string       `json:"llen" validate:"len=0"`
+		LCap []string       `json:"lcap" validate:"max=0,len=3"`
+		MMin map[string]int `json:"mmin" validate:"min=0"`
+		MMax map[string]int `json:"mmax" validate:"max=0"`
+	}
+	v := New()
+	b := mustSchema(t, v, reflect.TypeFor[zero](), nil, SchemaOptions{})
+	jsonEqual(t, b, `{"type": "object", "additionalProperties": false, "properties": {
+	  "smin": {"type": "string", "minLength": 0},
+	  "smax": {"type": "string", "maxLength": 0},
+	  "slen": {"type": "string", "minLength": 0, "maxLength": 0},
+	  "scap": {"type": "string", "minLength": 3, "maxLength": 0},
+	  "lmin": {"type": ["array", "null"], "items": {"type": "string"}, "minItems": 0},
+	  "lmax": {"type": ["array", "null"], "items": {"type": "string"}, "maxItems": 0},
+	  "llen": {"type": ["array", "null"], "items": {"type": "string"}, "minItems": 0, "maxItems": 0},
+	  "lcap": {"type": ["array", "null"], "items": {"type": "string"}, "minItems": 3, "maxItems": 0},
+	  "mmin": {"type": ["object", "null"], "additionalProperties": {"type": "integer"}, "minProperties": 0},
+	  "mmax": {"type": ["object", "null"], "additionalProperties": {"type": "integer"}, "maxProperties": 0}}}`)
+}
+
 func TestCompileLockedShortCircuit(t *testing.T) {
 	v := New()
 	if err := v.Compile(reflect.TypeFor[inner]()); err != nil {

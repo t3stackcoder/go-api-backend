@@ -32,6 +32,10 @@ func TestKeys_ParseLease(t *testing.T) {
 	if !ok || g != "proj" || topic != "orders" || p != 7 {
 		t.Fatalf("parse: %q %q %d %v", g, topic, p, ok)
 	}
+	// Partition 0 is the first partition, not a rejected value.
+	if g, topic, p, ok := k.ParseLease(k.Lease("proj", "orders", 0)); !ok || g != "proj" || topic != "orders" || p != 0 {
+		t.Fatalf("parse p0: %q %q %d %v", g, topic, p, ok)
+	}
 	for _, bad := range []string{
 		"", "other:lease:{proj:orders:p1}", "mediator:lease:{proj:orders:p1", "mediator:lease:{proj:orders:x1}",
 		"mediator:lease:{projorders:p1}", "mediator:lease:{proj::p1}", "mediator:lease:{:orders:p1}",
@@ -81,5 +85,12 @@ func TestStreamIDMillis(t *testing.T) {
 	}
 	if _, ok := streamIDMillis("abc-1"); ok {
 		t.Fatal("garbage accepted")
+	}
+	// A leading dash leaves an empty millisecond part; it must not be read
+	// as a negative number.
+	for _, bad := range []string{"-5", "-", ""} {
+		if ms, ok := streamIDMillis(bad); ok {
+			t.Fatalf("streamIDMillis(%q) = %d, accepted", bad, ms)
+		}
 	}
 }

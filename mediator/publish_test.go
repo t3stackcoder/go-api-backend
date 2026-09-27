@@ -247,10 +247,17 @@ func TestPublish_StrategyOverrideAndSuccess(t *testing.T) {
 		for i := range 3 {
 			mustNil(t, mediator.OnFunc(m, func(context.Context, puPlain) error { runs <- i; return nil }))
 		}
+		mustNil(t, mediator.OnFunc(m, noopEvent[puEvent]))
 		build(t, m)
 		mustNil(t, mediator.Publish(context.Background(), m, puPlain{}))
 		if len(runs) != 3 {
 			t.Fatalf("%v: %d runs", s, len(runs))
+		}
+		// A durable event whose handlers all succeed is still appended.
+		uow := &fakeUoW{}
+		mustNil(t, mediator.Publish(mediator.WithUnitOfWork(context.Background(), uow), m, puEvent{K: "k"}))
+		if len(uow.envs) != 1 {
+			t.Fatalf("%v: appended %d rows after a successful fan-out, want 1", s, len(uow.envs))
 		}
 	}
 	// Per-call override: the mediator default stops at the first error, the
@@ -297,21 +304,27 @@ func TestPublishAll_OrdersDurableAppends(t *testing.T) {
 		puEvent{K: "9"},              // topic puEvent
 		&puUnregisteredTopic{K: "1"}, // topic aaa
 		puPlain{V: 1},                // non-durable
-		puEvent{K: "1"},              // topic puEvent
+		puEvent{K: "1", V: 1},        // topic puEvent
 		puUnregistered{K: "x"},       // topic puUnregistered (derived name)
 		puTopicEvent{K: "a"},         // topic orders
+		puEvent{K: "1", V: 2},        // same topic and key as V 1: stays after it
 	}
 	mustNil(t, mediator.PublishAll(ctx, m, events))
 	var order []string
 	for _, e := range uow.envs {
 		order = append(order, e.Topic+"/"+e.StreamKey)
 	}
-	want := []string{"aaa/1", "orders/a", "orders/z", "puEvent/1", "puEvent/9", "puUnregistered/x"}
+	want := []string{"aaa/1", "orders/a", "orders/z", "puEvent/1", "puEvent/1", "puEvent/9", "puUnregistered/x"}
 	if !reflect.DeepEqual(order, want) {
 		t.Fatalf("append order = %v, want %v", order, want)
 	}
+	// Two events with the same topic and stream key keep their input order,
+	// so their sequence numbers reflect it.
+	if uow.payloads[3] != `{"k":"1","v":1}` || uow.payloads[4] != `{"k":"1","v":2}` {
+		t.Fatalf("same-key payloads = %v", uow.payloads[3:5])
+	}
 	// Non-durable events run first, in their original relative order.
-	if !reflect.DeepEqual(handled, []string{"plain", "ev:1", "ev:9"}) {
+	if !reflect.DeepEqual(handled, []string{"plain", "ev:1", "ev:1", "ev:9"}) {
 		t.Fatalf("handled = %v", handled)
 	}
 	// Empty and nil lists are no-ops; an error stops the batch.

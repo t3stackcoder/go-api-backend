@@ -3,6 +3,9 @@ package pg_test
 import (
 	"context"
 	"errors"
+	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -30,6 +33,9 @@ type fakeSlotStore struct {
 	// onBegin runs at the start of every BeginBatch; tests use it to cancel
 	// the context under a failing batch.
 	onBegin func()
+	// gauges counts Gauges reads; gaugesFn, when set, supplies the reading.
+	gauges   int
+	gaugesFn func() (int64, time.Duration, error)
 }
 
 type fakeRow struct {
@@ -126,7 +132,28 @@ func (f *fakeSlotStore) SaveCursor(ctx context.Context, topic string, partition 
 }
 
 func (f *fakeSlotStore) Gauges(ctx context.Context, topic string, partition int) (int64, time.Duration, error) {
+	f.mu.Lock()
+	f.gauges++
+	fn := f.gaugesFn
+	f.mu.Unlock()
+	if fn != nil {
+		return fn()
+	}
 	return int64(len(f.unpublished())), 0, nil
+}
+
+// gaugeCalls reports how many times Gauges was read.
+func (f *fakeSlotStore) gaugeCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.gauges
+}
+
+// setGauges replaces the Gauges reading; nil restores the backlog count.
+func (f *fakeSlotStore) setGauges(fn func() (int64, time.Duration, error)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.gaugesFn = fn
 }
 
 type fakeBatch struct {
@@ -173,6 +200,17 @@ type failingSink struct {
 
 func (s failingSink) EnsureGroups(ctx context.Context, topic string, partition int, groups []string) error {
 	return s.ensureErr
+}
+
+// countingSink wraps a sink to count EnsureGroups calls.
+type countingSink struct {
+	pg.StreamSink
+	ensures atomic.Int32
+}
+
+func (s *countingSink) EnsureGroups(ctx context.Context, topic string, partition int, groups []string) error {
+	s.ensures.Add(1)
+	return s.StreamSink.EnsureGroups(ctx, topic, partition, groups)
 }
 
 func newSlot(store pg.SlotStore, sink pg.StreamSink, cfg pg.RelayConfig) *pg.Slot {
@@ -604,4 +642,169 @@ func TestSlot_RunLoop_DetectsLossOnWake(t *testing.T) {
 			t.Fatalf("replay must not count as an error: %+v", st)
 		}
 	})
+}
+
+// slotName renders a slot as its notification payload, "<topic>:<partition>".
+func slotName(st pg.SlotStats) string { return st.Topic + ":" + strconv.Itoa(st.Partition) }
+
+// TestRelay_WakeTargetsOneOwnedSlot pins the notification router: a
+// "<topic>:<partition>" payload wakes exactly the owned slot it names, and
+// anything else wakes nothing.
+func TestRelay_WakeTargetsOneOwnedSlot(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload string
+		unowned string // the slot left unowned, "" for none
+		want    string // the slot woken, "" for none
+	}{
+		{"first partition", "a:0", "", "a:0"},
+		{"second partition", "a:1", "", "a:1"},
+		{"other topic", "b:1", "", "b:1"},
+		{"empty topic: the separator is at index 0", ":1", "", ":1"},
+		{"unowned slot", "a:1", "a:1", ""},
+		{"unknown partition", "a:9", "", ""},
+		{"unknown topic", "zzz:0", "", ""},
+		{"non-numeric partition", "a:x", "", ""},
+		{"no separator", "a", "", ""},
+		{"empty payload", "", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := pg.NewRelay(nil, memstore.NewStreams(nil), pg.RelayConfig{Topics: []string{"a", "b", ""}, Partitions: 2})
+			for _, s := range r.SlotsForTest() {
+				s.SetOwnedForTest(slotName(s.Stats()) != tc.unowned)
+			}
+			r.WakeForTest(tc.payload)
+			var woken []string
+			for _, s := range r.SlotsForTest() {
+				if s.TakeWake() {
+					woken = append(woken, slotName(s.Stats()))
+				}
+			}
+			if got := strings.Join(woken, " "); got != tc.want {
+				t.Fatalf("wake(%q) woke %q, want %q", tc.payload, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSlot_RunLoop_FullBatchPollsAgainAtOnce pins the two decisions after a
+// successful batch: a batch of exactly BatchSize rows is followed by another
+// batch at once (no wake-up, no poll), and the gauges are refreshed only
+// when a non-empty batch leaves the slot idle.
+func TestSlot_RunLoop_FullBatchPollsAgainAtOnce(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		store := &fakeSlotStore{}
+		store.add(1, 2, 3)
+		sink := memstore.NewStreams(nil)
+		cfg := pg.RelayConfig{BatchSize: 2, PollInterval: time.Hour}
+		s := newSlot(store, sink, cfg)
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			s.Run(ctx)
+		}()
+		t.Cleanup(func() {
+			cancel()
+			<-done
+		})
+		synctest.Wait()
+		// The first batch is full (n == BatchSize), so the third row is
+		// relayed without waiting for a wake-up or the poll.
+		if got := len(sink.Entries("t", 0)); got != 3 {
+			t.Fatalf("entries after the initial drain: %d, want 3", got)
+		}
+		// Gauges: once from the initial check and once when the second,
+		// partial batch left the slot idle; the full batch did not refresh.
+		if got := store.gaugeCalls(); got != 2 {
+			t.Fatalf("gauge reads after the drain: %d, want 2", got)
+		}
+		// A wake-up that finds nothing leaves the gauges alone.
+		s.Wake()
+		synctest.Wait()
+		if got := store.gaugeCalls(); got != 2 {
+			t.Fatalf("gauge reads after an empty batch: %d, want 2", got)
+		}
+		// A partial batch (n < BatchSize) refreshes once.
+		store.add(4)
+		s.Wake()
+		synctest.Wait()
+		if got := len(sink.Entries("t", 0)); got != 4 {
+			t.Fatalf("entries after the wake-up: %d, want 4", got)
+		}
+		if got := store.gaugeCalls(); got != 3 {
+			t.Fatalf("gauge reads after a partial batch: %d, want 3", got)
+		}
+	})
+}
+
+// TestSlot_RunLoop_GaugesKeepTheLastGoodReading: a successful Gauges read
+// is stored as is; a failed read leaves the previous values in place.
+func TestSlot_RunLoop_GaugesKeepTheLastGoodReading(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		store := &fakeSlotStore{}
+		store.setGauges(func() (int64, time.Duration, error) { return 5, 7 * time.Second, nil })
+		cfg := pg.RelayConfig{PollInterval: time.Second}
+		s := newSlot(store, memstore.NewStreams(nil), cfg)
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			s.Run(ctx)
+		}()
+		t.Cleanup(func() {
+			cancel()
+			<-done
+		})
+		synctest.Wait()
+		if st := s.Stats(); st.Unpublished != 5 || st.OldestAge != 7*time.Second {
+			t.Fatalf("gauges after a successful read: %+v", st)
+		}
+		store.setGauges(func() (int64, time.Duration, error) { return 0, 0, errors.New("db down") })
+		time.Sleep(cfg.PollInterval + time.Millisecond)
+		synctest.Wait()
+		if st := s.Stats(); st.Unpublished != 5 || st.OldestAge != 7*time.Second {
+			t.Fatalf("a failed read must keep the last values: %+v", st)
+		}
+		if got := store.gaugeCalls(); got != 2 {
+			t.Fatalf("gauge reads: %d, want 2 (initial check and one poll)", got)
+		}
+	})
+}
+
+// TestSlot_DataLossRecovery_RecreatesOnlyKnownGroups: after a loss the
+// consumer groups are recreated only when KnownGroups names at least one.
+func TestSlot_DataLossRecovery_RecreatesOnlyKnownGroups(t *testing.T) {
+	cases := []struct {
+		name        string
+		known       func() []string
+		wantEnsures int32
+		wantGroups  []string
+	}{
+		{"no KnownGroups", nil, 0, nil},
+		{"KnownGroups returns nil", func() []string { return nil }, 0, nil},
+		{"KnownGroups returns an empty slice", func() []string { return []string{} }, 0, nil},
+		{"one group", func() []string { return []string{"proj"} }, 1, []string{"proj"}},
+		{"two groups", func() []string { return []string{"proj", "audit"} }, 1, []string{"audit", "proj"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &fakeSlotStore{cursor: &pg.RelayCursor{LastOutboxID: 3, LastStreamID: "50-0"}}
+			store.add(1, 2, 3)
+			store.markPublished(1, 2, 3)
+			inner := memstore.NewStreams(nil)
+			sink := &countingSink{StreamSink: inner}
+			s := newSlot(store, sink, pg.RelayConfig{KnownGroups: tc.known})
+			if n, err := s.CheckDataLoss(context.Background()); err != nil || n != 3 {
+				t.Fatalf("replayed %d %v", n, err)
+			}
+			if got := sink.ensures.Load(); got != tc.wantEnsures {
+				t.Fatalf("EnsureGroups calls: %d, want %d", got, tc.wantEnsures)
+			}
+			if got := inner.Groups("t", 0); !slices.Equal(got, tc.wantGroups) {
+				t.Fatalf("groups: %v, want %v", got, tc.wantGroups)
+			}
+		})
+	}
 }

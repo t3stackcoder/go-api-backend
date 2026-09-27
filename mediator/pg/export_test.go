@@ -93,3 +93,20 @@ func (c RelayConfig) WithDefaults() RelayConfig             { return c.withDefau
 func (c JanitorConfig) WithDefaults() JanitorConfig         { return c.withDefaults() }
 func (c IdempotencyConfig) WithDefaults() IdempotencyConfig { return c.withDefaults() }
 func (c UnitOfWorkConfig) WithDefaults() UnitOfWorkConfig   { return c.withDefaults() }
+
+// SetOwnedForTest marks the slot owned (or not) without running its loop, so
+// the notification router can be tested against slots that have no pool.
+func (s *slot) SetOwnedForTest(owned bool) { s.owned.Store(owned) }
+
+// TakeWake reports whether a wake-up is pending on the slot and consumes it.
+func (s *slot) TakeWake() bool {
+	select {
+	case <-s.wake:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *PgStore) LockTimeoutForTest() time.Duration { return s.lockTimeout }
+func (s *PgStore) FencingSQLForTest() string         { return s.fencingSQL }

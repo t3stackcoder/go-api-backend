@@ -76,6 +76,8 @@ func TestProblemOf(t *testing.T) {
 		{"empty message falls back to title", mediator.E(mediator.CodeForbidden, ""), 403, "forbidden", "Forbidden", 0, nil},
 		{"validation", (&mediator.ValidationError{}).Add("/a", "r", "m"), 422, "validation", "1 field is invalid", 1, nil},
 		{"validation empty", &mediator.ValidationError{}, 422, "validation", "Validation failed", 0, nil},
+		{"validation empty non-nil fields", &mediator.ValidationError{Fields: []mediator.FieldError{}}, 422, "validation", "Validation failed", 0, nil},
+		{"empty details map", &mediator.Error{Code: mediator.CodeConflict, Message: "dup", Details: map[string]any{}}, 409, "conflict", "dup", 0, nil},
 		{"validation wrapped keeps message", mediator.Wrap(mediator.CodeValidation, "invalid order", (&mediator.ValidationError{}).Add("/a", "r", "m").Add("/b", "r", "m")), 422, "validation", "invalid order", 2, nil},
 		{"validation code without fields", mediator.E(mediator.CodeValidation, "custom"), 422, "validation", "custom", 0, nil},
 		{"deadline", context.DeadlineExceeded, 504, "timeout", "Timeout", 0, nil},
@@ -96,6 +98,9 @@ func TestProblemOf(t *testing.T) {
 			}
 			if row.detail0 == nil && p.Details != nil {
 				t.Errorf("unexpected details %v", p.Details)
+			}
+			if row.errors == 0 && p.Errors != nil {
+				t.Errorf("errors must be absent, not empty: %#v", p.Errors)
 			}
 			for k, v := range row.detail0 {
 				if p.Details[k] != v {

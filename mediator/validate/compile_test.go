@@ -33,6 +33,7 @@ func TestCompileErrors(t *testing.T) {
 		{"int oneof bad", "oneof=1 x", reflect.TypeFor[int](), `rule "oneof": "x" is not a valid int`},
 		{"string length negative", "min=-1", reflect.TypeFor[string](), `rule "min": "-1" is not a non-negative integer`},
 		{"string length huge", "max=99999999999", reflect.TypeFor[string](), `rule "max": "99999999999" is not a non-negative integer`},
+		{"string length ceiling plus one", "max=2147483648", reflect.TypeFor[string](), `rule "max": "2147483648" is not a non-negative integer`},
 		{"string length text", "len=abc", reflect.TypeFor[string](), `rule "len": "abc" is not a non-negative integer`},
 		{"slice length bad", "min=x", reflect.TypeFor[[]int](), `rule "min": "x" is not a non-negative integer`},
 		{"map length bad", "max=x", reflect.TypeFor[map[string]int](), `rule "max": "x" is not a non-negative integer`},

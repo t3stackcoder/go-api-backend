@@ -14,6 +14,7 @@ import (
 	"github.com/t3stackcoder/go-api-backend/mediator/behavior"
 	"github.com/t3stackcoder/go-api-backend/mediator/behavior/cachemodel"
 	"github.com/t3stackcoder/go-api-backend/mediator/pg"
+	"github.com/t3stackcoder/go-api-backend/mediator/testkit"
 	"github.com/t3stackcoder/go-api-backend/mediator/testkit/memstore"
 )
 
@@ -103,8 +104,10 @@ type bubbleClock struct{}
 func (bubbleClock) Now() time.Time { return time.Now() }
 
 // invalidationBubble builds a standard set over memstore inside a synctest
-// bubble with a backend whose bumps fail while *failing is set.
-func invalidationBubble(t *testing.T, ttl time.Duration) (*mediator.Mediator, *cachemodel.Memory, *logSink, *bool, io.Closer) {
+// bubble with a backend whose bumps fail while *failing is set. With
+// bubbleClock the retries sleep on virtual time; with a testkit.FakeClock
+// they sleep on its timers and run when Advance fires them.
+func invalidationBubble(t *testing.T, ttl time.Duration, clock mediator.Clock) (*mediator.Mediator, *cachemodel.Memory, *logSink, *bool, io.Closer) {
 	t.Helper()
 	backend := cachemodel.NewMemory()
 	failing := new(bool)
@@ -118,7 +121,7 @@ func invalidationBubble(t *testing.T, ttl time.Duration) (*mediator.Mediator, *c
 	m := mediator.New()
 	register(t, m, defaultHooks())
 	entries := behavior.Standard(behavior.Config{
-		Logger: slog.New(sink), Clock: bubbleClock{}, Store: memstore.New(memstore.Config{}), Cache: backend, CacheTTL: ttl,
+		Logger: slog.New(sink), Clock: clock, Store: memstore.New(memstore.Config{}), Cache: backend, CacheTTL: ttl,
 	})
 	var closer io.Closer
 	for _, e := range entries {
@@ -133,7 +136,7 @@ func invalidationBubble(t *testing.T, ttl time.Duration) (*mediator.Mediator, *c
 
 func TestCacheInvalidation_RetryRecovers(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		m, backend, sink, failing, closer := invalidationBubble(t, time.Minute)
+		m, backend, sink, failing, closer := invalidationBubble(t, time.Minute, bubbleClock{})
 		defer closer.Close()
 		*failing = true
 		if _, err := mediator.Send(admin(context.Background()), m, richCmd{ID: "a", Tags: []string{"t1", "t2"}}); err != nil {
@@ -158,12 +161,17 @@ func TestCacheInvalidation_RetryRecovers(t *testing.T) {
 		if backend.Version("t1") != 2 || backend.Version("t2") != 2 {
 			t.Fatalf("both bumps must recover: t1=%d t2=%d", backend.Version("t1"), backend.Version("t2"))
 		}
-		if recovered := sink.find("cache invalidation recovered"); len(recovered) != 2 {
+		recovered := sink.find("cache invalidation recovered")
+		if len(recovered) != 2 {
 			t.Fatalf("recovered records %v", recovered)
 		}
 		phases := map[any]bool{}
-		for _, r := range sink.find("cache invalidation recovered") {
+		for _, r := range recovered {
 			phases[r.Attrs["phase"]] = true
+			// The initial bump was attempt 1, the failed retry 2, the recovery 3.
+			if r.Attrs["attempts"] != int64(3) {
+				t.Fatalf("recovery must report attempt 3: %v", r)
+			}
 		}
 		if !phases["pre-commit"] || !phases["post-commit"] {
 			t.Fatalf("phases %v", phases)
@@ -173,7 +181,7 @@ func TestCacheInvalidation_RetryRecovers(t *testing.T) {
 
 func TestCacheInvalidation_GivesUpAfterTTL(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		m, backend, sink, failing, closer := invalidationBubble(t, 3*time.Second)
+		m, backend, sink, failing, closer := invalidationBubble(t, 3*time.Second, bubbleClock{})
 		defer closer.Close()
 		*failing = true
 		if _, err := mediator.Send(admin(context.Background()), m, richCmd{ID: "a", Tags: []string{"t"}}); err != nil {
@@ -202,7 +210,7 @@ func TestCacheInvalidation_GivesUpAfterTTL(t *testing.T) {
 
 func TestCacheInvalidation_Close(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		m, backend, _, failing, closer := invalidationBubble(t, time.Hour)
+		m, backend, _, failing, closer := invalidationBubble(t, time.Hour, bubbleClock{})
 		*failing = true
 		if _, err := mediator.Send(admin(context.Background()), m, richCmd{ID: "a", Tags: []string{"t"}}); err != nil {
 			t.Fatal(err)
@@ -226,6 +234,56 @@ func TestCacheInvalidation_Close(t *testing.T) {
 		synctest.Wait()
 		if backend.Ops(cachemodel.OpBumpPre) != attempts+1 {
 			t.Fatalf("attempts %d", backend.Ops(cachemodel.OpBumpPre))
+		}
+	})
+}
+
+// TestCacheInvalidation_RetryAttemptsAreNumbered: the initial bump is
+// attempt 1; each retry is numbered from there in the warning it logs (once
+// the log window lets it through) and in the recovery record. A fake clock
+// drives the backoff timers so a retry runs exactly when Advance fires it.
+func TestCacheInvalidation_RetryAttemptsAreNumbered(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const warn = "cache invalidation failed; retrying with backoff"
+		clock := testkit.NewFakeClock(time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC))
+		m, backend, sink, failing, closer := invalidationBubble(t, time.Hour, clock)
+		defer closer.Close()
+		*failing = true
+		if _, err := mediator.Send(admin(context.Background()), m, richCmd{ID: "a", Tags: []string{"t"}}); err != nil {
+			t.Fatal(err)
+		}
+		warns := sink.find(warn)
+		if len(warns) != 1 || warns[0].Attrs["attempt"] != int64(1) {
+			t.Fatalf("initial warning %v", warns)
+		}
+		// Let both retry goroutines (pre and post phases) park on their
+		// 100 ms timers. Firing them a minute later also puts the failure
+		// past the log window, so it is logged, as attempt 2, once for the
+		// tag set.
+		synctest.Wait()
+		clock.Advance(time.Minute)
+		synctest.Wait()
+		if backend.Version("t") != 0 {
+			t.Fatal("the retry must have failed while down")
+		}
+		if warns = sink.find(warn); len(warns) != 2 || warns[1].Attrs["attempt"] != int64(2) {
+			t.Fatalf("retry warning %v", warns)
+		}
+		// The second retry (200 ms of backoff) succeeds: attempt 3.
+		*failing = false
+		clock.Advance(time.Second)
+		synctest.Wait()
+		if backend.Version("t") != 2 {
+			t.Fatalf("both phases must recover: version %d", backend.Version("t"))
+		}
+		recovered := sink.find("cache invalidation recovered")
+		if len(recovered) != 2 {
+			t.Fatalf("recovered records %v", recovered)
+		}
+		for _, r := range recovered {
+			if r.Attrs["attempts"] != int64(3) {
+				t.Fatalf("recovery must report attempt 3: %v", r)
+			}
 		}
 	})
 }

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -219,6 +220,12 @@ func TestLeaseManager_SingleNodeOwnsAll(t *testing.T) {
 		if c := a.ownedCount()[testScopes[0]]; c != 4 {
 			t.Fatalf("ownedCount %d", c)
 		}
+		// The snapshot is sorted by key, ascending.
+		for i, l := range a.snapshot() {
+			if l.key.partition != i {
+				t.Fatalf("snapshot[%d] = %s, want p%d", i, l.key, i)
+			}
+		}
 		seen := map[int64]bool{}
 		for p, e := range epochsOf(a) {
 			if seen[e] || e < 1 || e > 4 {
@@ -236,6 +243,95 @@ func TestLeaseManager_SingleNodeOwnsAll(t *testing.T) {
 			t.Fatal("second tick changed ownership")
 		}
 	})
+}
+
+// TestLeaseManager_AcquiresExactlyDesired: with a live peer that owns
+// nothing yet, every partition is free but the node takes only its desired
+// share, ceil(P / live), and not one more.
+func TestLeaseManager_AcquiresExactlyDesired(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeLeaseStore(testkit.RealClock{})
+	a := newTestManager(store, &counterFencing{}, "a", 4)
+	if _, err := store.beat(ctx, a.keys.Members("g"), "b", time.Now(), testTTL); err != nil {
+		t.Fatal(err)
+	}
+	a.tick(ctx) // live=2, desired=2, four free partitions
+	if n := len(a.snapshot()); n != 2 {
+		t.Fatalf("owned %d, want exactly the desired 2", n)
+	}
+	if held := store.held(); held != 2 {
+		t.Fatalf("held %d, want 2", held)
+	}
+	if h := a.handoverCounts()[testScopes[0]]; h != 2 {
+		t.Fatalf("handovers %d, want 2", h)
+	}
+	// A second tick with the same membership changes nothing.
+	a.tick(ctx)
+	if n := len(a.snapshot()); n != 2 {
+		t.Fatalf("owned %d after a second tick, want 2", n)
+	}
+	a.stopAcquiring()
+	a.releaseAll(ctx)
+}
+
+// logCapture is a slog.Handler that records every message it receives, so
+// tests can assert which log line a branch produced.
+type logCapture struct {
+	mu   sync.Mutex
+	msgs []string
+}
+
+func (h *logCapture) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *logCapture) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	h.msgs = append(h.msgs, r.Level.String()+" "+r.Message)
+	h.mu.Unlock()
+	return nil
+}
+
+func (h *logCapture) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *logCapture) WithGroup(string) slog.Handler      { return h }
+
+// count returns how many recorded lines start with prefix ("LEVEL message").
+func (h *logCapture) count(prefix string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	n := 0
+	for _, m := range h.msgs {
+		if strings.HasPrefix(m, prefix) {
+			n++
+		}
+	}
+	return n
+}
+
+// TestLeaseManager_ReleaseLogsOutcome pins the log line of each release
+// outcome: a successful compare-and-delete is reported as released with its
+// reason, a store error as a failure that will expire.
+func TestLeaseManager_ReleaseLogsOutcome(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeLeaseStore(testkit.RealClock{})
+	logs := &logCapture{}
+	a := newTestManager(store, &counterFencing{}, "a", 2)
+	a.logger = slog.New(logs)
+	a.tick(ctx)
+	leases := a.snapshot()
+	if len(leases) != 2 {
+		t.Fatalf("owned %d", len(leases))
+	}
+	a.release(ctx, leases[0], LeaseEndSurplus)
+	if logs.count("INFO lease released") != 1 || logs.count("WARN lease release failed") != 0 {
+		t.Fatalf("after a successful release: %v", logs.msgs)
+	}
+	store.releaseErr = errors.New("redis down")
+	a.release(ctx, leases[1], LeaseEndShutdown)
+	if logs.count("INFO lease released") != 1 || logs.count("WARN lease release failed") != 1 {
+		t.Fatalf("after a failed release: %v", logs.msgs)
+	}
+	if len(a.snapshot()) != 0 || leases[1].ctx.Err() == nil {
+		t.Fatal("a failed release must still end the lease")
+	}
 }
 
 func TestLeaseManager_RebalanceOnJoin_TokensIncrease(t *testing.T) {
@@ -506,6 +602,14 @@ func TestLeaseManager_RunLoop(t *testing.T) {
 func TestLease_BeginEndMarks(t *testing.T) {
 	now := time.Now()
 	l := &lease{lastRenew: now, ctx: context.Background(), cancel: func() {}}
+	// A lease is fresh strictly inside the ttl and stale at exactly the ttl,
+	// the same instant begin refuses work.
+	if !l.fresh(now, testTTL) || !l.fresh(now.Add(testTTL-time.Nanosecond), testTTL) {
+		t.Fatal("lease inside the ttl reported stale")
+	}
+	if l.fresh(now.Add(testTTL), testTTL) || l.begin(now.Add(testTTL), testTTL) {
+		t.Fatal("lease at exactly the ttl reported fresh")
+	}
 	if !l.begin(now, testTTL) || l.end() {
 		t.Fatal("plain begin/end")
 	}
@@ -886,7 +990,9 @@ func TestLease_WorkerAttachedSemantics(t *testing.T) {
 func TestLeaseManager_AcquireAfterStopReleasesUnderDetachedContext(t *testing.T) {
 	store := newFakeLeaseStore(testkit.RealClock{})
 	fence := &counterFencing{}
+	logs := &logCapture{}
 	lm := newTestManager(store, fence, "a", 1)
+	lm.logger = slog.New(logs)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	store.afterAcquire = func() {
@@ -903,10 +1009,27 @@ func TestLeaseManager_AcquireAfterStopReleasesUnderDetachedContext(t *testing.T)
 	if n := len(lm.snapshot()); n != 0 {
 		t.Fatalf("owned %d, want 0", n)
 	}
+	const notReleased = "WARN lease acquired after stop could not be released"
+	if logs.count(notReleased) != 0 {
+		t.Fatalf("release succeeded but was reported as failed: %v", logs.msgs)
+	}
 	// A canceled tick context before the write acquires nothing and leaves
 	// nothing behind either.
 	store.afterAcquire = nil
 	if lm.acquire(ctx, key) || store.held() != 0 {
 		t.Fatalf("acquire under a canceled context: held=%d", store.held())
+	}
+	// When the give-back itself fails the key stays until its TTL, and the
+	// warning says so.
+	store.afterAcquire = lm.stopAcquiring
+	store.releaseErr = errors.New("redis down")
+	if lm.acquire(context.Background(), key) {
+		t.Fatal("acquired after stop")
+	}
+	if held := store.held(); held != 1 {
+		t.Fatalf("held %d after a failed give-back, want the key left to expire", held)
+	}
+	if logs.count(notReleased) != 1 || len(lm.snapshot()) != 0 {
+		t.Fatalf("failed give-back not reported: %v", logs.msgs)
 	}
 }

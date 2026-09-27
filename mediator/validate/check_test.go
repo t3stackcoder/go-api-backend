@@ -89,15 +89,21 @@ func TestStringRules(t *testing.T) {
 		{"min counts runes", "min=2", str, "é", "min", "must be at least 2 characters"},
 		{"min runes ok", "min=2", str, "日本", "", ""},
 		{"min singular", "min=1", str, "", "min", "must be at least 1 character"},
+		{"min zero ok", "min=0", str, "", "", ""},
 		{"max long", "max=3", str, "abcd", "max", "must be at most 3 characters"},
 		{"max ok", "max=3", str, "abc", "", ""},
 		{"max runes ok", "max=3", str, "日本語", "", ""},
 		{"max empty ok", "max=3", str, "", "", ""},
 		{"max singular", "max=1", str, "ab", "max", "must be at most 1 character"},
+		{"max zero ok", "max=0", str, "", "", ""},
+		{"max zero rejects one rune", "max=0", str, "a", "max", "must be at most 0 characters"},
+		{"max at the length ceiling ok", "max=2147483647", str, "a", "", ""},
 		{"len short", "len=2", str, "a", "len", "must be exactly 2 characters"},
 		{"len ok", "len=2", str, "ab", "", ""},
 		{"len long", "len=2", str, "abc", "len", "must be exactly 2 characters"},
 		{"len singular", "len=1", str, "", "len", "must be exactly 1 character"},
+		{"len zero ok", "len=0", str, "", "", ""},
+		{"len zero rejects one rune", "len=0", str, "a", "len", "must be exactly 0 characters"},
 		{"pattern ok", "pattern=^[a-z]+$", str, "abc", "", ""},
 		{"pattern bad", "pattern=^[a-z]+$", str, "ABC", "pattern", "must match ^[a-z]+$"},
 		{"pattern with comma", "pattern=^[a-z]{2,3}$", str, "abcd", "pattern", "must match ^[a-z]{2,3}$"},
@@ -209,12 +215,17 @@ func TestSliceRules(t *testing.T) {
 		{"min empty", "min=1", ss, []string{}, "min", "must have at least 1 item"},
 		{"min ok", "min=1", ss, []string{"a"}, "", ""},
 		{"min plural", "min=2", ss, []string{"a"}, "min", "must have at least 2 items"},
+		{"min zero ok", "min=0", ss, []string{}, "", ""},
 		{"max", "max=2", ss, []string{"a", "b", "c"}, "max", "must have at most 2 items"},
 		{"max singular", "max=1", ss, []string{"a", "b"}, "max", "must have at most 1 item"},
 		{"max ok", "max=2", ss, []string{"a", "b"}, "", ""},
+		{"max zero ok", "max=0", ss, []string{}, "", ""},
+		{"max zero rejects one item", "max=0", ss, []string{"a"}, "max", "must have at most 0 items"},
 		{"len short", "len=2", ss, []string{}, "len", "must have exactly 2 items"},
 		{"len ok", "len=2", ss, []string{"a", "b"}, "", ""},
 		{"len singular", "len=1", ss, []string{}, "len", "must have exactly 1 item"},
+		{"len zero ok", "len=0", ss, []string{}, "", ""},
+		{"len zero rejects one item", "len=0", ss, []string{"a"}, "len", "must have exactly 0 items"},
 		{"unique dup", "unique", ss, []string{"a", "a"}, "unique", "must not contain duplicates"},
 		{"unique ok", "unique", ss, []string{"a", "b"}, "", ""},
 		{"unique ints", "unique", is, []int{1, 2, 1}, "unique", "must not contain duplicates"},
@@ -243,9 +254,12 @@ func TestMapRules(t *testing.T) {
 		{"min empty", "min=1", m, map[string]int{}, "min", "must have at least 1 entry"},
 		{"min plural", "min=2", m, map[string]int{"a": 1}, "min", "must have at least 2 entries"},
 		{"min ok", "min=1", m, map[string]int{"a": 1}, "", ""},
+		{"min zero ok", "min=0", m, map[string]int{}, "", ""},
 		{"max", "max=1", m, map[string]int{"a": 1, "b": 2}, "max", "must have at most 1 entry"},
 		{"max plural", "max=2", m, map[string]int{"a": 1, "b": 2, "c": 3}, "max", "must have at most 2 entries"},
 		{"max ok", "max=1", m, map[string]int{"a": 1}, "", ""},
+		{"max zero ok", "max=0", m, map[string]int{}, "", ""},
+		{"max zero rejects one entry", "max=0", m, map[string]int{"a": 1}, "max", "must have at most 0 entries"},
 	})
 }
 
@@ -712,6 +726,37 @@ func TestCheckErrors(t *testing.T) {
 	type empty struct{ A int }
 	if err := v.Check(bg, empty{}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestPlanFlags: hasCheck and hasValidate are exact. Check skips the field
+// walk without hasCheck and the Validate pass without hasValidate, and finish
+// (which propagates hasValidate up from nested plans) must not mark a plan
+// that has no Validate at or below it.
+func TestPlanFlags(t *testing.T) {
+	type bare struct{ A int }
+	type rulesOnly struct {
+		In inner `json:"in"`
+	}
+	type withValidate struct {
+		L vLine `json:"l"`
+	}
+	v := New()
+	for _, tc := range []struct {
+		typ                   reflect.Type
+		hasCheck, hasValidate bool
+	}{
+		{reflect.TypeFor[bare](), false, false},
+		{reflect.TypeFor[rulesOnly](), true, false},
+		{reflect.TypeFor[withValidate](), true, true},
+	} {
+		p, err := v.plan(tc.typ)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.hasCheck != tc.hasCheck || p.hasValidate != tc.hasValidate {
+			t.Errorf("%s: hasCheck=%v hasValidate=%v, want %v %v", tc.typ, p.hasCheck, p.hasValidate, tc.hasCheck, tc.hasValidate)
+		}
 	}
 }
 

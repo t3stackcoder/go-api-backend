@@ -31,6 +31,7 @@ func TestBackoff(t *testing.T) {
 	}{
 		{"zero policy", retry.Policy{}, 1, 0},
 		{"zero policy later attempt", retry.Policy{}, 5, 0},
+		{"zero base with cap stays zero", retry.Policy{MaxDelay: time.Second}, 2, 0},
 		{"attempt below 1 is 1", retry.Policy{BaseDelay: time.Second}, 0, time.Second},
 		{"attempt negative is 1", retry.Policy{BaseDelay: time.Second}, -7, time.Second},
 		{"first", retry.Policy{BaseDelay: time.Second}, 1, time.Second},
@@ -105,6 +106,24 @@ func TestDelay(t *testing.T) {
 	// The maximum duration does not overflow the random range.
 	if d := (retry.Policy{BaseDelay: time.Duration(math.MaxInt64)}).Delay(1, rnd); d < 0 {
 		t.Fatal(d)
+	}
+	// The bound is inclusive: a 1ns bound yields both 0 and 1ns, and never
+	// panics on an empty range.
+	seen := map[time.Duration]bool{}
+	for range 64 {
+		seen[(retry.Policy{BaseDelay: time.Nanosecond}).Delay(1, rnd)] = true
+	}
+	if len(seen) != 2 || !seen[0] || !seen[time.Nanosecond] {
+		t.Fatalf("1ns bound: saw %v, want {0, 1ns}", seen)
+	}
+	// A non-positive bound returns without drawing from the generator, so a
+	// zero-delay policy does not disturb a generator it shares with another.
+	r1, r2 := rand.New(rand.NewPCG(3, 4)), rand.New(rand.NewPCG(3, 4))
+	if (retry.Policy{}).Delay(1, r1) != 0 {
+		t.Fatal("zero")
+	}
+	if a, b := p.Delay(3, r1), p.Delay(3, r2); a != b {
+		t.Fatalf("a zero bound consumed randomness: %v != %v", a, b)
 	}
 	if (retry.Policy{RetryIf: nil}).RetryIf != nil {
 		t.Fatal("RetryIf")

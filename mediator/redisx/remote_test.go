@@ -107,6 +107,15 @@ func TestDecodeRequest(t *testing.T) {
 	if !r.deadline.IsZero() || r.call != "" {
 		t.Fatalf("garbage: %+v", r)
 	}
+	// A deadline of zero or below means none, not the Unix epoch.
+	for _, none := range []string{"0", "-1", ""} {
+		if r := decodeRequest(map[string]any{RPCFieldDeadline: none}); !r.deadline.IsZero() {
+			t.Fatalf("deadline %q decoded as %s", none, r.deadline)
+		}
+	}
+	if r := decodeRequest(map[string]any{RPCFieldDeadline: "1"}); !r.deadline.Equal(time.UnixMilli(1)) {
+		t.Fatalf("deadline 1 ms decoded as %s", r.deadline)
+	}
 }
 
 func TestRemote_SendNilInfo(t *testing.T) {
