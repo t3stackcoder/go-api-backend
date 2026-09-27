@@ -350,7 +350,7 @@ func TestTierTasks(t *testing.T) {
 	if code := h.run(t, "mutate"); code != 0 {
 		t.Errorf("mutate: exit %d: %s", code, h.stderr)
 	}
-	assertCmds(t, h.runner.strings(), []string{"go clean -testcache", "gremlins unleash ./mediator --threshold-efficacy 80"})
+	assertCmds(t, h.runner.strings(), []string{"go clean -testcache", "gremlins unleash ./mediator --threshold-efficacy 95"})
 }
 
 func TestMutateNotInstalled(t *testing.T) {

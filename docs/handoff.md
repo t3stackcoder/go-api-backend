@@ -5,9 +5,9 @@ contract), `docs/design-notes.md` (decisions, deviations, and the hardening
 and tier outcomes in sections 7 and 8), then this file. Keep this file
 current: update it in the same commit as the work it describes.
 
-Last updated 2026-09-27 at the end of the seventh session (the one that
-triaged the mutation survivors; it was cut short, so section 3 item 1 lists
-what it left unfinished and where its records are).
+Last updated 2026-09-27 at the end of the eighth session (the one that
+closed the mutation triage: the record in design-notes 8.14, the `Publish`
+fix, the full gate run, and the 95 percent gate).
 
 ## 1. Where things stand
 
@@ -21,125 +21,83 @@ a no-op.
 |---|---|
 | Core, behaviors, validate, pg, redisx, httpapi, openapi, ctl, otel, testkit | complete; `go test -count=1 -shuffle=on ./...` green in the 24 packages that have tests (31 in the module); lint at zero as of the fifth session (design-notes 5, 8.4) |
 | Example service and integration tier (`examples/orders`, `test/integration`) | complete and verified in the fifth session: shutdown drain, ack-after-commit, OpenAPI drift, readiness, end to end, Docker target `orders`, compose profile `orders` smoke-tested |
-| Chaos tier (`test/chaos`, `cmd/chaosnode`) | complete; every workload green on the rebuilt image: `events` seeds 1 to 8 (fifth session, design-notes 8.8) and the other seven at seed 1 (this session, 8.12), 60 s runs |
+| Chaos tier (`test/chaos`, `cmd/chaosnode`) | complete; every workload green on the rebuilt image: `events` seeds 1 to 8 (fifth session, design-notes 8.8) and the other seven at seed 1 (sixth session, 8.12), 60 s runs |
 | M7 hardening | done: G17 met (5 allocs, 296 ns on this machine; 6 and 0.44 µs measured in the fifth), generic schema names, metrics single-sourced, retry rule, json/v2 tag grammar (design-notes 8.1 to 8.4) |
-| Fault sweep tier (`test/faultsweep`) | complete; 40 fault points; quick and full matrices green after the fifth session's fixes (design-notes 8.9); not re-run this session (nothing under it changed) |
-| Coverage gate (`task cover`, integration and fault-injection tags) | green with the default 95 percent threshold everywhere but `pg/storetest` (80): `pg` 100, `testkit/invariants` 100, `testkit/workload` 100, `redisx` 95.8, new `testkit/netfault` 100; 20 packages; `coverage/summary.md` is the record (design-notes 8.11) |
-| Benchmark baseline | recorded: `coverage/bench-baseline.txt` from `task bench` then `task bench-baseline` on a quiet machine; `task bench` now gates against it at 10 percent (design-notes 8.12) |
-| Mutation gate (`task mutate`, gremlins, 80 percent efficacy) | run for the first time: efficacy 89.89 percent (2018 killed, 227 lived, 57 hung, 794 on integration-only lines), 12.7 minutes; the task now clears the test cache first; a gremlins path bug needs a one-line local patch on Windows (section 2, design-notes 8.13) |
+| Fault sweep tier (`test/faultsweep`) | complete; 40 fault points; quick and full matrices green after the fifth session's fixes (design-notes 8.9); not re-run since (nothing under it changed) |
+| Coverage gate (`task cover`, integration and fault-injection tags) | green with the default 95 percent threshold everywhere but `pg/storetest` (80): `pg` 100, `testkit/invariants` 100, `testkit/workload` 100, `redisx` 95.8, `testkit/netfault` 100; 20 packages; `coverage/summary.md` is the record (design-notes 8.11) |
+| Benchmark baseline | recorded: `coverage/bench-baseline.txt` from `task bench` then `task bench-baseline` on a quiet machine; `task bench` gates against it at 10 percent (design-notes 8.12); `BenchmarkPublish_InProcess` re-measured at 35.6 to 35.9 ns and 0 allocs after the eighth session's fix |
+| Mutation gate (`task mutate`, gremlins, 95 percent efficacy) | green at the new 95 gate: efficacy 96.87 percent (2167 killed, 70 lived and all equivalent, 67 timed out, 793 on integration-only lines), 12.6 minutes with the patched gremlins after the `Publish` fix (design-notes 8.14) |
 
-Verified complete against the spec before this session: all 7 property
+Verified complete against the spec before the sixth session: all 7 property
 tests, 6 fuzz targets, 16 CLI commands, 20 metrics, every Makefile target,
 Defects A to D of the chaos rounds (design-notes 8.5, 8.7, 8.8).
 
-## 2. What the sixth session did
+## 2. What the seventh and eighth sessions did
 
-* **Coverage thresholds raised** (item 1 of the last handoff): the held
-  thresholds for `pg`, `testkit/invariants`, and `testkit/workload` are
-  gone from `coverThresholds` (`tools/task/tasks.go`); only `pg/storetest`
-  remains at 80. The gaps were the driver's error branches, closed three
-  ways (design-notes 8.11): statements the server rejects while they run
-  (triggers that raise, a deferred constraint trigger that fails COMMIT,
-  columns retyped to text, views whose column raises, a locked row under a
-  short `lock_timeout`); connection-level failures through the new
-  `mediator/testkit/netfault` package (design-notes 7.9), a pgconn
-  `DialFunc` that fails the next write carrying a chosen SQL fragment or
-  sends it and withholds the reply; and arming every `pg.*` fault point
-  against the real store. Two seams were added to `pg` (`migrationsFS`,
-  `NewPgSlotStoreForTest`), and three defensive lines carry
-  `covergate:ignore` with reasons. No framework code changed otherwise.
-  New tests: `pg/failure_test.go` (unit), `pg/dbfault_integration_test.go`,
-  `pg/faultpoints_integration_test.go` (integration and faultinject),
-  `invariants` `TestIntegration_CheckFailures`, `workload`
-  `TestIntegration_HandlerFailures` plus three rows of
-  `TestIntegration_StorageErrors`, and `netfault`'s own unit test.
-* **Chaos re-run** (item 2): the seven workloads other than `events` at seed
-  1, 60 s, all green with every checker passing (design-notes 8.12); the
-  stack was torn down afterwards.
-* **Benchmark baseline** (item 3, first half): `task bench` on the quiet
-  machine, then `task bench-baseline`; `BenchmarkSend_DefaultChain` at
-  296 ns and 5 allocs (design-notes 8.12). The file is under the
-  git-ignored `coverage/`, so it lives on this machine only.
-* **Mutation gate** (item 3, second half): `task mutate` with gremlins
-  v0.6.0 installed into a scratch `GOBIN`. Finding: gremlins keys its
-  coverage profile with `filepath.Rel`, which uses backslashes on Windows,
-  while mutant positions come from an `fs.FS` walk with forward slashes, so
-  every mutant below the calling directory is reported "not covered" and
-  only the root `mediator` package is actually tested (first run: 302
-  killed, 25 lived, 2768 not covered, efficacy 92.35 percent, mutator
-  coverage 10.57 percent, 2.5 minutes). Linux CI does not have the
-  problem. A one-line local patch (`filepath.ToSlash` in
-  `internal/coverage/coverage.go` `removeModuleFromPath`) makes the gate
-  real on Windows. Second finding: gremlins sizes every mutant's test
-  timeout from the wall time of its coverage run, so a run served from the
-  test cache (2.7 s) starved the real test runs and 266 of the first 361
-  mutants timed out; `taskMutate` now runs `go clean -testcache` first
-  (`tools/task/tasks.go`, with its test). The real run: 12 minutes 45
-  seconds, 2018 killed, 227 lived, 57 timed out (mutants that hang their
-  tests), 794 not covered (integration-only lines), efficacy 89.89 percent
-  against the 80 gate (design-notes 8.13, with the survivors by file). The
-  gremlins patch is not in the repository; the upstream fix is worth a
-  pull request.
-* Docs: design-notes 7.9, 8.11, 8.12, 8.13 added; this file rewritten.
+* **Mutation survivors triaged** (seventh session, item 1 of the sixth
+  handoff): all 227 survivors of design-notes 8.13, plus three more
+  outside its list that the per-package runs exposed, went through
+  gremlins one package at a time: 156 killed by new unit-test rows in the
+  mutant's own package (36 test files, no source file changed), 70
+  recorded as equivalent with a one-sentence reason each, one left open.
+  Every kill was verified by applying the mutation by hand and watching
+  the named test fail. The per-mutant record (test name per kill, reason
+  per equivalent, timeouts seen, per-package efficacy) is design-notes
+  8.14; the scratch reports it came from were in a session temp directory
+  and are no longer needed.
+* **The open survivor fixed** (eighth session): `send.go:293:15` was a
+  defect. `Publish` installed the call's options in the context only when
+  options were passed, so a nested `Publish` made from an in-process
+  handler without options inherited the enclosing call's `Strategy` and
+  `Headers`, against the documented "one call" semantics. The fix masks
+  inherited options with a package-level zero set when the nested call
+  passes none, so the common path still allocates nothing (design-notes
+  8.14). Pinned by `TestPublish_NestedCallDoesNotInheritOptions`
+  (`mediator/publish_test.go`) and `TestPublish_InProcessAllocations`
+  (`mediator/bench_test.go`); `BenchmarkPublish_InProcess` unchanged at
+  0 allocs. The only source change of the triage.
+* **Full gate run** (eighth session): `task mutate` once, alone, with the
+  patched gremlins first on `PATH` and the `Publish` fix in the tree: 12
+  minutes 36 seconds, 2167 killed, 70 lived, 67 timed out, 793 not
+  covered, efficacy 96.87 percent (89.89 in 8.13), exit 0 against the 95
+  gate. The 70 that lived are the 70 equivalents of 8.14 (the run prints
+  positions relative to `./mediator`, and the fix moved the two `send.go`
+  equivalents down by 11 lines to `342:14` and `380:19`); the
+  seventy-first timed out. Four `behavior` kills of 8.14 showed as
+  timeouts under the full run's load; a timeout counts against neither
+  side, so the figure is conservative.
+* **Gate raised to 95** (eighth session): `--threshold-efficacy` in
+  `taskMutate` (`tools/task/tasks.go`), the assertion in
+  `tools/task/app_test.go`, and the `nightly-mutate` job name in
+  `.github/workflows/ci.yml`. spec 11 still says "80 percent, rising as the
+  suite matures", which this is.
+* Docs: design-notes 8.14 added; this file rewritten. The eighth session's
+  changes were left uncommitted for the user to commit (section 3 item 3).
 
 ## 3. What is left, in order
 
 Against spec 14's definition of done for v1.0: every milestone's
-deliverables exist and every tier is green locally. What remains is the
-acceptance tail that needs a remote or calendar time, plus the survivors of
-the mutation gate.
+deliverables exist, every tier is green locally, and the mutation triage is
+closed. What remains is the acceptance tail that needs a remote or calendar
+time.
 
-1. **Mutation survivors: finish the triage.** The seventh session triaged
-   all 227 survivors of design-notes 8.13, plus four more that longer
-   per-package timeouts exposed: 156 killed by new unit-test rows in the
-   mutant's own package (36 test files, committed with this handoff; no
-   source file changed), 70 recorded as equivalent, 1 open. Every kill was
-   verified by applying the mutation by hand and watching the named test
-   fail. Per-package gremlins efficacy afterwards: validate 98.2, root
-   `mediator` 94.5, `retry` 83.3 (its four survivors are equivalent),
-   `ratelimit` 100, `behavior` 99.0, `httpapi` 99.0, `pg` 98.0, `ctl` 98.6,
-   `redisx` 91.3, `testkit/history` 97.0, `testkit/memstore` 97.5,
-   `testkit/workload` 100 percent. Left to do, in order:
-   * Move the triage record into design-notes 8.14. The per-mutant tables
-     (test name per kill, one-sentence reason per equivalent, timeouts
-     seen) are six files in the session scratchpad
-     `C:\Users\dwhit\AppData\Local\Temp\claude\c--Projects-go-api-backend\cd632d37-9699-4f87-9675-787c84548bf8\scratchpad\reports\`
-     and nowhere else; copy them before anything cleans that directory.
-   * Decide the open one, `send.go:293:15` (`CONDITIONALS_BOUNDARY`), a
-     suspected defect: `Publish` stores the call's options in the context
-     only when options were passed, so a nested `Publish` made from an
-     in-process handler without options inherits the enclosing call's
-     `Strategy` and `Headers`, while the option docs say an option
-     configures one call. The fix is to mask inherited options when the
-     nested call passes none (`else if ctx.Value(publishOptsKey{}) != nil`,
-     install an empty `publishOptions`); an unconditional install would add
-     an allocation to every `Publish` and fail `BenchmarkPublish_InProcess`
-     (36 ns, 0 allocs) under the 10 percent gate. Not applied; it needs a
-     pinning test in `publish_test.go` and a design-notes entry.
-   * Run the full gate once on a quiet machine (`task mutate` with the
-     patched gremlins of section 2 on `PATH`; the session's own full run was
-     interrupted) and raise `--threshold-efficacy` in `tools/task/tasks.go`
-     from 80 (with the assertion in `app_test.go` and the CI job name).
-     Expected efficacy is about 97 percent; 95 is the suggested gate.
-   * Facts for the next run: `gremlins -E` matches paths relative to the
-     target directory (`-E '^[a-z]+/'` restricts `./mediator` to the root
-     package); a per-package run needs `--timeout-coefficient 30` because
-     the timeout is sized from a sub-second coverage run; in Git Bash put
-     the gobin on `PATH` in `/c/...` form; concurrent runs make kills show
-     as TIMED OUT (not counted against efficacy), so run one at a time.
-2. **CI.** No remote exists. The first push exercises tiers 0 to 4 and the
+1. **CI.** No remote exists. The first push exercises tiers 0 to 4 and the
    openapi job for the first time, including the race detector, which has
    never run anywhere (no C compiler on this machine), and the nightly
    mutation and benchmark jobs. The `mutate` job runs on Linux, where the
-   gremlins path bug of section 2 does not apply.
-3. **Chaos at spec scale.** The nightly matrix is 5 minutes per cell over
+   gremlins path bug of design-notes 8.13 does not apply, and now gates at
+   95; the first nightly run there is the first measurement of the gate on
+   a machine other than this one (timeouts are not counted against
+   efficacy, but a slower runner may turn kills into timeouts and lower
+   the killed count that efficacy is computed from; if the job fails
+   narrowly, compare its LIVED list with 8.14 before touching the gate).
+2. **Chaos at spec scale.** The nightly matrix is 5 minutes per cell over
    seeds 1 to 3 (`task chaos-matrix`, `CHAOS_DURATION`); every cell has
    passed at 60 s; the definition of done wants two weeks of green
    nightlies, which is calendar time. Soak mode (`-soak`) exists and has
    not been exercised.
-4. **Commit** only when the user asks, with the attribution line the session
-   specifies. The seventh session is committed; the tree was clean at the
-   end of it.
+3. **Commit** only when the user asks, with the attribution line the session
+   specifies.
 
 ## 4. How to run each tier here
 
@@ -153,7 +111,7 @@ go run ./tools/task chaos -workload events -seed 1 -duration 60s
 go run ./tools/task chaos-down
 go run ./tools/task cover                    # needs Docker; about 4 minutes
 go run ./tools/task bench                    # gates against coverage/bench-baseline.txt
-go run ./tools/task mutate                   # gremlins on PATH; see section 2 for Windows
+go run ./tools/task mutate                   # gremlins on PATH; on Windows the patched build of design-notes 8.13
 go run ./tools/task orders-up                # example service on :8080, then orders-down
 ```
 
@@ -174,7 +132,12 @@ chaos at the same time, and do not run `orders-up`/`orders-down` while the
 chaos stack is up: both profiles belong to the same compose project, and
 `down -v` removes the shared Postgres and Redis. The mutation run is CPU
 bound for minutes; do not run it beside the integration tiers, whose
-`eventually` windows are seconds.
+`eventually` windows are seconds. On Windows the stock gremlins tests only
+the root package (design-notes 8.13); build it from source with the one-line
+`filepath.ToSlash` patch into a scratch `GOBIN`, put that directory first on
+`PATH` in `/c/...` form, and run `task mutate` once, detached, on an idle
+machine: about 13 minutes at 24 workers, and a tool timeout that kills it
+part-way wastes the run.
 
 ## 5. Environment facts (verified 2026-09-27)
 

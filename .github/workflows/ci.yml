@@ -206,7 +206,7 @@ jobs:
           if-no-files-found: ignore
 
   nightly-mutate:
-    name: nightly mutation testing (gremlins, efficacy >= 80)
+    name: nightly mutation testing (gremlins, efficacy >= 95)
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.nightly)
     runs-on: ubuntu-latest
     timeout-minutes: 180

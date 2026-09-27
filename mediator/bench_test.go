@@ -118,3 +118,31 @@ func TestSend_CoreAllocations(t *testing.T) {
 		}
 	}
 }
+
+// TestPublish_InProcessAllocations guards the allocation budget of a Publish
+// with no options on a context that carries none: the in-process fan-out
+// allocates nothing (BenchmarkPublish_InProcess is 0 allocs/op in
+// coverage/bench-baseline.txt). Publish installs an option set in the context
+// only when the call passes options, or when it must mask an enclosing call's.
+func TestPublish_InProcessAllocations(t *testing.T) {
+	m := mediator.New()
+	for i := 0; i < 3; i++ {
+		mustNil(t, mediator.OnFunc(m, func(context.Context, benchEvent) error { return nil }))
+	}
+	build(t, m)
+	ctx := context.Background()
+	// Box the event once, outside the measured closure. A struct captured by
+	// the closure is boxed into the interface on every call, which is the
+	// caller's allocation, not Publish's; the benchmark's plain local is a
+	// constant literal that the compiler folds to a read-only static, so it
+	// shows none.
+	var ev mediator.Notification = benchEvent{ID: "e"}
+	got := testing.AllocsPerRun(2000, func() {
+		if err := mediator.Publish(ctx, m, ev); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if got > 0 {
+		t.Errorf("%v allocs per Publish with no options, budget 0", got)
+	}
+}

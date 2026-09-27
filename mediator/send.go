@@ -271,8 +271,14 @@ func Headers(h map[string]string) PublishOption {
 
 type publishOptsKey struct{}
 
+// noPublishOptions is the zero option set (no strategy override, no headers)
+// that a nested Publish without options installs in place of the enclosing
+// call's, so the mask costs the context frame and nothing else.
+var noPublishOptions publishOptions
+
 // Publish runs the in-process handlers of e and, when e is Durable, appends
-// one outbox row in the ambient unit of work.
+// one outbox row in the ambient unit of work. Options apply to this call only:
+// a Publish made from one of its handlers does not inherit them.
 func Publish(ctx context.Context, m *Mediator, e Notification, opts ...PublishOption) error {
 	if !m.built.Load() {
 		return ErrNotBuilt
@@ -290,12 +296,17 @@ func Publish(ctx context.Context, m *Mediator, e Notification, opts ...PublishOp
 		ev = v.Elem().Interface()
 		t = t.Elem()
 	}
-	if len(opts) > 0 {
+	switch {
+	case len(opts) > 0:
 		var o publishOptions
 		for _, opt := range opts {
 			opt(&o)
 		}
 		ctx = context.WithValue(ctx, publishOptsKey{}, &o)
+	case ctx.Value(publishOptsKey{}) != nil:
+		// A nested Publish without options must not inherit the enclosing
+		// call's strategy and headers: an option configures one call.
+		ctx = context.WithValue(ctx, publishOptsKey{}, &noPublishOptions)
 	}
 	n := m.notifications[t]
 	if n == nil {

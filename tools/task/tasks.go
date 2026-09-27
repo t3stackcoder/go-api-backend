@@ -316,7 +316,7 @@ func taskMutate(a *App, _ []string) error {
 		if err := a.goRun("clean", "-testcache"); err != nil {
 			return err
 		}
-		return a.run("gremlins", "unleash", "./mediator", "--threshold-efficacy", "80")
+		return a.run("gremlins", "unleash", "./mediator", "--threshold-efficacy", "95")
 	})
 }
 

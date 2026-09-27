@@ -437,3 +437,80 @@ func TestDeliver(t *testing.T) {
 		t.Fatalf("handler error: %v", err)
 	}
 }
+
+// TestPublish_NestedCallDoesNotInheritOptions pins that a PublishOption
+// configures one call: a Publish made from a handler of an outer call that
+// passed options, itself passing none, runs with the mediator defaults and no
+// headers, on every path that reads the options (fan-out strategy, fan-out
+// headers, and the unregistered-durable append).
+func TestPublish_NestedCallDoesNotInheritOptions(t *testing.T) {
+	t.Run("strategy", func(t *testing.T) {
+		m := mediator.New() // default: StopOnFirstError
+		innerRuns := 0
+		var innerOpts []mediator.PublishOption
+		mustNil(t, mediator.OnFunc(m, func(context.Context, bPlainEvent) error { innerRuns++; return errors.New("inner h1") }))
+		mustNil(t, mediator.OnFunc(m, func(context.Context, bPlainEvent) error { innerRuns++; return nil }))
+		mustNil(t, mediator.OnFunc(m, func(ctx context.Context, _ puPlain) error {
+			return mediator.Publish(ctx, m, bPlainEvent{}, innerOpts...)
+		}))
+		build(t, m)
+		// The outer call continues on error; the inner call passes no options
+		// and must use the mediator default, which stops at the first error.
+		err := mediator.Publish(context.Background(), m, puPlain{}, mediator.Strategy(mediator.ContinueOnError))
+		if err == nil || !strings.Contains(err.Error(), "inner h1") {
+			t.Fatalf("outer err = %v, want the inner handler's failure", err)
+		}
+		if innerRuns != 1 {
+			t.Fatalf("inner handlers run = %d, want 1: the nested call inherited the outer strategy", innerRuns)
+		}
+		// The inner call's own option still applies.
+		innerRuns = 0
+		innerOpts = []mediator.PublishOption{mediator.Strategy(mediator.ContinueOnError)}
+		err = mediator.Publish(context.Background(), m, puPlain{}, mediator.Strategy(mediator.ContinueOnError))
+		if err == nil || innerRuns != 2 {
+			t.Fatalf("inner override: runs=%d err=%v, want 2 runs and the error", innerRuns, err)
+		}
+	})
+
+	t.Run("headers", func(t *testing.T) {
+		m := mediator.New()
+		mustNil(t, mediator.OnFunc(m, func(ctx context.Context, _ puEvent) error {
+			return mediator.Publish(ctx, m, puTopicEvent{K: "inner"})
+		}))
+		mustNil(t, mediator.OnFunc(m, noopEvent[puTopicEvent]))
+		build(t, m)
+		uow := &fakeUoW{}
+		ctx := mediator.WithUnitOfWork(context.Background(), uow)
+		mustNil(t, mediator.Publish(ctx, m, puEvent{K: "outer"}, mediator.Headers(map[string]string{"outer": "1"})))
+		if len(uow.envs) != 2 {
+			t.Fatalf("appended %d rows, want 2", len(uow.envs))
+		}
+		byType := map[string]mediator.Envelope{}
+		for _, e := range uow.envs {
+			byType[e.Type] = e
+		}
+		if outer := byType["puEvent"]; !reflect.DeepEqual(outer.Headers, map[string]string{"outer": "1"}) {
+			t.Fatalf("outer envelope headers = %v", outer.Headers)
+		}
+		if inner := byType["puTopicEvent"]; len(inner.Headers) != 0 {
+			t.Fatalf("nested envelope inherited headers %v", inner.Headers)
+		}
+	})
+
+	t.Run("unregistered durable", func(t *testing.T) {
+		m := mediator.New()
+		mustNil(t, mediator.OnFunc(m, func(ctx context.Context, _ puPlain) error {
+			return mediator.Publish(ctx, m, puUnregistered{K: "u"})
+		}))
+		build(t, m)
+		uow := &fakeUoW{}
+		ctx := mediator.WithUnitOfWork(context.Background(), uow)
+		mustNil(t, mediator.Publish(ctx, m, puPlain{}, mediator.Headers(map[string]string{"outer": "1"})))
+		if len(uow.envs) != 1 || uow.envs[0].Type != "puUnregistered" {
+			t.Fatalf("envs = %+v", uow.envs)
+		}
+		if h := uow.envs[0].Headers; len(h) != 0 {
+			t.Fatalf("nested unregistered envelope inherited headers %v", h)
+		}
+	})
+}

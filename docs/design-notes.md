@@ -841,3 +841,394 @@ and the first two runs were wrong in ways worth recording.
   `testkit/invariants` 2. The boundary survivors in `validate` are the
   length and range checks (`min`, `max`, `len`) whose tables test one side
   of each boundary; those are the cheapest rows to add.
+
+### 8.14 Mutation survivors triaged (seventh session)
+
+The 227 survivors of 8.13 were triaged one by one, plus three more that
+the per-package runs exposed outside that list
+(`validate/checkers.go:222:21`, `behavior/logging.go:41:16`,
+`behavior/behavior.go:205:18`; a fourth, `redisx/lease.go:396:37`, lived
+only in a partial log under load and the existing tests kill it). The
+by-file list in 8.13 sums to 215: it names no file for 12 of the 227,
+and the tables below are the complete set. Each package ran alone,
+gremlins pointed at its own directory (the root package through
+`-E '^[a-z]+/'`, which keeps the subdirectories out), and every survivor
+ended in one of three places: killed by a new row in a unit test of the
+mutant's own package, recorded as equivalent with a one-sentence reason,
+or left open.
+Every kill was verified by applying the mutation by hand and watching the
+named test fail. The outcome: 156 killed (36 test files touched, no
+source file changed), 70 equivalent, 1 open (`send.go:293:15`, taken up
+below). Efficacy per package afterwards: `validate` 98.2, root `mediator`
+94.5, `retry` 83.3 (its four survivors are equivalent), `ratelimit` 100,
+`behavior` 99.0, `httpapi` 99.0, `pg` 98.0, `ctl` 98.6, `redisx` 91.3,
+`testkit/history` 97.0, `testkit/memstore` 97.5, `testkit/workload` 100
+percent. The tables below are the record, one pair per package group: a
+kill names the test that fails under the mutation, an equivalent gives
+the reason the mutation cannot be observed. Positions are
+`file:line:column` as gremlins prints them, and a position that carries
+two mutators appears once per mutator; a kill row names its mutator only
+where the report did.
+
+* **The core (root `mediator`, `retry`, `ratelimit`): 11 killed, 21
+  equivalent, 1 open.** gremlins on the root package alone (a `git
+  archive` export plus the five changed test files): 309 killed, 18 lived,
+  1 not covered, 1 timed out (`names.go:76:29`, a hang), efficacy 94.50
+  percent, 4 minutes 45 seconds; `retry`: 20 killed, 4 lived, 2 timed out
+  (`retry.go:37:16` and `37:28`, loop-header hangs), 83.33 percent;
+  `ratelimit`: 11 killed, 0 lived, 100 percent. A fallback run over the
+  whole tree, made when the `-E` of the assignment did not take, lasted
+  1 hour 21 minutes (2052 killed, 223 lived, 794 not covered, 27 timed
+  out, 90.20 percent) against the mid-work state of the other packages.
+  The `ratelimit` kill is amd64-specific: `int64(NaN)` is 0 on arm64.
+  Files: `mediator/build_test.go` (+59), `pipeline_test.go` (+47/-3),
+  `publish_test.go` (+16/-3), `retry/retry_test.go` (+19),
+  `ratelimit/ratelimit_test.go` (+1).
+
+  | File | Mutant | Killed by |
+  |---|---|---|
+  | `mediator.go` | `602:9` | `TestBuild_ReportsEveryProblemAtOnce` (`noUnmarshalQuery`) |
+  | `mediator.go` | `744:27` | `TestBuild_DuplicateConsumersKeepRegistrationOrder` |
+  | `names.go` | `90:17` | `TestBuild_DuplicateConsumersKeepRegistrationOrder` (`Names()`) |
+  | `pipeline.go` | `357:17` | `TestPipeline_HandlerResultBesideError` |
+  | `send.go` | `333:25` | `TestPublishAll_OrdersDurableAppends` |
+  | `send.go` | `378:17` | `TestPublish_StrategyOverrideAndSuccess` |
+  | `typed.go` | `75:11` | `TestPipeline_TypedBehaviorsPositionedAndNamed` |
+  | `retry/retry.go` | `39:11` | `TestBackoff` ("zero base with cap stays zero") |
+  | `retry/retry.go` | `61:11`, `66:4` | `TestDelay` |
+  | `ratelimit/ratelimit.go` | `29:29` | `TestEmissionInterval` ("nan rate zero period") |
+
+  | Mutant | Mutator | Reason |
+  |---|---|---|
+  | `envelope.go:30:7` | `CONDITIONALS_BOUNDARY` | `p <= 1` to `p < 1` differs only at `p == 1`, where `h.Sum64() % 1` is 0, the early return's value. |
+  | `errors.go:145:50` | `ARITHMETIC_BASE` | `len(e.Details)+1` to `-1` only changes the size hint of `make`; a negative hint is clamped and capacity is unobservable. |
+  | `mediator.go:615:59` | `CONDITIONALS_BOUNDARY` | `allInfos` sorts requests by `Name`; names are unique after `Build`'s claim check, and equal names exist only in a failed duplicate-name `Build`, whose map iteration order is random in both programs. |
+  | `mediator.go:620:57` | `CONDITIONALS_BOUNDARY` | The same for notifications. |
+  | `mediator.go:636:59` | `CONDITIONALS_BOUNDARY` | The same for `Requests()`. |
+  | `mediator.go:648:59` | `CONDITIONALS_BOUNDARY` | The same for `Events()`. |
+  | `mediator.go:712:66` | `CONDITIONALS_BOUNDARY` | `ChainFor` sorts by rank; behavior names are unique and ranks distinct after `Build`, and before `Build` `ChainFor` is documented invalid. |
+  | `mediator.go:742:24` | `CONDITIONALS_BOUNDARY` | Guarded by `out[i].Group != out[j].Group` on the previous line. |
+  | `names.go:38:43` | `CONDITIONALS_BOUNDARY` | `i >= 0` to `> 0` differs only when `reflect.Type.Name()` starts with `[`, which is impossible. |
+  | `names.go:85:17` | `CONDITIONALS_BOUNDARY` | Guarded by `a.Kind != b.Kind`. |
+  | `names.go:88:17` | `CONDITIONALS_BOUNDARY` | Guarded by `a.Name != b.Name`. |
+  | `pipeline.go:244:23` | `CONDITIONALS_BOUNDARY` | Positions are unique per name; `p == lo` only when the same `After` anchor repeats, where `anchor = a` is a no-op. |
+  | `pipeline.go:251:23` | `CONDITIONALS_BOUNDARY` | The same for `hi` and `Before`. |
+  | `pipeline.go:292:14` | `CONDITIONALS_BOUNDARY` | `pos(a) == p` means `a == r.name`, rejected earlier by the "positioned relative to itself" check. |
+  | `pipeline.go:297:14` | `CONDITIONALS_BOUNDARY` | The same for `Before` anchors. |
+  | `send.go:331:14` | `CONDITIONALS_BOUNDARY` | Guarded by `ti != tj`. |
+  | `send.go:369:19` | `CONDITIONALS_BOUNDARY` | With no handlers every strategy branch is a no-op and control reaches `appendDurable` either way. |
+  | `retry/retry.go:24:19` | `CONDITIONALS_BOUNDARY` | `MaxAttempts < 1` to `<= 1`: at 1 both branches return 1. |
+  | `retry/retry.go:33:13` | `CONDITIONALS_BOUNDARY` | `attempt < 1` to `<= 1`: at 1 the assignment sets 1. |
+  | `retry/retry.go:46:26` | `CONDITIONALS_BOUNDARY` | Differs only at `d == MaxDelay`; every continuation path yields `MaxDelay`. |
+  | `retry/retry.go:50:25` | `CONDITIONALS_BOUNDARY` | Differs only at `d == MaxDelay`, where both branches return the same value. |
+
+* **`validate`: 46 killed, 8 equivalent, 0 open.** One more kill fell
+  outside the list, `checkers.go:222:21` (`CONDITIONALS_NEGATION`), the
+  format schema now pinned in `TestTypeMapping`. gremlins: 431 killed, 8
+  lived, 17 not covered, 8 timed out, efficacy 98.18 percent, mutator
+  coverage 96.27 percent, 22 minutes 5 seconds under load. Of the 8
+  timeouts, the `CONDITIONALS_BOUNDARY` and `CONDITIONALS_NEGATION`
+  mutants at `schemagen.go:78:20` and `78:32` fail in five to six seconds
+  when re-run by hand under `-timeout 120s`, so they are kills that hit a
+  load spike; `schemagen.go:132:26`, `319:11`, `343:23` and `347:10`
+  (`CONDITIONALS_NEGATION`) are genuine hangs outside the list. Files:
+  `check_test.go`, `compile_test.go`, `coverage_test.go`,
+  `format_test.go`, `schema_test.go` (no new files). No suspected defect.
+  One observation: the compiler does not cross-check a field's rules, so
+  `max=0,len=3` compiles and renders `minLength` 3 with `maxLength` 0;
+  `TestZeroBoundsInSchema` documents this as it is.
+
+  | File | Mutant | Killed by |
+  |---|---|---|
+  | `checkers.go` | `170:13`, `176:14` | `TestStringRules` |
+  | `checkers.go` | `365:13`, `371:16` | `TestSliceRules` |
+  | `checkers.go` | `485:16` | `TestMapRules` |
+  | `checkers.go` | `199:13`, `201:9`, `207:8`, `210:8`, `419:13`, `421:9`, `427:8`, `430:8`, `516:16`, `519:16` | `TestZeroBoundsInSchema` |
+  | `compile.go` | `346:20` | `TestPlanFlags` (white-box, through `v.plan`) |
+  | `compile.go` | `491:39` | `TestTypeMapping` (`ArrR`) |
+  | `compile.go` | `531:21`, `531:30` | `TestStringRules` |
+  | `compile.go` | `531:37` (`ARITHMETIC_BASE` and `INVERT_NEGATIVES`) | `TestCompileErrors` ("string length ceiling plus one") |
+  | `format.go` | `53:26`, `79:12`, `83:35`, `96:23`, `96:35`, `96:47`, `96:59`, `96:71`, `102:38`, `102:51`, `102:51` (`CONDITIONALS_NEGATION`), `102:64`, `102:77`, `102:77` (`CONDITIONALS_NEGATION`), `109:12`, `117:35`, `120:16` | `TestFormats` rows |
+  | `schemagen.go` | `78:20`, `78:32`, `78:44`, `78:56`, `78:68` | `TestStripTypeArgPackages` (`zAZ09`) |
+  | `schemagen.go` | `95:10`, `103:46` | scanner rows |
+  | `schemagen.go` | `132:35` | `TestSchemasNaming` (the `_3` counter) |
+
+  | Mutant | Mutator | Reason |
+  |---|---|---|
+  | `checkers.go:173:14` | `CONDITIONALS_BOUNDARY` | `c.minLen >= 0` to `> 0` differs only at `minLen == 0`, where the guarded test is `n < 0`, impossible for a rune count. |
+  | `checkers.go:368:16` | `CONDITIONALS_BOUNDARY` | The same for `minItems`. |
+  | `checkers.go:482:16` | `CONDITIONALS_BOUNDARY` | The same for `minProps`. |
+  | `compile.go:83:14` | `CONDITIONALS_BOUNDARY` | `f.single >= 0` to `> 0` differs only at `single == 0`, where the fallback `fieldByIndex(v, []int{0})` returns the same value. |
+  | `compile.go:93:8` | `CONDITIONALS_BOUNDARY` | `i > 0` to `>= 0` differs only at `i == 0`, where `v` is always the struct value itself (root and `ptrChecker` dereference first), so the `Pointer` kind test is false. |
+  | `format.go:113:8` | `CONDITIONALS_BOUNDARY` | `at < 0` to `<= 0` differs only at `at == 0`, where `local` is empty and line 117 rejects it the same way. |
+  | `format.go:134:17` | `CONDITIONALS_BOUNDARY` | `len(domain) > 1` to `>= 1` differs only for a one-character domain, where `domain[0]` cannot be both `[` and `]`, so both fall through to `isHostname`. |
+  | `schemagen.go:123:45` | `CONDITIONALS_BOUNDARY` | `i >= 0` to `> 0` differs only when `PkgPath` begins with `/`, which no Go import path can, and reflect cannot construct named types. |
+
+* **`behavior`, `cachemodel` and `httpapi`: 22 killed, 3 equivalent, 0
+  open.** Two more fell outside the list: `behavior/logging.go:41:16`
+  (`CONDITIONALS_NEGATION`) is killed, since
+  `TestLogging_ConsumerAndNotification` now asserts the group on the
+  start record, and `behavior/behavior.go:205:18`
+  (`CONDITIONALS_NEGATION`) is equivalent, the `idem.Logger` default in
+  `Standard`, because `pg.IdempotencyConfig.Logger` is documented unused
+  and never read. gremlins on `behavior` (which recurses into
+  `cachemodel`): 201 killed, 2 lived, 21 not covered, 6 timed out,
+  efficacy 99.01 percent, 4 minutes 24 seconds; `httpapi`: 197 killed, 2
+  lived, 20 not covered, 3 timed out, 98.99 percent, 4 minutes 23 seconds.
+  The timeouts are the known ones outside the list:
+  `cachemodel/scheduler.go:120:32`, `123:32`, `168:8` (twice) and `168:18`
+  (`CONDITIONALS_NEGATION`), `retry.go:100:29`, and `httpapi/sse.go:58:11`,
+  `126:54`, `129:45`. Files (9, +423/-47): `behavior/internal_test.go`,
+  `logging_test.go`, `cache_invalidation_test.go` (`invalidationBubble`
+  now takes a `Clock`), `cachemodel/cachemodel_test.go`,
+  `httpapi/handle_test.go`, `problem_test.go`, `internal_test.go`,
+  `listener_test.go`, `routing_test.go`. No suspected defect. The hints
+  the triage started from needed correcting: `redact.go` is a
+  depth-bounded reflection walker (`maxRedactDepth` 32); `logging.go` 71
+  and 86 are the stream item count; `cache_invalidation.go` 185 to 204
+  are the retry attempt numbers in the log records; `problem.go` 76 and
+  91 are empty-slice and empty-map guards.
+
+  | File | Mutant | Killed by |
+  |---|---|---|
+  | `behavior/cache.go` | `111:16` | `TestCache_PrepareWarmsCachedQueries` |
+  | `behavior/cache_invalidation.go` | `185:29`, `201:92` | `TestCacheInvalidation_RetryRecovers` (`attempts == 3`) |
+  | `behavior/cache_invalidation.go` | `204:38` | `TestCacheInvalidation_RetryAttemptsAreNumbered` (`synctest` and `FakeClock`) |
+  | `behavior/cachemodel/scheduler.go` | `168:18`, `212:34` | `TestScheduler_Model` |
+  | `behavior/common.go` | `123:17` | `TestLogLimiter` (boundary rows at `logLimiterMaxKeys`) |
+  | `behavior/logging.go` | `71:11` | `TestLogging_Stream` (empty stream, `items` 0) |
+  | `behavior/logging.go` | `86:47` | `TestLogging_Outcomes` (no `items` on non-streams) |
+  | `behavior/redact.go` | `63:11`, `164:44`, `165:26` | `TestRedactor_DepthLimit`, `TestRedactor_EdgeCases` |
+  | `behavior/redact.go` | `100:57`, `136:37` | `TestRedactor_DepthThroughMapsAndLists` |
+  | `behavior/timeout.go` | `50:23` | `TestTimeout_OnBuildRecordsExplicitTimeoutsOnly` (internal seam) |
+  | `behavior/timeout.go` | `79:9` | `TestTimeoutErrorAndPhase` (identity) |
+  | `httpapi/handle.go` | `171:21` | `TestDecode` (64 and 65 bytes at `MaxBodyBytes` 64) |
+  | `httpapi/listener.go` | `46:11` | `TestNewListener_Drain`, `TestListener_DrainsInFlight` (drain 0) |
+  | `httpapi/problem.go` | `76:43`, `91:35` | `TestProblemOf` (empty fields, empty details map, nil `Errors`) |
+  | `httpapi/routing.go` | `384:32`, `384:50` | `TestBuildCheck_Violations` (status 199, 200, 299, 300) |
+
+  | Mutant | Mutator | Reason |
+  |---|---|---|
+  | `behavior/cachemodel/scheduler.go:273:16` | `CONDITIONALS_BOUNDARY` | `if a.written > s.lastReturned { s.lastReturned = a.written }` to `>=`: the equal case assigns the value already there. |
+  | `httpapi/handle.go:228:24` | `CONDITIONALS_BOUNDARY` | `len(rt.boundNames) > 0` to `>= 0` only decides whether `boundMembersInBody` runs with an empty map, which matches nothing and returns nil either way. |
+  | `httpapi/problem.go:180:10` | `CONDITIONALS_BOUNDARY` | `if secs < 1 { secs = 1 }` to `<= 1`: at 1 the assignment is a no-op. |
+  | `behavior/behavior.go:205:18` (outside the list) | `CONDITIONALS_NEGATION` | The `idem.Logger == nil` default: the field is never read. |
+
+* **`pg` and `ctl`: 23 killed, 7 equivalent, 0 open.** gremlins on `pg`:
+  191 killed, 4 lived, 221 not covered, 12 timed out, efficacy 97.95
+  percent, 29 minutes 34 seconds under load; `ctl`: 218 killed, 3 lived,
+  1 not covered, 0 timed out, 98.64 percent, 2 minutes 45 seconds. The 12
+  `pg` timeouts are loop-breaking mutants outside the list:
+  `janitor.go:74:14`, `122:34`, `122:54`; `relay.go:124:36`, `359:8`
+  (`CONDITIONALS_NEGATION`), `554:11`; `uow.go:127:17`, `129:8` (twice),
+  `176:17`, `178:8` (twice). Files: `pg/export_test.go` (the seams
+  `SetOwnedForTest`, `TakeWake`, `LockTimeoutForTest`,
+  `FencingSQLForTest`), `pg/relay_test.go` (`gaugeCalls` and `setGauges`
+  on `fakeSlotStore`, `countingSink`, four new tests),
+  `pg/failure_test.go` (three new tests), `pg/misc_test.go` (extended,
+  plus `TestNewStore_LockTimeoutAndFencingSQL`), `ctl/ctl_test.go`
+  (`TestParseDuration` rows). No suspected defect.
+
+  | File | Mutant | Killed by |
+  |---|---|---|
+  | `ctl/main.go` | `431:39` | `TestParseDuration` (the exact messages for `d` and `d12h`) |
+  | `pg/hooks.go` | `45:28` | `TestBeforeCommit_OutsideUnitOfWorkLogsOnlyAFailure` (`slog.Default` swap) |
+  | `pg/pool.go` | `42:9`, `54:18`, `57:18`, `60:25` (twice), `63:25` | `TestConfigDefaultsAndPool` (a zero `PoolConfig` keeps the URL values; `pg: ping`) |
+  | `pg/relay.go` | `249:7` (twice), `252:34`, `253:9`, `258:14`, `258:38` | `TestRelay_WakeTargetsOneOwnedSlot` (10 rows) |
+  | `pg/relay.go` | `359:8`, `362:8` | `TestSlot_RunLoop_FullBatchPollsAgainAtOnce` (`synctest`) |
+  | `pg/relay.go` | `384:67` | `TestSlot_RunLoop_GaugesKeepTheLastGoodReading` |
+  | `pg/relay.go` | `500:49` | `TestSlot_DataLossRecovery_RecreatesOnlyKnownGroups` (`countingSink`) |
+  | `pg/store.go` | `47:19` (twice), `53:14` | `TestNewStore_LockTimeoutAndFencingSQL` |
+  | `pg/uow.go` | `117:37` | `TestUnitOfWork_LogsRollbackFailure` |
+  | `pg/uow.go` | `191:24` | `TestUnitOfWork_LogsOnCommitHookPanic` |
+
+  | Mutant | Mutator | Reason |
+  |---|---|---|
+  | `ctl/commands.go:81:79` | `CONDITIONALS_BOUNDARY` | `Changed` holds one row per migration version (`loadMigrations` rejects duplicates), so the down-sort never compares equal keys. |
+  | `ctl/main.go:386:18` | `CONDITIONALS_BOUNDARY` | Every caller of `require` passes (condition, name) pairs, so `len(pairs)` is even and `i+1 < len` against `<= len` never differ. |
+  | `ctl/results.go:70:7` | `CONDITIONALS_BOUNDARY` | `if d < 0 { d = 0 }` to `<=`: at `d == 0` the mutant assigns 0 to a zero. |
+  | `pg/migrate.go:74:62` | `CONDITIONALS_BOUNDARY` | The sort's `<` to `<=` differs only for equal versions, rejected by the `seen` map ten lines earlier. |
+  | `pg/relay.go:534:7` | `CONDITIONALS_BOUNDARY` | `parseStreamID` with `-` at index 0: `strconv.ParseUint("")` fails, so `i < 0` and `i <= 0` give identical results. |
+  | `pg/store.go:111:16` | `CONDITIONALS_BOUNDARY` | `if remaining < 1 { remaining = 1 }` to `<=`: at 1 the mutant assigns the value it already has. |
+  | `pg/uow.go:378:20` | `CONDITIONALS_BOUNDARY` | `opts.LockTimeout` is zero before the check (`defaultTxOptions` never sets it), so copying a zero `o.LockTimeout` changes nothing and line 382 applies `defaultLock` either way. |
+
+* **`redisx`: 23 killed, 22 equivalent, 0 open.** gremlins: 232 killed,
+  22 lived, 290 not covered, 1 timed out, efficacy 91.34 percent, 6
+  minutes 47 seconds. The one timeout is `lease.go:404:36`
+  (`INCREMENT_DECREMENT`), an infinite loop, outside the list. A partial
+  log from before a crash showed `lease.go:412:13` and `416:10` timed out
+  and `lease.go:396:37` (`INVERT_NEGATIVES`) lived; those were load
+  artefacts, all killed on a quiet machine. Files (+257/-9):
+  `backoff_test.go`, `cache_test.go`, `consumers_test.go`,
+  `keys_test.go`, `lease_test.go`, `limiter_test.go`, `remote_test.go`,
+  `streams_test.go`; `lease_test.go` gained `logCapture`, a recording
+  `slog` handler. One nuance, pinned with a comment and not a defect: the
+  `d >= max/2` guard of `backoff.delay` returns the cap one step early
+  for an odd cap (`{3,7}` gives 3, 7, 7).
+
+  | File | Mutant | Killed by |
+  |---|---|---|
+  | `backoff.go` | `25:16`, `25:8`, `44:34` | `TestBackoff_CapBoundaries`, `TestBackoff_Schedule` |
+  | `cache.go` | `137:28` | `TestCacheEntry_Malformed` |
+  | `consumers.go` | `96:8`, `114:8`, `348:76`, `348:79` | `TestNewConsumers_Scopes` |
+  | `consumers.go` | `300:19` | `TestConsumers_IdleRun` |
+  | `keys.go` | `73:21` | `TestKeys_ParseLease` |
+  | `keys.go` | `115:40` | `TestStreamIDMillis` |
+  | `lease.go` | `210:42` | `TestLease_BeginEndMarks` |
+  | `lease.go` | `412:13`, `416:10` | `TestLeaseManager_AcquiresExactlyDesired` |
+  | `lease.go` | `451:103` | `TestLeaseManager_AcquireAfterStopReleasesUnderDetachedContext` |
+  | `lease.go` | `475:109` | `TestLeaseManager_ReleaseLogsOutcome` |
+  | `lease.go` | `574:67` (`CONDITIONALS_NEGATION`) | `TestLeaseManager_SingleNodeOwnsAll` |
+  | `limiter.go` | `69:19` | `TestLimiterArgs` |
+  | `ops.go` | `59:9` | `TestDLQFields_Shape` |
+  | `redisx.go` | `117:24`, `117:9` | `TestConfig_WithDefaults` |
+  | `remote_server.go` | `369:82` | `TestDecodeRequest` |
+  | `streams.go` | `168:19` | `TestEntry_Defaults` |
+
+  | Mutant | Mutator | Reason |
+  |---|---|---|
+  | `backoff.go:20:11` | `CONDITIONALS_BOUNDARY` | `retry < 1` to `<= 1`: at `retry == 1` the body assigns `retry = 1`. |
+  | `backoff.go:30:7` | `CONDITIONALS_BOUNDARY` | `d > max` to `>=`: at `d == max` both branches return `max`. |
+  | `backoff.go:40:7` | `CONDITIONALS_BOUNDARY` | `d <= 0` to `< 0`: at `d == 0` the fall-through computes `Duration(0*f)`, which is 0. |
+  | `cache.go:132:57` | `CONDITIONALS_BOUNDARY` | `len < 7` to `<= 7`: the only 7-byte entry with the prefix and a closing brace is `{"v":{}`, which the later `,"b":` check rejects with the same error. |
+  | `cache.go:132:68` | `ARITHMETIC_BASE` | `len(head)+1` to `-1`: an entry with the 6-byte prefix ending in `}` has at least 7 bytes anyway. |
+  | `cache.go:161:11` | `CONDITIONALS_BOUNDARY` | `endv >= 0` to `> 0`: `endv` is -1 or at least 6, never 0. |
+  | `cache.go:165:10` | `CONDITIONALS_BOUNDARY` | `endv < 0` to `<= 0`: the same range argument. |
+  | `consumers.go:265:29` | `CONDITIONALS_BOUNDARY` | `group < group` to `<=` is only reached after line 264 established that the groups differ. |
+  | `consumers.go:267:28` | `CONDITIONALS_BOUNDARY` | Scopes are deduplicated by (group, topic), so same-group scopes never share a topic, and `<` and `<=` agree on distinct strings. |
+  | `consumers.go:894:40` | `CONDITIONALS_BOUNDARY` | `i >= 0` to `> 0` in `splitStreamID`: an ID starting with `-` fails `ParseUint` either way. |
+  | `consumers.go:911:7` | `CONDITIONALS_BOUNDARY` | `i < 0` to `<= 0` in `nextStreamID`: at `i == 0` the original parses `id[:0]`, which is rejected, so both return `("", false)`. |
+  | `consumers.go:1172:39` | `ARITHMETIC_BASE` | `make(map, len+7)` to `len-7`: a capacity hint only; a negative hint is clamped by the runtime (probed). |
+  | `consumers.go:1180:14` | `CONDITIONALS_BOUNDARY` | `len(msg) > 4096` to `>=`: at 4096 `msg[:4096]` is the identity. |
+  | `keys.go:69:7` | `CONDITIONALS_BOUNDARY` | `i < 0` to `<= 0` in `ParseLease`: with `i == 0` `rest` is empty and the later `j <= 0` check rejects the key anyway. |
+  | `lease.go:326:8` | `CONDITIONALS_BOUNDARY` | `n < 1` to `<= 1`: at `n == 1` the body assigns `n = 1`. |
+  | `lease.go:395:72` | `CONDITIONALS_BOUNDARY` | `mine` holds one scope's leases keyed by `leaseKey` with distinct partitions, so the sort never compares an element with itself. |
+  | `lease.go:574:67` | `CONDITIONALS_BOUNDARY` | Snapshot keys are distinct and `leaseKey.String()` is injective (`NamePattern` forbids `/`), so the sort never compares an element with itself. |
+  | `limiter.go:61:14` | `CONDITIONALS_BOUNDARY` | `interval < 1us` to `<=`: at exactly 1 µs the body assigns 1 µs. |
+  | `limiter.go:65:14` | `CONDITIONALS_BOUNDARY` | `capacity < 1` to `<=`: at 1 the body assigns 1. |
+  | `limiter.go:69:48` | `CONDITIONALS_BOUNDARY` | `e > expire` to `>=`: at `e == expire` the assignment is a no-op. |
+  | `limiter.go:72:12` | `CONDITIONALS_BOUNDARY` | `expire < 1s` to `<=`: at exactly 1 s the body assigns 1 s. |
+  | `streams.go:63:22` | `CONDITIONALS_BOUNDARY` | `len(env.Headers) > 0` to `>= 0`: json/v2 marshals a nil or empty map as `{}`, the literal the original uses. |
+
+* **The `testkit` family: 31 killed, 9 equivalent, 0 open.** gremlins on
+  `testkit/history`: 161 killed, 5 lived, 16 not covered, 0 timed out,
+  efficacy 96.99 percent; `testkit/memstore`: 77 killed, 2 lived, 2 not
+  covered, 2 timed out (`locks.go:31:13` and `47:15`, outside the list),
+  97.47 percent; `testkit/workload`: 24 killed, 0 lived, 47 not covered,
+  100 percent; `testkit/invariants` was not re-run, since both of its
+  survivors are equivalent and nothing changed there. A final run on the
+  `testkit` root, which recurses into every subpackage, took 15 minutes 3
+  seconds: 280 killed, 9 lived, 217 not covered, 8 timed out, efficacy
+  96.89 percent, mutator coverage 57.11 percent; the 9 that lived are
+  exactly the 9 equivalents, and `clock.go:95:7` is killed. The 8
+  timeouts under the whole-tree load: `history/logscan.go:110:32`,
+  `110:44`, `115:11`, `115:26`; `memstore/locks.go:31:13`, `47:15`; and
+  `memstore/memstore.go:102:20` with both `CONDITIONALS_NEGATION` and
+  `CONDITIONALS_BOUNDARY`, of which the boundary one is killed in the
+  `memstore`-only run and by hand. Files: `testkit/clock_test.go`;
+  `testkit/history/history_test.go` (an `oneShotReader` helper, two new
+  tests, eight extended); `testkit/memstore/memstore_test.go`
+  (`TestNewDefaults`); `testkit/workload/workload_test.go`
+  (`recordingStore`, `recordingTx` and `recordingPgxTx` fakes,
+  `TestRegister_NodeID`). No suspected defect.
+
+  | File | Mutant | Killed by |
+  |---|---|---|
+  | `testkit/clock.go` | `95:7` | `TestFakeClock_Set` |
+  | `history/checkers.go` | `39:71`, `74:12`, `98:70`, `137:15` | `TestAppendListChecker_Boundaries` |
+  | `history/checkers.go` | `179:31`, `182:33`, `227:51`, `240:71` | `TestCheckStaleness_Boundaries` |
+  | `history/history.go` | `185:13` | `TestRecorder_OKFailAndExtra` |
+  | `history/history.go` | `298:30`, `298:40`, `298:45`, `302:7`, `318:64` | `TestJSONL_Errors` |
+  | `history/history.go` | `339:29` | `TestBoundedStaleness` |
+  | `history/logscan.go` | `57:13`, `58:28`, `60:25`, `63:11`, `63:24` | `TestLogScan` |
+  | `history/logscan.go` | `92:12`, `177:14` (`CONDITIONALS_NEGATION`) | `TestFencingFromLogs` |
+  | `history/porcupine.go` | `60:71` | `TestToPorcupine` |
+  | `history/porcupine.go` | `226:19`, `258:30`, `261:25` | `TestBankModel` |
+  | `history/values.go` | `110:39` | `TestValues` |
+  | `memstore/memstore.go` | `102:20` | `TestNewDefaults` |
+  | `workload/handlers.go` | `48:17`, `51:17` | `TestRegister_NodeID` (a recording `pgx.Tx` through a fake `pg.Store` under `pg.WithTx`) |
+
+  | Mutant | Mutator | Reason |
+  |---|---|---|
+  | `history/checkers.go:140:15` | `CONDITIONALS_BOUNDARY` | The branch only does `last = pos[0]`; when `pos[0] == last` the assignment is a no-op. |
+  | `history/logscan.go:43:21` | `ARITHMETIC_BASE` | The initial value of `last` is dead: `last` is only read when `first >= 0`, and every assignment of `first` also assigns `last`. |
+  | `history/logscan.go:43:21` | `INVERT_NEGATIVES` | The same reason. |
+  | `history/logscan.go:140:21` | `CONDITIONALS_BOUNDARY` | With zero records `timed` only gates a sort of an empty slice and the loop has nothing to check; both return nil. |
+  | `history/logscan.go:177:14` | `CONDITIONALS_BOUNDARY` | The branch only does `s.max = r.Token`; when equal the assignment is a no-op. |
+  | `invariants/checks.go:452:12` | `CONDITIONALS_BOUNDARY` | `capSeqs`: when `len(s) == maxDetails`, `s[:maxDetails]` is the same slice. |
+  | `invariants/invariants.go:218:14` | `CONDITIONALS_BOUNDARY` | `sortedIDs`: the same, `out[:maxDetails]` is identical to `out`. |
+  | `memstore/memstore.go:161:57` | `CONDITIONALS_BOUNDARY` | Outbox IDs are unique (`nextID++` under the store lock), so the sort comparator never sees equal IDs. |
+  | `memstore/streams.go:201:61` | `CONDITIONALS_BOUNDARY` | `Truncate` with `keep == len(entries)` reslices to itself. |
+
+* **The open one, `send.go:293:15`.** Decided a defect and fixed. `Publish`
+  installed the call's `publishOptions` in the context only when options
+  were passed (`if len(opts) > 0`), and the context that reaches an
+  in-process handler still carries the enclosing call's options, so a
+  nested `Publish` made from a handler without options inherited the outer
+  call's `Strategy` and `Headers` on every path that reads them (the
+  fan-out strategy, the fan-out headers, and the unregistered-durable
+  append). The docs on `PublishOption` and `Strategy` say an option
+  configures one call, and spec 4.4 says the strategy is "overridden per
+  call". The `CONDITIONALS_BOUNDARY` mutant (`>=`, install the call's own
+  option set unconditionally) is what the code should have said, minus its
+  cost: `context.WithValue` on every call would add two allocations to a
+  path that `BenchmarkPublish_InProcess` pins at 36 ns and 0 allocs, and
+  `task bench` gates sec/op at 10 percent. The fix keeps the `>` and adds a
+  second case: when the call passes no options and the context already
+  carries an option set, install the package-level zero set
+  (`noPublishOptions`: no strategy override, nil headers) instead, so the
+  mask costs one context frame and only in the nested case; a `Publish` on
+  a context without options still allocates nothing. `PublishAll` calls
+  `Publish` per event with the same options, so it is covered. Pinned by
+  `TestPublish_NestedCallDoesNotInheritOptions` (`publish_test.go`, three
+  subtests: strategy, headers, unregistered durable; each fails with the
+  masking case deleted) and `TestPublish_InProcessAllocations`
+  (`bench_test.go`, `testing.AllocsPerRun` budget 0 beside
+  `TestSend_CoreAllocations`; fails under the `>=` mutant with 2 allocs).
+  The allocation test boxes the event into `Notification` once outside the
+  measured closure: a struct captured by a closure is boxed on every call,
+  which is the caller's allocation, while the benchmark's constant literal
+  is folded to a static and shows none. The benchmark after the fix:
+  35.6 to 35.9 ns and 0 allocs over three runs, against a baseline of 35.7
+  to 36.3. No test anywhere in the module depended on the inherited
+  behaviour. This is the first source change of the whole triage.
+* **The full run after the triage.** `task mutate` once, alone on the
+  machine, with the patched gremlins of 8.13 first on `PATH`, the test
+  cache cleared, and the `Publish` fix in the tree: 12 minutes 36 seconds,
+  2167 killed, 70 lived, 67 timed out, 793 not covered, efficacy 96.87
+  percent (89.89 in 8.13), mutator coverage 73.83 percent, exit 0 against
+  the 95 gate. The 70 that lived are exactly the 70 equivalents of the
+  tables above: the full run prints positions relative to `./mediator`, so
+  `backoff.go:20:11` appears as `redisx/backoff.go:20:11`, and the fix
+  moved the two `send.go` equivalents down by 11 lines, to `342:14` and
+  `380:19`. The seventy-first, `behavior/behavior.go:205:18`, timed out
+  this time instead of living. No mutant in `send.go` lived. The 67
+  timeouts (57 in 8.13) by file: `behavior/behavior.go` 19,
+  `behavior/common.go` 9, `behavior/logging.go` 7, `pg/uow.go` 6,
+  `behavior/cachemodel/scheduler.go` 5, `httpapi/sse.go` 4, `pg/janitor.go`
+  3, `pg/relay.go` 3, `behavior/authorization.go` 2, `retry/retry.go` 2,
+  `testkit/memstore/locks.go` 2, and one each in `authz/authz.go`,
+  `behavior/retry.go`, `names.go`, `redisx/lease.go`,
+  `validate/schemagen.go`. Among them are `behavior/common.go:123:17`,
+  `behavior/logging.go:41:16`, `71:11` and `86:47`, which the tables above
+  record as kills in the per-package runs: under the full run's 24 workers
+  a kill can present as a timeout, which gremlins counts against neither
+  side, so it lowers the killed count and the figure is conservative. The
+  793 uncovered mutants are still the integration-only lines of 8.13. The
+  gate is raised from 80 to 95 in `taskMutate` (`tools/task/tasks.go`),
+  the assertion in `tools/task/app_test.go`, and the `nightly-mutate` job
+  name in `.github/workflows/ci.yml`; spec 11's 80 was "rising as the suite
+  matures". The log of the run is not in the repository.
+* **Facts for the next run.** `gremlins -E` matches paths relative to the
+  target directory, so `-E '^[a-z]+/'` restricts `./mediator` to the root
+  package. A per-package run needs `--timeout-coefficient 30`, because
+  the timeout is sized from a coverage run that takes under a second (the
+  sizing rule of 8.13). In Git Bash the gobin goes on `PATH` in its
+  `/c/...` form. Concurrent runs make kills show as TIMED OUT, which
+  gremlins does not count against efficacy, so run one package at a time.
+  On Windows gremlins cannot remove its temporary folder while a
+  `.test.exe` is still held, which prints an "Access is denied" line
+  after the summary; it is harmless. Two agents sharing one working tree
+  collided on `.git/index.lock`, which broke a `git checkout` restore of a
+  test file; the agent switched to restoring from backup copies and the
+  tree was re-checked clean.
