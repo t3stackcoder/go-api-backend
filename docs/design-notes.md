@@ -251,6 +251,7 @@ func WriteProblem(w http.ResponseWriter, r *http.Request, err error)
 | Timeout "applies `context.WithTimeout`" (5.6) | `behavior.deadlineCtx`: one allocation, observably equivalent, lazily backed by `context.WithDeadline` on the first `Done()` | G17: saves 4 allocations on the no-I/O path; children derived by pgx, go-redis, or errgroup still attach without a watcher goroutine (`TestDeadlineCtx_NoWatcherGoroutines`) |
 | Spec 6.2 table list | Migration `0002_partition_epoch.sql` adds `mediator_partition_epoch (consumer_group, topic, partition, epoch, updated_at)`, primary key `(consumer_group, topic, partition)` | Fencing at the effect (G14, 8.7): the lease store cannot close the window between Redis forgetting a lease key and the old owner's next renewal tick, so the consumer's token is checked in the transaction that applies the effect |
 | `pg.Tx` interface frozen | `FencePartition(ctx, group, topic, partition, token) (ok bool, err error)` added, fault point `pg.inbox.fence`; `Inbox()` calls it before `InboxInsert` whenever `mediator.FencingToken(ctx)` is present and returns `CodeConflict` wrapping `pg.ErrStaleLease` (not transient) when the token is below the stored epoch | The token has to be checked where the effect happens, which is Postgres (G14, 8.7); the upsert's row lock also serializes the two owners' transactions |
+| Spec 11.3: tiers 0 to 4 on every push, the long tiers nightly (11.6 and 14 count on nightly runs) | No cron schedule. Every push runs static, unit (with `-race` and the coverage gate), short fuzz, integration, and the openapi job, about ten minutes of wall clock; the fault sweep, 30-minute fuzz, mutation gate, benchmarks, and chaos matrix run only by manual dispatch of the workflow with `nightly=true` | The user's decision in the eighth and ninth sessions: with no front end there is nothing to soak every night, and the sweep's 40 to 75 minutes on every push is not worth waiting for. Every tier still runs locally (handoff section 4) and on demand; spec 14's two weeks of green nightlies is on hold until there is something to soak |
 
 ## 7. Decisions recorded by the package agents
 
@@ -1232,3 +1233,109 @@ where the report did.
   collided on `.git/index.lock`, which broke a `git checkout` restore of a
   test file; the agent switched to restoring from backup copies and the
   tree was re-checked clean.
+
+### 8.15 First CI run and its findings (ninth session)
+
+The eighth session pushed `b084ebb` to github.com/t3stackcoder/go-api-backend
+and the workflow ran for the first time (run 36318721586 on the Actions tab).
+The openapi job and tier 4 integration (testcontainers on a runner that had
+never seen the project) passed; three jobs failed; the fault sweep was
+cancelled after 34 minutes at the user's request, along with the two
+follow-up runs. The findings, all in test code or comments except one
+decoder line, were fixed in the ninth session and verified here with the
+same tools CI uses, since the local tree had been reset to `31504d4` and
+was fast-forwarded back to `9989273` first.
+
+* **Tier 0 static, golangci-lint v2.14.0 with `.golangci.yml`, three
+  findings.** `misspell`: `modelling` in the `Rollback` comment of
+  `pg/tx.go:80`, now `modeling` (the config's locale is US). staticcheck
+  QF1008 twice in `testkit/netfault/netfault.go` (`139`, `146`): `conn`
+  embeds `net.Conn` and overrides only `Read` and `Write`, so
+  `c.Conn.Close()` and `c.Conn.SetReadDeadline(...)` are `c.Close()` and
+  `c.SetReadDeadline(...)`. gofmt, vet, staticcheck, and govulncheck had
+  passed in the same job. Locally: golangci-lint v2.14.0 built from source
+  with Go 1.27 into a scratch `GOBIN` reports 0 issues; staticcheck 2026.2.1
+  reports nothing.
+* **Tier 1 unit under `-race`, four data races.** The race detector's first
+  run anywhere (this machine has no C compiler). Every one is a test
+  sharing a variable or a fake with a goroutine of the code under test,
+  and three of the four are in tests the seventh session's triage extended.
+  The fixes:
+  * `behavior` `TestCacheInvalidation_RetryRecovers`: `invalidationBubble`
+    handed out a `*bool` that the test flips between virtual sleeps while
+    the invalidation retry goroutine reads it through `Memory.Fail`. The
+    race detector does not treat synctest's durable blocking or a timer
+    firing in virtual time as synchronization, so the flag is now an
+    `atomic.Bool` (the same fix for the three sibling tests that use the
+    helper).
+  * `httpapi` `TestHealth/readyz with passing checks`: `runReadyChecks`
+    runs each check in its own goroutine and two checks did `calls++` on
+    one int. Now `atomic.Int32`.
+  * `pg` `TestSlot_RunLoop`: the test reassigned `sink.Hooks.Append` while
+    the slot goroutine was in its backoff timer, and `memstore.Streams`
+    reads its hooks without its lock. That is by design, a set-before-use
+    seam, and is now said in the `StreamHooks` doc; the test installs one
+    hook before the slot starts and switches the failure with an
+    `atomic.Bool`. The other hook assignments in tests either run with no
+    goroutine alive or precede a `Wake`, whose channel send is an edge.
+  * `redisx` `TestLeaseManager_RunLoop`: the test read
+    `store.calls["renew"]` without the fake's mutex while the manager's tick
+    wrote `calls["beat"]` under it. `fakeLeaseStore.count(op)` reads under
+    the lock.
+
+  Verification: `go test -race -shuffle=on -count=2 ./...`, the unit job's
+  exact command, in a `golang:1.27` Linux container (go1.27.1) with the
+  repository and the module cache bind-mounted: 24 packages `ok`, no
+  `DATA RACE`, 61 seconds end to end. The command is in handoff section 4;
+  it replaces "push and let CI check".
+* **Tier 2 short fuzz: one crasher in CI, a second one here, both in the
+  decoder.** `FuzzEnvelopeDecode` found in CI, after 29 seconds, an entry whose `at` field is
+  `0000-01-01T0:00:00+00:00`. `time.Parse` keeps a numeric offset as the
+  `Local` location when the offsets agree (the runner's local zone is UTC)
+  or as a `FixedZone` otherwise, never as `UTC` itself, while `EncodeEntry`
+  writes `OccurredAt.UTC()` and a `Z` suffix parses to the UTC location. So
+  the decoded envelope and its re-decoded twin were the same instant with
+  different `Location` pointers: `reflect.DeepEqual` false, `%+v` identical,
+  which is why the failure message showed two equal lines. `DecodeEntry` now
+  returns `t.UTC()`, matching the field's documented form ("RFC3339Nano",
+  written in UTC). Only an entry written by another producer with a non-`Z`
+  offset ever saw the difference; the framework's own entries always
+  carried `Z`. The crasher is committed as
+  `mediator/redisx/testdata/fuzz/FuzzEnvelopeDecode/5515dd0f123bbdbc`
+  (spec 11.3: any crash is a regression test) and failed on this machine
+  before the fix (local zone is not UTC, so the `FixedZone` path) and
+  passes after. With that fixed, a local `task fuzz -fuzztime 30s` found
+  the next one in 13 seconds: `at` = `0000-01-01T0:00:00+01:00`, which is
+  23:00 on the last day of year -1 once in UTC. RFC 3339 writes four-digit
+  years, so `EncodeEntry` produced `-0001-12-31T23:00:00Z` and the
+  re-decode failed with a parse error. That was already so before the
+  `.UTC()` change, since the encoder formatted in UTC all along, and it
+  happens at the other end too (`9999-12-31T23:59:59-01:00` is year 10000).
+  `DecodeEntry` now rejects an `at` whose UTC year is outside 0000 to 9999
+  with `ErrBadEntry`: the field is defined as RFC3339Nano, an instant the
+  format cannot carry is malformed like any other bad field, and the
+  consumer dead-letters it. Only garbage reaches that branch; the
+  framework's own entries carry a `Z` and a real year. Pinned by
+  `TestEntry_OccurredAtUTC` (the UTC location whatever the offset; years
+  0000 and 9999 decode and format back unchanged, which kills the boundary
+  mutants of the new check) and two `TestEntry_Garbage` rows; the second
+  crasher is committed beside the first as `.../20a0251787e92bfe`. The six
+  targets then ran 30 seconds each here without a finding. The two other
+  hashed files in the run's `fuzz-crashers`
+  artifact (`FuzzProblemJSON/d8889adbbe058a4f`,
+  `FuzzRequestDecode/8adde3e8e5de680f`) are committed corpus entries that
+  the artifact's `**/testdata/fuzz/**` glob swept up, not new crashers; the
+  other five targets passed.
+* **The fault sweep job moved to manual dispatch** (section 6). Spec 11.3
+  runs tier 3 on every push; the first run showed what that costs (the job
+  was at 34 minutes when it was cancelled, cap 75) and the user had asked,
+  in the same session, for the nightly schedule to go because there is
+  nothing to soak yet. The `sweep` job now carries the same
+  `workflow_dispatch && inputs.nightly` condition as the long tiers, so a
+  push runs static, unit, short fuzz, integration, and openapi, about ten
+  minutes. The dispatch input is still named `nightly` (its description
+  lists the fault sweep now) so the documented `nightly=true` keeps working.
+* **State of the two copies.** GitHub holds `9989273`; the local clone is
+  one commit ahead with these fixes and has no remote configured (the user
+  had it removed in the eighth session). Nothing was pushed in the ninth
+  session; the push command is in handoff section 3.

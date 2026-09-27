@@ -2,10 +2,11 @@
 # `go run ./tools/task <name>` entry points developers use locally, so the
 # commands are defined once in tools/task.
 #
-# Push and pull request: static, unit, fuzz-short, integration, sweep, openapi.
-# Manual dispatch with `nightly=true` only (there is no cron schedule): fuzz
-# for 30 min per target, mutation testing, benchmarks with the benchstat
-# gate, and the chaos matrix against the compose `chaos` profile.
+# Push and pull request: static, unit, fuzz-short, integration, openapi, the
+# jobs that finish in minutes.
+# Manual dispatch with `nightly=true` only (there is no cron schedule): the
+# fault sweep, fuzz for 30 min per target, mutation testing, benchmarks with
+# the benchstat gate, and the chaos matrix against the compose `chaos` profile.
 name: ci
 
 on:
@@ -15,7 +16,7 @@ on:
   workflow_dispatch:
     inputs:
       nightly:
-        description: "Also run the long tiers (fuzz 30m, mutate, bench, chaos matrix)"
+        description: "Also run the long tiers (fault sweep, fuzz 30m, mutate, bench, chaos matrix)"
         type: boolean
         default: false
 
@@ -139,6 +140,9 @@ jobs:
   # ---------------------------------------------------------------- tier 3
   sweep:
     name: tier 3 fault sweep
+    # On demand, like the other long tiers: the full matrix takes most of an
+    # hour, which is not worth waiting for on every push (design-notes 6).
+    if: github.event_name == 'workflow_dispatch' && inputs.nightly
     runs-on: ubuntu-latest
     timeout-minutes: 75
     steps:

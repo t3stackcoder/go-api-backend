@@ -77,7 +77,7 @@ func (t *pgTx) Commit(ctx context.Context) error {
 // not an error. An injected failure at pg.tx.rollback is what the caller
 // sees, but the transaction is still torn down underneath: when a real
 // ROLLBACK fails the connection is broken and pgxpool releases it, so the
-// pool never shrinks, and modelling the fault as an abandoned transaction
+// pool never shrinks, and modeling the fault as an abandoned transaction
 // would keep the connection checked out for good and starve a pool of one.
 func (t *pgTx) Rollback(ctx context.Context) error {
 	if err := testkit.Fault(ctx, "pg.tx.rollback"); err != nil {

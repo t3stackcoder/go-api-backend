@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -28,14 +29,14 @@ func TestHealth(t *testing.T) {
 		}
 	})
 	t.Run("readyz with passing checks", func(t *testing.T) {
-		calls := 0
-		ok := func(context.Context) error { calls++; return nil }
+		var calls atomic.Int32 // the checks run concurrently
+		ok := func(context.Context) error { calls.Add(1); return nil }
 		f := newFixture(t, httpapi.Config{ReadyChecks: []func(context.Context) error{ok, ok}})
 		if rec := f.do(t, "GET", "/readyz", ""); rec.Code != 200 {
 			t.Errorf("%d %s", rec.Code, rec.Body)
 		}
-		if calls != 2 {
-			t.Errorf("calls %d", calls)
+		if calls.Load() != 2 {
+			t.Errorf("calls %d", calls.Load())
 		}
 	})
 	t.Run("readyz lists failures", func(t *testing.T) {

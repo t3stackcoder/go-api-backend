@@ -5,139 +5,119 @@ contract), `docs/design-notes.md` (decisions, deviations, and the hardening
 and tier outcomes in sections 7 and 8), then this file. Keep this file
 current: update it in the same commit as the work it describes.
 
-Last updated 2026-09-27 at the end of the eighth session (the one that
-closed the mutation triage: the record in design-notes 8.14, the `Publish`
-fix, the full gate run, and the 95 percent gate).
+Last updated 2026-09-27 at the end of the ninth session (the one that
+fixed what the first CI run found, verified the fixes with the race detector
+in a container, and moved the fault sweep job to manual dispatch).
 
 ## 1. Where things stand
 
 Module `github.com/t3stackcoder/go-api-backend`, `go 1.27`. The branch is
-`main`, pushed to `origin` (github.com/t3stackcoder/go-api-backend, public)
-in the eighth session; CI (`.github/workflows/ci.yml`) ran for the first
-time on that push. The workflow has no cron schedule: the user removed it,
-because there is nothing substantial to soak nightly until there is a
-front end, so the long tiers (fuzz 30 m, mutation, bench, chaos matrix)
-run only by manual dispatch with `nightly=true`. The whole tree builds,
-vets, and is gofmt-clean under every build tag
-(`integration`, `faultinject`, `faultsweep`, `chaos`), and `go mod tidy` is
-a no-op.
+`main`. GitHub (github.com/t3stackcoder/go-api-backend, public) holds it at
+`9989273`, the eighth session's last push; the local clone is one commit
+ahead with the ninth session's fixes and has no remote configured (the user
+had it removed in the eighth session), so a push is
+`git push https://github.com/t3stackcoder/go-api-backend main`. CI
+(`.github/workflows/ci.yml`) has run once, on the eighth session's push; its
+findings are fixed in the local commit (design-notes 8.15) and the three
+runs of that day were cancelled. The workflow has no cron schedule, and the
+fault sweep runs, like the long tiers, only by manual dispatch with
+`nightly=true` (design-notes 6): a push runs static, unit, short fuzz,
+integration, and openapi, about ten minutes. The whole tree builds, vets,
+and is gofmt-clean under every build tag (`integration`, `faultinject`,
+`faultsweep`, `chaos`), `go mod tidy` is a no-op, golangci-lint v2.14.0
+with `.golangci.yml` and staticcheck report nothing, and
+`go test -race -shuffle=on -count=2 ./...` is green in a `golang:1.27`
+container (section 4).
 
 | Area | State |
 |---|---|
-| Core, behaviors, validate, pg, redisx, httpapi, openapi, ctl, otel, testkit | complete; `go test -count=1 -shuffle=on ./...` green in the 24 packages that have tests (31 in the module); lint at zero as of the fifth session (design-notes 5, 8.4) |
-| Example service and integration tier (`examples/orders`, `test/integration`) | complete and verified in the fifth session: shutdown drain, ack-after-commit, OpenAPI drift, readiness, end to end, Docker target `orders`, compose profile `orders` smoke-tested |
+| Core, behaviors, validate, pg, redisx, httpapi, openapi, ctl, otel, testkit | complete; `go test -count=1 -shuffle=on ./...` green in the 24 packages that have tests (31 in the module) and green under `-race -shuffle=on -count=2` in the container (ninth session); lint at zero with golangci-lint v2.14.0 and staticcheck (design-notes 8.15) |
+| Fuzz corpora (6 targets, `testdata/fuzz`) | two `FuzzEnvelopeDecode` crashers, one from CI and one from the local 30 s run that followed, both decoder defects on the `at` field: `DecodeEntry` now returns `OccurredAt` in UTC as `EncodeEntry` writes it and rejects an instant outside RFC 3339's years 0000 to 9999; both inputs are committed as corpus entries (design-notes 8.15); all six targets then passed 30 s each here |
+| Example service and integration tier (`examples/orders`, `test/integration`) | complete and verified in the fifth session: shutdown drain, ack-after-commit, OpenAPI drift, readiness, end to end, Docker target `orders`, compose profile `orders` smoke-tested; tier 4 and the openapi job also passed in CI |
 | Chaos tier (`test/chaos`, `cmd/chaosnode`) | complete; every workload green on the rebuilt image: `events` seeds 1 to 8 (fifth session, design-notes 8.8) and the other seven at seed 1 (sixth session, 8.12), 60 s runs |
 | M7 hardening | done: G17 met (5 allocs, 296 ns on this machine; 6 and 0.44 µs measured in the fifth), generic schema names, metrics single-sourced, retry rule, json/v2 tag grammar (design-notes 8.1 to 8.4) |
-| Fault sweep tier (`test/faultsweep`) | complete; 40 fault points; quick and full matrices green after the fifth session's fixes (design-notes 8.9); not re-run since (nothing under it changed) |
-| Coverage gate (`task cover`, integration and fault-injection tags) | green with the default 95 percent threshold everywhere but `pg/storetest` (80): `pg` 100, `testkit/invariants` 100, `testkit/workload` 100, `redisx` 95.8, `testkit/netfault` 100; 20 packages; `coverage/summary.md` is the record (design-notes 8.11) |
+| Fault sweep tier (`test/faultsweep`) | complete; 40 fault points; quick and full matrices green after the fifth session's fixes (design-notes 8.9); not re-run since (nothing under it changed); the CI job is manual dispatch only (design-notes 6) |
+| Coverage gate (`task cover`, integration and fault-injection tags) | green with the default 95 percent threshold everywhere but `pg/storetest` (80): `pg` 100, `testkit/invariants` 100, `testkit/workload` 100, `redisx` 95.8, `testkit/netfault` 100; 20 packages; `coverage/summary.md` is the record (design-notes 8.11); not re-run in the ninth session (its only production change, in `DecodeEntry`, has unit rows for the new branch) |
 | Benchmark baseline | recorded: `coverage/bench-baseline.txt` from `task bench` then `task bench-baseline` on a quiet machine; `task bench` gates against it at 10 percent (design-notes 8.12); `BenchmarkPublish_InProcess` re-measured at 35.6 to 35.9 ns and 0 allocs after the eighth session's fix |
-| Mutation gate (`task mutate`, gremlins, 95 percent efficacy) | green at the new 95 gate: efficacy 96.87 percent (2167 killed, 70 lived and all equivalent, 67 timed out, 793 on integration-only lines), 12.6 minutes with the patched gremlins after the `Publish` fix (design-notes 8.14) |
+| Mutation gate (`task mutate`, gremlins, 95 percent efficacy) | green at the 95 gate: efficacy 96.87 percent (2167 killed, 70 lived and all equivalent, 67 timed out, 793 on integration-only lines), 12.6 minutes with the patched gremlins after the `Publish` fix (design-notes 8.14) |
 
 Verified complete against the spec before the sixth session: all 7 property
 tests, 6 fuzz targets, 16 CLI commands, 20 metrics, every Makefile target,
 Defects A to D of the chaos rounds (design-notes 8.5, 8.7, 8.8).
 
-## 2. What the seventh and eighth sessions did
+## 2. What the eighth and ninth sessions did
 
-* **Mutation survivors triaged** (seventh session, item 1 of the sixth
-  handoff): all 227 survivors of design-notes 8.13, plus three more
-  outside its list that the per-package runs exposed, went through
-  gremlins one package at a time: 156 killed by new unit-test rows in the
-  mutant's own package (36 test files, no source file changed), 70
-  recorded as equivalent with a one-sentence reason each, one left open.
-  Every kill was verified by applying the mutation by hand and watching
-  the named test fail. The per-mutant record (test name per kill, reason
-  per equivalent, timeouts seen, per-package efficacy) is design-notes
-  8.14; the scratch reports it came from were in a session temp directory
-  and are no longer needed.
-* **The open survivor fixed** (eighth session): `send.go:293:15` was a
-  defect. `Publish` installed the call's options in the context only when
-  options were passed, so a nested `Publish` made from an in-process
-  handler without options inherited the enclosing call's `Strategy` and
-  `Headers`, against the documented "one call" semantics. The fix masks
-  inherited options with a package-level zero set when the nested call
-  passes none, so the common path still allocates nothing (design-notes
-  8.14). Pinned by `TestPublish_NestedCallDoesNotInheritOptions`
-  (`mediator/publish_test.go`) and `TestPublish_InProcessAllocations`
-  (`mediator/bench_test.go`); `BenchmarkPublish_InProcess` unchanged at
-  0 allocs. The only source change of the triage.
-* **Full gate run** (eighth session): `task mutate` once, alone, with the
-  patched gremlins first on `PATH` and the `Publish` fix in the tree: 12
-  minutes 36 seconds, 2167 killed, 70 lived, 67 timed out, 793 not
-  covered, efficacy 96.87 percent (89.89 in 8.13), exit 0 against the 95
-  gate. The 70 that lived are the 70 equivalents of 8.14 (the run prints
-  positions relative to `./mediator`, and the fix moved the two `send.go`
-  equivalents down by 11 lines to `342:14` and `380:19`); the
-  seventy-first timed out. Four `behavior` kills of 8.14 showed as
-  timeouts under the full run's load; a timeout counts against neither
-  side, so the figure is conservative.
-* **Gate raised to 95** (eighth session): `--threshold-efficacy` in
-  `taskMutate` (`tools/task/tasks.go`), the assertion in
-  `tools/task/app_test.go`, and the `nightly-mutate` job name in
-  `.github/workflows/ci.yml`. spec 11 still says "80 percent, rising as the
-  suite matures", which this is.
-* Docs: design-notes 8.14 added; this file rewritten. Committed and
-  pushed at the user's request, then the cron schedule removed and the
-  first CI run's findings recorded (section 3 item 1) in two more commits.
+* **Mutation triage closed** (eighth session). Design-notes 8.14 holds the
+  per-mutant record of the seventh session's triage (156 killed by new unit
+  rows in 36 test files, 70 equivalent with a reason each). The one open
+  survivor, `send.go:293:15`, was a defect: a nested `Publish` made from an
+  in-process handler without options inherited the enclosing call's
+  `Strategy` and `Headers`. The fix masks inherited options with a
+  package-level zero set when the nested call passes none, so the common
+  path still allocates nothing; pinned by
+  `TestPublish_NestedCallDoesNotInheritOptions` (`mediator/publish_test.go`)
+  and `TestPublish_InProcessAllocations` (`mediator/bench_test.go`),
+  `BenchmarkPublish_InProcess` unchanged at 0 allocs. The full gate then ran
+  once, alone, with the patched gremlins: 2167 killed, 70 lived (the 70
+  equivalents), 67 timed out, 793 not covered, efficacy 96.87 percent, and
+  `--threshold-efficacy` rose from 80 to 95 in `tools/task/tasks.go`, its
+  assertion in `tools/task/app_test.go`, and the `nightly-mutate` job name.
+* **Pushed, and the first CI run** (eighth session). Committed and pushed at
+  the user's request; the nightly cron removed at the user's request in a
+  second commit; the run's findings recorded in a third. Then, at the
+  user's request, the local `main` was reset to `31504d4`, the `origin`
+  remote removed, and the three CI runs cancelled.
+* **The first CI run's findings fixed** (ninth session, design-notes 8.15).
+  The local tree was fast-forwarded back to `9989273` by a fetch from the
+  URL (still no remote), then the seven findings were fixed without touching
+  the framework's behaviour except one decoder line:
+  * tier 0: `modelling` in a comment of `mediator/pg/tx.go`; two staticcheck
+    QF1008 hints in `mediator/testkit/netfault/netfault.go`, where
+    `c.Conn.Close()` and `c.Conn.SetReadDeadline(...)` lose the `Conn`.
+  * tier 1, four data races, each a test sharing state with a goroutine of
+    the code under test: `behavior` (`invalidationBubble`'s failing flag is
+    an `atomic.Bool`), `httpapi` (`TestHealth` counts the concurrent
+    readiness checks with an `atomic.Int32`), `pg` (`TestSlot_RunLoop`
+    installs its `Hooks.Append` before the slot starts and switches the
+    failure with an atomic; `memstore.StreamHooks` now documents that hooks
+    are read without locking), `redisx` (`fakeLeaseStore.count(op)` reads
+    the call counters under the fake's lock).
+  * tier 2: `DecodeEntry` (`mediator/redisx/streams.go`) returns
+    `OccurredAt` in UTC, matching `EncodeEntry`, and rejects an `at` whose
+    UTC year RFC 3339 cannot write (a second crasher the local fuzz run
+    found once the first was fixed); both inputs are committed under
+    `mediator/redisx/testdata/fuzz/FuzzEnvelopeDecode/`, pinned by
+    `TestEntry_OccurredAtUTC` and two `TestEntry_Garbage` rows.
+  Verified with the tools CI uses: `go test -race -shuffle=on -count=2
+  ./...` in a `golang:1.27` container (24 packages ok, 61 seconds),
+  golangci-lint v2.14.0 built from source (0 issues), staticcheck, gofmt,
+  `go vet` under every tag, `go mod tidy -diff`, the full suite here, and
+  `task fuzz -fuzztime 30s` over the six targets.
+* **Fault sweep job moved to manual dispatch** (ninth session). The `sweep`
+  job in `.github/workflows/ci.yml` carries the long tiers' condition
+  (`workflow_dispatch` with `nightly=true`); recorded as a deviation from
+  spec 11.3 in design-notes 6 with the reason (the user's cost decision).
+  The dispatch input keeps the name `nightly`.
+* Docs: design-notes 6 row and 8.15 added; this file rewritten.
 
 ## 3. What is left, in order
 
 Against spec 14's definition of done for v1.0: every milestone's
-deliverables exist, every tier is green locally, and the mutation triage is
-closed. What remains is the acceptance tail that needs a remote or calendar
-time.
+deliverables exist, every tier is green locally, the mutation triage is
+closed, and the first CI run's findings are fixed. What remains needs the
+user's decision or calendar time.
 
-1. **Fix what the first CI run found.** The first push run (the eighth
-   session, run 36318721586 on the Actions tab) exercised tiers 0 to 4 and
-   the openapi job for the first time. openapi and tier 4 integration
-   passed; the fault sweep was still running when this was written; three
-   jobs failed, none of it caused by that session's changes:
-   * **Tier 0 static (golangci-lint), three findings.** A comment
-     misspelling, `modelling`, at `mediator/pg/tx.go:80` (misspell); two
-     staticcheck QF1008 hints, "could remove embedded field `Conn` from
-     selector", at `mediator/testkit/netfault/netfault.go:139` and `:146`.
-     staticcheck, govulncheck, gofmt and vet passed.
-   * **Tier 1 unit under `-race`, four data races**, the race detector's
-     first run anywhere (no C compiler on this machine). Every frame pair
-     is a test fake shared between goroutines without a mutex; three of
-     the four tests were extended by the seventh session's triage. In
-     `behavior`, `TestCacheInvalidation_RetryRecovers`: a write at
-     `cache_invalidation_test.go:158` (the test's metrics recorder, under
-     `metrics.go:91`) against a read at `:115` from the invalidation
-     goroutine (`cache_invalidation.go:177`, through
-     `cachemodel/memory.go:72`). In `httpapi`,
-     `TestHealth/readyz_with_passing_checks`: two health checks started at
-     `httpapi.go:236` both write the test's variable at
-     `health_test.go:32`. In `pg`, `TestSlot_RunLoop`: the test writes at
-     `relay_test.go:482` while the slot loop (`relay.go:344`, `:431`) reads
-     the memstore stream at `testkit/memstore/streams.go:85`; the only one
-     with a production file on the read side, so check whether
-     `memstore` takes its lock on that path before blaming the test. In
-     `redisx`, `TestLeaseManager_RunLoop`: the lease manager (`lease.go:298`,
-     `:320`) writes into the test's fake at `lease_test.go:119` while the
-     test goroutine started at `lease_test.go:580` reads it. The full
-     reports are in the job log; the fix is a mutex (or an atomic) in each
-     fake. `go test -race` cannot run here; push and let CI check.
-   * **Tier 2 short fuzz, one failure.** `FuzzEnvelopeDecode` in
-     `mediator/redisx` (`fuzz_test.go:36`, "round trip changed the entry")
-     on a 325-byte input that the fuzzer minimised and wrote to
-     `testdata/fuzz/FuzzEnvelopeDecode/5515dd0f123bbdbc` on the runner; it
-     is in the `fuzz-crashers` artifact of that run, not in the
-     repository. The printed `got` and `want` are identical, so the
-     difference is one `%v` hides and `reflect.DeepEqual` sees: most
-     likely a nil `Headers` map on one side and an empty one on the other
-     (design-notes 5 lists json/v2's `{}` behaviour), possibly a
-     `time.Time` location. Download the artifact, put the file under
-     `mediator/redisx/testdata/fuzz/FuzzEnvelopeDecode/`, run
-     `go test -run=FuzzEnvelopeDecode/5515dd0f123bbdbc ./mediator/redisx`,
-     and either fix the decoder or make the comparison canonical; the
-     corpus entry is then committed as a regression test (spec 11.3).
-   The other five short fuzz targets passed. The long tiers have not run
-   in CI. When the `mutate` job is dispatched it runs on Linux, where the
-   gremlins path bug of design-notes 8.13 does not apply, and gates at 95;
-   a slower runner may turn kills into timeouts and lower the killed count
-   that efficacy is computed from, so if it fails narrowly, compare its
-   LIVED list with 8.14 before touching the gate.
+1. **Push, when the user wants it.** The local commit carries everything;
+   `git push https://github.com/t3stackcoder/go-api-backend main` (or
+   `git remote add origin https://github.com/t3stackcoder/go-api-backend`
+   first) fast-forwards GitHub. A push starts the five short jobs only
+   (static, unit with `-race` and the coverage gate, short fuzz,
+   integration, openapi), about ten minutes of wall clock; nothing long
+   starts without a manual dispatch. Each failed job was re-run here with
+   the same tool and command. The one step not repeated locally is the
+   coverage gate inside the unit job (`task cover`, four minutes with
+   Docker); the only production change is in `DecodeEntry`'s handling of
+   the `at` field, and its new branch has unit rows.
 2. **Chaos at spec scale.** The matrix is 5 minutes per cell over seeds 1
    to 3 (`task chaos-matrix`, `CHAOS_DURATION`; 20 minutes per cell in the
    CI job); every cell has passed at 60 s. spec 14 wants two weeks of
@@ -145,12 +125,16 @@ time.
    is on demand until there is something substantial to soak. Soak mode
    (`-soak`) exists and has not been exercised.
 3. **Commit** only when the user asks, with the attribution line the session
-   specifies.
+   specifies. The ninth session is committed; the tree was clean at the end
+   of it.
 
 ## 4. How to run each tier here
 
 ```sh
-go run ./tools/task test                     # tiers 0-2 (no -race locally)
+go run ./tools/task test                     # tiers 0-2 (no -race natively)
+MSYS_NO_PATHCONV=1 docker run --rm -v "C:/Projects/go-api-backend:/src" -v "C:/Users/dwhit/go/pkg/mod:/go/pkg/mod" -w /src -e GOFLAGS=-buildvcs=false golang:1.27 go test -race -shuffle=on -count=2 ./...   # tier 1 as CI runs it; one minute alone, three beside a fuzz run
+<scratch GOBIN>/golangci-lint run --timeout=10m   # tier 0 lint as CI runs it; v2.14.0 built from source (section 5)
+go run ./tools/task fuzz -fuzztime 30s       # tier 2 as CI runs it; six targets, about four minutes
 go run ./tools/task test-integration         # tier 4, testcontainers
 SWEEP_QUICK=1 go test -tags faultsweep,faultinject -count=1 -timeout 60m -v ./test/faultsweep/...
 go run ./tools/task test-sweep               # tier 3, full matrix
@@ -193,12 +177,27 @@ part-way wastes the run.
   `go run ./tools/task <name>`); Docker Desktop 29.1 with Linux containers
   and Compose v2.40 (it may not be running when a session starts: start
   `Docker Desktop.exe` and wait for the engine, about a minute); Node 24
-  with npx; benchstat installed; staticcheck and golangci-lint not
-  installed (the user's golangci-lint is a Go 1.26 build and refuses the
-  module; install v2.14.0 from source with Go 1.27 into a scratch `GOBIN`);
-  gremlins v0.6.0 installs and runs, with the path caveat of section 2.
-* No C compiler: `-race` cannot run locally; CI runs it. Use
-  `go test -count=2 -shuffle=on` locally.
+  with npx; benchstat installed; the user's golangci-lint on `PATH` is a Go
+  1.26 build and refuses the module, so build v2.14.0 from source with Go
+  1.27 into a scratch `GOBIN` (`GOBIN=<dir> go install
+  github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0`, about
+  two minutes; likewise `honnef.co/go/tools/cmd/staticcheck@latest`), as the
+  ninth session did; gremlins v0.6.0 installs and runs, with the path
+  caveat of design-notes 8.13.
+* No C compiler: `-race` cannot run natively. It runs in a `golang:1.27`
+  Linux container with the repository and the module cache bind-mounted
+  (section 4): the whole suite at `-count=2` takes a minute on an idle
+  machine (three beside a fuzz run), and
+  `MSYS_NO_PATHCONV=1` keeps Git Bash from rewriting the container paths.
+  The race detector does not treat synctest's durable blocking or a timer
+  firing in virtual time as synchronization: a flag a test flips between
+  `time.Sleep`s and a goroutine reads after its timer fires is a data race,
+  and the fix is an atomic (design-notes 8.15).
+* `time.Parse` keeps a numeric offset as `Local` (when the offsets agree)
+  or as a `FixedZone`, never as `UTC` itself, while a `Z` suffix parses to
+  UTC; a `time.Time` that goes through RFC 3339 and back compares equal
+  under `reflect.DeepEqual` only after `.UTC()` on both sides (design-notes
+  8.15).
 * go-redis is v9.22.0 with `ContextTimeoutEnabled`: a command runs
   synchronously on its connection and only the socket deadline comes from
   the context, so cancelling the context of a blocking `XREADGROUP` does not

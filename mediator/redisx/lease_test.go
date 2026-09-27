@@ -158,6 +158,14 @@ func (s *fakeLeaseStore) held() int {
 	return len(s.leases)
 }
 
+// count returns how many times op has been called, under the lock: the
+// manager goroutine increments the counters while a test reads them.
+func (s *fakeLeaseStore) count(op string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls[op]
+}
+
 // forget drops every lease key, as FLUSHALL or a restore from an older
 // snapshot does; the owners learn at their next renewal.
 func (s *fakeLeaseStore) forget() {
@@ -585,11 +593,11 @@ func TestLeaseManager_RunLoop(t *testing.T) {
 		if len(a.snapshot()) != 2 {
 			t.Fatal("run did not tick immediately")
 		}
-		renews := store.calls["renew"]
+		renews := store.count("renew")
 		time.Sleep(testRenew)
 		synctest.Wait()
-		if store.calls["renew"] != renews+2 {
-			t.Fatalf("renew calls %d", store.calls["renew"])
+		if store.count("renew") != renews+2 {
+			t.Fatalf("renew calls %d", store.count("renew"))
 		}
 		cancel()
 		<-done

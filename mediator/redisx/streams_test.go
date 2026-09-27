@@ -99,25 +99,47 @@ func TestEntry_Defaults(t *testing.T) {
 	}
 }
 
+// TestEntry_OccurredAtUTC pins what the fuzzer found missing (design-notes
+// 8.15): a decoded OccurredAt is in UTC whatever offset was written, and the
+// first and last years RFC 3339 can write decode and format back unchanged.
+// The instants outside that range are TestEntry_Garbage rows.
+func TestEntry_OccurredAtUTC(t *testing.T) {
+	decodeAt := func(at string) (time.Time, error) {
+		env, _, _, err := DecodeEntry(map[string]any{FieldID: uuid.NewString(), FieldType: "E", FieldKey: "k", FieldSeq: "1", FieldAt: at})
+		return env.OccurredAt, err
+	}
+	got, err := decodeAt("2026-09-26T14:00:00.5+02:00")
+	if err != nil || got.Location() != time.UTC || !got.Equal(time.Date(2026, 9, 26, 12, 0, 0, 500000000, time.UTC)) {
+		t.Fatalf("offset input: %v in %v, %v", got, got.Location(), err)
+	}
+	for _, at := range []string{"0000-01-01T00:00:00Z", "9999-12-31T23:59:59.999999999Z"} {
+		if got, err = decodeAt(at); err != nil || got.Format(time.RFC3339Nano) != at {
+			t.Fatalf("%s: decoded %v, %v", at, got, err)
+		}
+	}
+}
+
 func TestEntry_Garbage(t *testing.T) {
 	base := func() map[string]any {
 		return map[string]any{FieldID: uuid.NewString(), FieldType: "E", FieldKey: "k", FieldSeq: "1"}
 	}
 	cases := map[string]func(map[string]any){
-		"nil fields":       nil,
-		"missing id":       func(m map[string]any) { delete(m, FieldID) },
-		"bad uuid":         func(m map[string]any) { m[FieldID] = "nope" },
-		"missing type":     func(m map[string]any) { m[FieldType] = "" },
-		"missing key":      func(m map[string]any) { delete(m, FieldKey) },
-		"missing seq":      func(m map[string]any) { delete(m, FieldSeq) },
-		"bad seq":          func(m map[string]any) { m[FieldSeq] = "x" },
-		"bad partition":    func(m map[string]any) { m[FieldPartition] = "-1" },
-		"bad partition2":   func(m map[string]any) { m[FieldPartition] = "p" },
-		"bad at":           func(m map[string]any) { m[FieldAt] = "yesterday" },
-		"bad schema":       func(m map[string]any) { m[FieldSchema] = "v2" },
-		"bad headers":      func(m map[string]any) { m[FieldHeaders] = "[1]" },
-		"bad headers json": func(m map[string]any) { m[FieldHeaders] = "{" },
-		"bad outbox":       func(m map[string]any) { m[FieldOutboxID] = "1.5" },
+		"nil fields":        nil,
+		"missing id":        func(m map[string]any) { delete(m, FieldID) },
+		"bad uuid":          func(m map[string]any) { m[FieldID] = "nope" },
+		"missing type":      func(m map[string]any) { m[FieldType] = "" },
+		"missing key":       func(m map[string]any) { delete(m, FieldKey) },
+		"missing seq":       func(m map[string]any) { delete(m, FieldSeq) },
+		"bad seq":           func(m map[string]any) { m[FieldSeq] = "x" },
+		"bad partition":     func(m map[string]any) { m[FieldPartition] = "-1" },
+		"bad partition2":    func(m map[string]any) { m[FieldPartition] = "p" },
+		"bad at":            func(m map[string]any) { m[FieldAt] = "yesterday" },
+		"at before year 0":  func(m map[string]any) { m[FieldAt] = "0000-01-01T00:00:00+01:00" },
+		"at past year 9999": func(m map[string]any) { m[FieldAt] = "9999-12-31T23:59:59-01:00" },
+		"bad schema":        func(m map[string]any) { m[FieldSchema] = "v2" },
+		"bad headers":       func(m map[string]any) { m[FieldHeaders] = "[1]" },
+		"bad headers json":  func(m map[string]any) { m[FieldHeaders] = "{" },
+		"bad outbox":        func(m map[string]any) { m[FieldOutboxID] = "1.5" },
 	}
 	for name, mutate := range cases {
 		var m map[string]any

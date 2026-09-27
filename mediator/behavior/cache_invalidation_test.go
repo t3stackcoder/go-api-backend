@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -104,15 +105,15 @@ type bubbleClock struct{}
 func (bubbleClock) Now() time.Time { return time.Now() }
 
 // invalidationBubble builds a standard set over memstore inside a synctest
-// bubble with a backend whose bumps fail while *failing is set. With
+// bubble with a backend whose bumps fail while failing is set. With
 // bubbleClock the retries sleep on virtual time; with a testkit.FakeClock
 // they sleep on its timers and run when Advance fires them.
-func invalidationBubble(t *testing.T, ttl time.Duration, clock mediator.Clock) (*mediator.Mediator, *cachemodel.Memory, *logSink, *bool, io.Closer) {
+func invalidationBubble(t *testing.T, ttl time.Duration, clock mediator.Clock) (*mediator.Mediator, *cachemodel.Memory, *logSink, *atomic.Bool, io.Closer) {
 	t.Helper()
 	backend := cachemodel.NewMemory()
-	failing := new(bool)
+	failing := new(atomic.Bool)
 	backend.Fail = func(op string) error {
-		if *failing && strings.HasPrefix(op, "bump.") {
+		if failing.Load() && strings.HasPrefix(op, "bump.") {
 			return errors.New("redis down")
 		}
 		return nil
@@ -138,7 +139,7 @@ func TestCacheInvalidation_RetryRecovers(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		m, backend, sink, failing, closer := invalidationBubble(t, time.Minute, bubbleClock{})
 		defer closer.Close()
-		*failing = true
+		failing.Store(true)
 		if _, err := mediator.Send(admin(context.Background()), m, richCmd{ID: "a", Tags: []string{"t1", "t2"}}); err != nil {
 			t.Fatalf("a failed bump never fails the command: %v", err)
 		}
@@ -155,7 +156,7 @@ func TestCacheInvalidation_RetryRecovers(t *testing.T) {
 		if backend.Version("t1") != 0 {
 			t.Fatal("retry must not have succeeded while down")
 		}
-		*failing = false
+		failing.Store(false)
 		time.Sleep(250 * time.Millisecond)
 		synctest.Wait()
 		if backend.Version("t1") != 2 || backend.Version("t2") != 2 {
@@ -183,7 +184,7 @@ func TestCacheInvalidation_GivesUpAfterTTL(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		m, backend, sink, failing, closer := invalidationBubble(t, 3*time.Second, bubbleClock{})
 		defer closer.Close()
-		*failing = true
+		failing.Store(true)
 		if _, err := mediator.Send(admin(context.Background()), m, richCmd{ID: "a", Tags: []string{"t"}}); err != nil {
 			t.Fatal(err)
 		}
@@ -199,7 +200,7 @@ func TestCacheInvalidation_GivesUpAfterTTL(t *testing.T) {
 		if attempts < 3 {
 			t.Fatalf("expected several attempts within the window, got %d", attempts)
 		}
-		*failing = false
+		failing.Store(false)
 		time.Sleep(time.Minute)
 		synctest.Wait()
 		if backend.Ops(cachemodel.OpBumpPre) != attempts {
@@ -211,7 +212,7 @@ func TestCacheInvalidation_GivesUpAfterTTL(t *testing.T) {
 func TestCacheInvalidation_Close(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		m, backend, _, failing, closer := invalidationBubble(t, time.Hour, bubbleClock{})
-		*failing = true
+		failing.Store(true)
 		if _, err := mediator.Send(admin(context.Background()), m, richCmd{ID: "a", Tags: []string{"t"}}); err != nil {
 			t.Fatal(err)
 		}
@@ -219,14 +220,14 @@ func TestCacheInvalidation_Close(t *testing.T) {
 		if err := closer.Close(); err != nil {
 			t.Fatal(err)
 		}
-		*failing = false
+		failing.Store(false)
 		time.Sleep(time.Hour)
 		synctest.Wait()
 		if backend.Ops(cachemodel.OpBumpPre) != attempts || backend.Version("t") != 0 {
 			t.Fatal("no retry may run after Close")
 		}
 		// A failure after Close schedules nothing.
-		*failing = true
+		failing.Store(true)
 		if _, err := mediator.Send(admin(context.Background()), m, richCmd{ID: "b", Tags: []string{"t"}}); err != nil {
 			t.Fatal(err)
 		}
@@ -248,7 +249,7 @@ func TestCacheInvalidation_RetryAttemptsAreNumbered(t *testing.T) {
 		clock := testkit.NewFakeClock(time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC))
 		m, backend, sink, failing, closer := invalidationBubble(t, time.Hour, clock)
 		defer closer.Close()
-		*failing = true
+		failing.Store(true)
 		if _, err := mediator.Send(admin(context.Background()), m, richCmd{ID: "a", Tags: []string{"t"}}); err != nil {
 			t.Fatal(err)
 		}
@@ -270,7 +271,7 @@ func TestCacheInvalidation_RetryAttemptsAreNumbered(t *testing.T) {
 			t.Fatalf("retry warning %v", warns)
 		}
 		// The second retry (200 ms of backoff) succeeds: attempt 3.
-		*failing = false
+		failing.Store(false)
 		clock.Advance(time.Second)
 		synctest.Wait()
 		if backend.Version("t") != 2 {

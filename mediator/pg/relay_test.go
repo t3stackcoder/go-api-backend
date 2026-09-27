@@ -441,6 +441,16 @@ func TestSlot_RunLoop(t *testing.T) {
 		store := &fakeSlotStore{}
 		store.add(1)
 		sink := memstore.NewStreams(nil)
+		// Streams reads its hooks without locking, so the hook is installed
+		// before the slot starts and the failure is switched by an atomic
+		// instead of by reassigning the hook while the slot runs.
+		var redisDown atomic.Bool
+		sink.Hooks.Append = func(string, int, []pg.OutboxEntry) error {
+			if redisDown.Load() {
+				return errors.New("redis down")
+			}
+			return nil
+		}
 		cfg := pg.RelayConfig{BatchSize: 10, PollInterval: time.Second, MinBackoff: 100 * time.Millisecond}
 		s := newSlot(store, sink, cfg)
 		ctx, cancel := context.WithCancel(context.Background())
@@ -472,14 +482,14 @@ func TestSlot_RunLoop(t *testing.T) {
 			t.Fatal("poll did not relay")
 		}
 
-		sink.Hooks.Append = func(string, int, []pg.OutboxEntry) error { return errors.New("redis down") }
+		redisDown.Store(true)
 		store.add(4)
 		s.Wake()
 		synctest.Wait()
 		if s.Errors() != 1 || s.Stats().LastError == "" {
 			t.Fatalf("failure not recorded: errors=%d stats=%+v", s.Errors(), s.Stats())
 		}
-		sink.Hooks.Append = nil
+		redisDown.Store(false)
 		time.Sleep(cfg.MinBackoff + time.Millisecond)
 		synctest.Wait()
 		if len(sink.Entries("t", 0)) != 4 || s.Stats().LastError != "" {

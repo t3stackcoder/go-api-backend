@@ -19,7 +19,10 @@ type StreamEntry struct {
 	Entry pg.OutboxEntry
 }
 
-// StreamHooks inject failures into Streams.
+// StreamHooks inject failures into Streams. The hooks are read without
+// locking: install them before the Streams is shared with another goroutine
+// (a running relay slot) and switch a failure on and off inside the hook, with
+// an atomic, rather than by reassigning the hook while that goroutine runs.
 type StreamHooks struct {
 	// Append runs before an append; an error fails it without adding anything.
 	Append func(topic string, partition int, entries []pg.OutboxEntry) error

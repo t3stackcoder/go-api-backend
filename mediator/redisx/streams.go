@@ -147,6 +147,16 @@ func DecodeEntry(fields map[string]any) (env mediator.Envelope, payload []byte, 
 		if perr != nil {
 			return env, nil, 0, fmt.Errorf("%w: %s: %v", ErrBadEntry, FieldAt, perr)
 		}
+		// The field is written in UTC (EncodeEntry) and is read back in UTC:
+		// time.Parse keeps the offset it saw as a fixed or local Location, so
+		// a "+00:00" from another producer would otherwise decode to the same
+		// instant with a different Location and not round-trip. An offset
+		// that carries the instant outside years 0000 to 9999 in UTC cannot
+		// be written back in RFC 3339 and is malformed like any other bad field.
+		t = t.UTC()
+		if y := t.Year(); y < 0 || y > 9999 {
+			return env, nil, 0, fmt.Errorf("%w: %s: year %d is outside RFC 3339", ErrBadEntry, FieldAt, y)
+		}
 		env.OccurredAt = t
 	}
 	env.CorrelationID, _ = str(FieldCorr)

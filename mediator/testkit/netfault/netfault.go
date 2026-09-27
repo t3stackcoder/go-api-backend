@@ -136,14 +136,14 @@ func (c *conn) Write(b []byte) (int, error) {
 	}
 	if !after {
 		c.dropped.Store(true)
-		_ = c.Conn.Close()
+		_ = c.Close()
 		return 0, ErrDropped
 	}
 	// Mark the drop and wake any blocked reader before the bytes go out, so
 	// no reply can be observed: it does not exist yet, and every read from
 	// now on fails without touching the connection.
 	c.dropped.Store(true)
-	_ = c.Conn.SetReadDeadline(time.Now())
+	_ = c.SetReadDeadline(time.Now())
 	return c.Conn.Write(b)
 }
 
