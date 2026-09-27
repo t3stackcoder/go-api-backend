@@ -32,7 +32,7 @@ const (
 	installBenchstat   = "go install golang.org/x/perf/cmd/benchstat@latest"
 )
 
-// chaosWorkloads is the nightly matrix of spec 11.6.
+// chaosWorkloads is the full chaos matrix of spec 11.6.
 var chaosWorkloads = []string{
 	"register", "register-cached", "bank", "bank-idempotent",
 	"idempotent-append", "events", "cache-staleness", "remote-send",

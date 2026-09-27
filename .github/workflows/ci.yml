@@ -6,7 +6,7 @@
 # request trigger (design-notes 6). The workflow runs only when dispatched by
 # hand from the Actions tab. Every dispatch runs static, unit, fuzz-short,
 # integration, and openapi, the jobs that finish in minutes; ticking
-# `nightly=true` adds the fault sweep, fuzz for 30 min per target, mutation
+# `long=true` adds the fault sweep, fuzz for 30 min per target, mutation
 # testing, benchmarks with the benchstat gate, and the chaos matrix against
 # the compose `chaos` profile.
 name: ci
@@ -14,7 +14,7 @@ name: ci
 on:
   workflow_dispatch:
     inputs:
-      nightly:
+      long:
         description: "Also run the long tiers (fault sweep, fuzz 30m, mutate, bench, chaos matrix)"
         type: boolean
         default: false
@@ -141,7 +141,7 @@ jobs:
     name: tier 3 fault sweep
     # On demand, like the other long tiers: the full matrix takes most of an
     # hour, which is not worth waiting for on every push (design-notes 6).
-    if: github.event_name == 'workflow_dispatch' && inputs.nightly
+    if: github.event_name == 'workflow_dispatch' && inputs.long
     runs-on: ubuntu-latest
     timeout-minutes: 75
     steps:
@@ -185,9 +185,9 @@ jobs:
           '
 
   # ------------------------------------------- long tiers, manual dispatch only
-  nightly-fuzz:
+  long-fuzz:
     name: long fuzz (30m per target)
-    if: github.event_name == 'workflow_dispatch' && inputs.nightly
+    if: github.event_name == 'workflow_dispatch' && inputs.long
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
@@ -202,13 +202,13 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: nightly-fuzz-crashers
+          name: long-fuzz-crashers
           path: "**/testdata/fuzz/**"
           if-no-files-found: ignore
 
-  nightly-mutate:
+  long-mutate:
     name: mutation testing (gremlins, efficacy >= 95)
-    if: github.event_name == 'workflow_dispatch' && inputs.nightly
+    if: github.event_name == 'workflow_dispatch' && inputs.long
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
@@ -222,9 +222,9 @@ jobs:
       - name: gremlins unleash ./mediator
         run: go run ./tools/task mutate
 
-  nightly-bench:
+  long-bench:
     name: benchmarks (benchstat gate, 10% on the median)
-    if: github.event_name == 'workflow_dispatch' && inputs.nightly
+    if: github.event_name == 'workflow_dispatch' && inputs.long
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -258,9 +258,9 @@ jobs:
           path: coverage/bench-baseline.txt
           key: bench-baseline-${{ github.sha }}
 
-  nightly-chaos:
+  long-chaos:
     name: chaos ${{ matrix.workload }} (seeds 1-3, 20m each)
-    if: github.event_name == 'workflow_dispatch' && inputs.nightly
+    if: github.event_name == 'workflow_dispatch' && inputs.long
     runs-on: ubuntu-latest
     timeout-minutes: 150
     strategy:

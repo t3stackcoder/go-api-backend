@@ -70,7 +70,7 @@ test-sweep:
 chaos:
 	$(TASK) chaos -workload=$(WORKLOAD) -seed=$(SEED) -duration=$(DURATION)
 
-# The nightly matrix: every workload x seeds 1,2,3; CHAOS_DURATION from env.
+# The full chaos matrix: every workload x seeds 1,2,3; CHAOS_DURATION from env.
 chaos-matrix:
 	$(TASK) chaos-matrix
 

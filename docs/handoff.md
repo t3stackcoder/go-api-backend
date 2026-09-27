@@ -7,24 +7,21 @@ current: update it in the same commit as the work it describes.
 
 Last updated 2026-09-27 at the end of the ninth session (the one that
 fixed what the first CI run found, verified the fixes with the race detector
-in a container, and moved the fault sweep job to manual dispatch).
+in a container, made CI manual only, and pushed).
 
 ## 1. Where things stand
 
 Module `github.com/t3stackcoder/go-api-backend`, `go 1.27`. The branch is
-`main`. GitHub (github.com/t3stackcoder/go-api-backend, public) holds it at
-`9989273`, the eighth session's last push; the local clone is one commit
-ahead with the ninth session's fixes and has no remote configured (the user
-had it removed in the eighth session), so a push is
-`git push https://github.com/t3stackcoder/go-api-backend main`. CI
-(`.github/workflows/ci.yml`) has run once, on the eighth session's push; its
-findings are fixed in the local commit (design-notes 8.15) and the three
-runs of that day were cancelled. The workflow has no cron schedule and no
-push or pull-request trigger (design-notes 6): nothing runs in CI unless
-someone dispatches it by hand from the Actions tab, which runs the five
-short jobs (static, unit, short fuzz, integration, openapi, about ten
-minutes) and, with `nightly=true` ticked, the long tiers as well. The whole
-tree builds, vets,
+`main`, pushed to `origin` (github.com/t3stackcoder/go-api-backend, public)
+at the end of the ninth session, so GitHub and the local clone are the
+same. CI (`.github/workflows/ci.yml`) has run once, on the eighth session's
+push; its findings are fixed (design-notes 8.15) and the three runs of that
+day were cancelled. The workflow has no cron schedule and no push or
+pull-request trigger (design-notes 6): nothing runs in CI unless someone
+dispatches it by hand from the Actions tab, which runs the five short jobs
+(static, unit, short fuzz, integration, openapi, about ten minutes) and,
+with `long=true` ticked, the long tiers as well; the ninth session's push
+started nothing. The whole tree builds, vets,
 and is gofmt-clean under every build tag (`integration`, `faultinject`,
 `faultsweep`, `chaos`), `go mod tidy` is a no-op, golangci-lint v2.14.0
 with `.golangci.yml` and staticcheck report nothing, and
@@ -63,9 +60,9 @@ Defects A to D of the chaos rounds (design-notes 8.5, 8.7, 8.8).
   once, alone, with the patched gremlins: 2167 killed, 70 lived (the 70
   equivalents), 67 timed out, 793 not covered, efficacy 96.87 percent, and
   `--threshold-efficacy` rose from 80 to 95 in `tools/task/tasks.go`, its
-  assertion in `tools/task/app_test.go`, and the `nightly-mutate` job name.
+  assertion in `tools/task/app_test.go`, and the `long-mutate` job name.
 * **Pushed, and the first CI run** (eighth session). Committed and pushed at
-  the user's request; the nightly cron removed at the user's request in a
+  the user's request; the cron schedule removed at the user's request in a
   second commit; the run's findings recorded in a third. Then, at the
   user's request, the local `main` was reset to `31504d4`, the `origin`
   remote removed, and the three CI runs cancelled.
@@ -97,41 +94,44 @@ Defects A to D of the chaos rounds (design-notes 8.5, 8.7, 8.8).
   `task fuzz -fuzztime 30s` over the six targets.
 * **CI made manual only** (ninth session). First the `sweep` job in
   `.github/workflows/ci.yml` got the long tiers' condition
-  (`workflow_dispatch` with `nightly=true`); then, at the user's direction,
+  (`workflow_dispatch` with `long=true`); then, at the user's direction,
   the push and pull-request triggers were removed altogether, so the
   workflow runs only when dispatched by hand. Recorded as a deviation from
   spec 11.3 in design-notes 6 with the reason: the framework is finished
-  and is not re-tested unless it changes. The dispatch input keeps the
-  name `nightly`.
+  and is not re-tested unless it changes. The dispatch input is named
+  `long` and the long-tier jobs `long-*`; at the user's direction no
+  mention of a scheduled run remains in the workflow, the Makefile, the
+  task runner, or these documents (spec.md, the original contract, keeps
+  its wording).
+* **Crash during a commit.** The machine crashed while git wrote the
+  branch pointer for the CI commit: the commit object was complete but
+  `.git/refs/heads/main` was left as 41 zero bytes, so `git status` showed
+  every file as added and `git log` reported a broken branch. `git fsck
+  --full` listed the commit as dangling; removing the zeroed file and
+  `git update-ref refs/heads/main <hash>` restored the branch with a clean
+  tree. Nothing was lost.
+* **Pushed.** `origin` was added back and `main` pushed at the end of the
+  session (the user's request, once the remaining checks had run here: the
+  openapi drift check, the coverage gate, and the integration tier). The
+  push started no CI run.
 * Docs: design-notes 6 row and 8.15 added; this file rewritten.
 
 ## 3. What is left, in order
 
 Against spec 14's definition of done for v1.0: every milestone's
 deliverables exist, every tier is green locally, the mutation triage is
-closed, and the first CI run's findings are fixed. What remains needs the
-user's decision or calendar time.
+closed, the first CI run's findings are fixed, and the tree is pushed. What
+remains is calendar time, at the user's discretion.
 
-1. **Push, when the user wants it.** The local commit carries everything;
-   `git push https://github.com/t3stackcoder/go-api-backend main` (or
-   `git remote add origin https://github.com/t3stackcoder/go-api-backend`
-   first) fast-forwards GitHub. A push starts nothing in CI; to check a
-   change there, dispatch the workflow by hand from the Actions tab (the
-   five short jobs, about ten minutes; tick `nightly=true` for the long
-   tiers). Each job that failed in the first run was re-run here with the
-   same tool and command. The one step not repeated locally is the
-   coverage gate inside the unit job (`task cover`, four minutes with
-   Docker); the only production change is in `DecodeEntry`'s handling of
-   the `at` field, and its new branch has unit rows.
-2. **Chaos at spec scale.** The matrix is 5 minutes per cell over seeds 1
+1. **Long chaos soak.** The matrix is 5 minutes per cell over seeds 1
    to 3 (`task chaos-matrix`, `CHAOS_DURATION`; 20 minutes per cell in the
    CI job); every cell has passed at 60 s. spec 14 wants two weeks of
-   green nightly runs; the schedule is off by the user's decision, so this
-   is on demand until there is something substantial to soak. Soak mode
-   (`-soak`) exists and has not been exercised.
-3. **Commit** only when the user asks, with the attribution line the session
-   specifies. The ninth session is committed; the tree was clean at the end
-   of it.
+   repeated green matrix runs; by the user's decision that soak is on
+   demand only, for when there is something substantial to soak. Soak
+   mode (`-soak`) exists and has not been exercised.
+2. **Commit** only when the user asks, with the attribution line the session
+   specifies. The ninth session is committed and pushed; the tree was clean at
+   the end of it.
 
 ## 4. How to run each tier here
 

@@ -251,7 +251,7 @@ func WriteProblem(w http.ResponseWriter, r *http.Request, err error)
 | Timeout "applies `context.WithTimeout`" (5.6) | `behavior.deadlineCtx`: one allocation, observably equivalent, lazily backed by `context.WithDeadline` on the first `Done()` | G17: saves 4 allocations on the no-I/O path; children derived by pgx, go-redis, or errgroup still attach without a watcher goroutine (`TestDeadlineCtx_NoWatcherGoroutines`) |
 | Spec 6.2 table list | Migration `0002_partition_epoch.sql` adds `mediator_partition_epoch (consumer_group, topic, partition, epoch, updated_at)`, primary key `(consumer_group, topic, partition)` | Fencing at the effect (G14, 8.7): the lease store cannot close the window between Redis forgetting a lease key and the old owner's next renewal tick, so the consumer's token is checked in the transaction that applies the effect |
 | `pg.Tx` interface frozen | `FencePartition(ctx, group, topic, partition, token) (ok bool, err error)` added, fault point `pg.inbox.fence`; `Inbox()` calls it before `InboxInsert` whenever `mediator.FencingToken(ctx)` is present and returns `CodeConflict` wrapping `pg.ErrStaleLease` (not transient) when the token is below the stored epoch | The token has to be checked where the effect happens, which is Postgres (G14, 8.7); the upsert's row lock also serializes the two owners' transactions |
-| Spec 11.3: tiers 0 to 4 on every push, the long tiers nightly (11.6 and 14 count on nightly runs) | No cron schedule and no push or pull-request trigger: nothing runs in CI unless someone dispatches the workflow by hand from the Actions tab. A dispatch runs static, unit (with `-race` and the coverage gate), short fuzz, integration, and the openapi job, about ten minutes of wall clock; ticking `nightly=true` adds the fault sweep, 30-minute fuzz, mutation gate, benchmarks, and chaos matrix | The user's decision in the eighth and ninth sessions: the framework is finished and is not to be re-tested unless it changes, with no front end there is nothing to soak every night, and the sweep's 40 to 75 minutes per run is not worth waiting for. A future change is verified by dispatching the workflow by hand or with the local commands of handoff section 4; spec 14's two weeks of green nightlies is on hold until there is something to soak |
+| Spec 11.3: tiers 0 to 4 on every push, the long tiers on a schedule (11.6 and 14 count on scheduled runs) | No cron schedule and no push or pull-request trigger: nothing runs in CI unless someone dispatches the workflow by hand from the Actions tab. A dispatch runs static, unit (with `-race` and the coverage gate), short fuzz, integration, and the openapi job, about ten minutes of wall clock; ticking `long=true` adds the fault sweep, 30-minute fuzz, mutation gate, benchmarks, and chaos matrix | The user's decision in the eighth and ninth sessions: the framework is finished and is not to be re-tested unless it changes, with no front end there is nothing to soak on a schedule, and the sweep's 40 to 75 minutes per run is not worth waiting for. A future change is verified by dispatching the workflow by hand or with the local commands of handoff section 4; spec 14's two-week soak is on hold until there is something to soak |
 
 ## 7. Decisions recorded by the package agents
 
@@ -820,7 +820,7 @@ and the first two runs were wrong in ways worth recording.
   uncovered mutants sit on lines only the integration tiers reach (the
   drivers of `pg` and `redisx`, `ctl`'s commands); a run with `-tags
   integration,faultinject` would need Docker under every worker and is not
-  what the nightly job asks for. The 57 timeouts are mutants that hang
+  what the `mutate` job asks for. The 57 timeouts are mutants that hang
   their tests (22 in `behavior/behavior.go`, 6 in `pg/uow.go`, 5 in the
   cache scheduler, 4 in `httpapi/sse.go`): each of those packages runs
   cold in one to two seconds, so a mutant that takes twenty is a loop or a
@@ -1217,7 +1217,7 @@ where the report did.
   side, so it lowers the killed count and the figure is conservative. The
   793 uncovered mutants are still the integration-only lines of 8.13. The
   gate is raised from 80 to 95 in `taskMutate` (`tools/task/tasks.go`),
-  the assertion in `tools/task/app_test.go`, and the `nightly-mutate` job
+  the assertion in `tools/task/app_test.go`, and the `long-mutate` job
   name in `.github/workflows/ci.yml`; spec 11's 80 was "rising as the suite
   matures". The log of the run is not in the repository.
 * **Facts for the next run.** `gremlins -E` matches paths relative to the
@@ -1329,16 +1329,17 @@ was fast-forwarded back to `9989273` first.
 * **The fault sweep job moved to manual dispatch** (section 6). Spec 11.3
   runs tier 3 on every push; the first run showed what that costs (the job
   was at 34 minutes when it was cancelled, cap 75) and the user had asked,
-  in the same session, for the nightly schedule to go because there is
+  in the same session, for the cron schedule to go because there is
   nothing to soak yet. The `sweep` job now carries the same
-  `workflow_dispatch && inputs.nightly` condition as the long tiers. Later
+  `workflow_dispatch && inputs.long` condition as the long tiers. Later
   in the session, at the user's direction, the push and pull-request
   triggers went too: the workflow now runs only when dispatched by hand,
   the five short jobs on every dispatch and the long tiers when
-  `nightly=true` is ticked (section 6). The dispatch input is still named
-  `nightly` (its description lists the fault sweep now) so the documented
-  `nightly=true` keeps working.
-* **State of the two copies.** GitHub holds `9989273`; the local clone is
-  one commit ahead with these fixes and has no remote configured (the user
-  had it removed in the eighth session). Nothing was pushed in the ninth
-  session; the push command is in handoff section 3.
+  `long=true` is ticked (section 6). The dispatch input is named `long`
+  and the long-tier jobs `long-*`.
+* **State of the two copies.** The ninth session ended by adding `origin`
+  back and pushing `main`, so GitHub and the local clone are the same; the
+  push started no run, the workflow having no push trigger. At the user's
+  direction every mention of a scheduled run was removed from the workflow
+  and from these documents (the dispatch input is `long`, the jobs
+  `long-*`); spec.md, the original contract, keeps its wording.
