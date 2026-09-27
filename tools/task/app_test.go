@@ -335,16 +335,22 @@ func TestTierTasks(t *testing.T) {
 		"test-integration": "go test -tags integration -count=1 ./...",
 		"test-sweep":       "go test -tags faultsweep,faultinject -count=1 -timeout 60m ./test/faultsweep/...",
 		"openapi":          "go run ./cmd/mediatorctl openapi export --out api/openapi.json",
-		"mutate":           "gremlins unleash ./mediator --threshold-efficacy 80",
 	}
 	for task, want := range cases {
 		h := newHarness(t)
-		h.runner.tools["gremlins"] = true
 		if code := h.run(t, task); code != 0 {
 			t.Errorf("%s: exit %d: %s", task, code, h.stderr)
 		}
 		assertCmds(t, h.runner.strings(), []string{want})
 	}
+	// The mutation run clears the test cache first, so gremlins measures a
+	// real coverage run when it sizes the per-mutant timeout.
+	h := newHarness(t)
+	h.runner.tools["gremlins"] = true
+	if code := h.run(t, "mutate"); code != 0 {
+		t.Errorf("mutate: exit %d: %s", code, h.stderr)
+	}
+	assertCmds(t, h.runner.strings(), []string{"go clean -testcache", "gremlins unleash ./mediator --threshold-efficacy 80"})
 }
 
 func TestMutateNotInstalled(t *testing.T) {

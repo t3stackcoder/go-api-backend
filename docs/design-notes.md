@@ -450,6 +450,30 @@ chaos runs (see the relay and consumers doc comments):
   the host environment; empty means the development secret, which the service
   logs a warning about at start.
 
+### 7.9 testkit/netfault
+
+* Connection-level faults are injected in process rather than through a
+  proxy: `netfault.Dialer` is a pgconn `DialFunc` whose connections fail
+  the next write that carries a chosen SQL fragment (`FailWrite`, nothing
+  is sent and the connection closes) or send it and withhold the reply
+  (`DropAfterWrite`, the lost acknowledgement of spec 6.1 step 5). The
+  fault points of `testkit` sit before and after each driver call and
+  cannot fail the call itself; the dialer reaches the driver's own error
+  branches (a failed COMMIT or ROLLBACK, an advisory lock that cannot be
+  taken or released, a LISTEN connection lost at a query) deterministically
+  and without protocol parsing, because pgx writes the statement text in
+  the Parse or Query message.
+* `Dialer.Config` returns a pool of one connection in
+  `pgx.QueryExecModeDescribeExec`: with the statement cache a repeated
+  statement carries only its name on the wire, and one connection keeps
+  the statement under test on the connection the rule watches. Tests set
+  `search_path` on the config's `RuntimeParams`.
+* A rule fires once and is consumed by whichever connection writes the
+  fragment first, so a test arms it right before the call and runs the
+  call on a single goroutine; the relay's LISTEN connection test sets
+  `MaxConns` to two because the slot worker needs a pooled connection
+  beside the hijacked one.
+
 ### 8.6 Fault sweep (tier 3)
 
 First complete run on 2026-09-26 in quick mode (first hit of every point, no
@@ -683,3 +707,137 @@ uncovered lines are error returns that only a failing Postgres reaches. An
 explicit `-thresholds` argument to `task cover` replaces the defaults.
 With the regenerated profile the gate passes: all 19 packages at or above
 their thresholds (`coverage/summary.md`).
+
+### 8.11 Coverage thresholds raised (sixth session)
+
+The three held thresholds of 8.10 are gone: `pg` is at 100.0 percent (1052
+statements, two ignored), `testkit/invariants` at 100.0 and
+`testkit/workload` at 100.0 (three ignored), and `coverThresholds` names
+only `pg/storetest` (80.1, the conformance suite). The gate now lists 20
+packages; the new one, `testkit/netfault` (7.9), is at 100.0. Nothing in
+the framework changed except two seams and three ignore comments; the
+gaps were closed by kind:
+
+* **Statements the server rejects while they run** (no proxy needed): a
+  plpgsql trigger that raises, BEFORE INSERT, UPDATE, or DELETE on the
+  table of the statement under test (outbox insert, relay mark and cursor
+  upsert, reshard update and cursor reset, idempotency store, the bank
+  debit and credit); a deferred constraint trigger, which fails the COMMIT
+  itself with SQLSTATE P0001 and is the definite commit failure of 6.1
+  (`isDefiniteCommitFailure` true, nothing committed); `ALTER COLUMN ...
+  TYPE text` for a row that no longer scans (outbox seq, stats partition,
+  bank balance, append value, bump count); a view whose column is a
+  plpgsql function that raises, for a query that fails after it started
+  returning rows (pgx v5 prepares a statement before it executes it, so a
+  missing table fails `Query` itself and only a runtime error surfaces in
+  `rows.Err()`); a `mediator_schema_version` with the wrong columns or
+  text values; a table that already exists before `Migrate`; a `NULL`
+  stream key after `DROP NOT NULL`; a headers document of the wrong shape
+  (`{"h": 5}`); and a row lock held under a 200 ms `lock_timeout`, whose
+  failure arrives with the rows (`SELECT ... FOR UPDATE`).
+* **Connection-level failures**, through `testkit/netfault` (7.9): the
+  failed ROLLBACK of `pgTx` and `pgBatch` and the unit of work logging it;
+  the migration advisory lock, unlock, and `begin`; the janitor lock and
+  the unlock that hijacks and closes the connection; the relay's LISTEN
+  connection dropped at LISTEN itself and at the advisory lock query (the
+  session ends, the relay counts it, the next session owns the slot; the
+  LISTEN branch was covered before only when the terminate-backend test
+  happened to race a reconnect); and the lost COMMIT
+  acknowledgement, where the test reads the committed row through a fresh
+  connection while the client saw an indefinite failure. In `invariants`,
+  one statement of each check is dropped in turn (16 statements).
+* **Fault-point returns**: `TestFault_PointsReturnTheInjectedError` arms
+  every `pg.*` point of the catalogue with the error kind against the real
+  store, the mark point also with the ambiguous kind (`FaultAfter`), and
+  `TestFault_RelayLockFaultIsRetried` shows a fault at `pg.relay.lock`
+  skips the slot for one pass. A relay batch locks its row `FOR UPDATE`,
+  so a test that opens several must roll each back before the next selects
+  with `SKIP LOCKED`, or the next sees nothing; that cost one hung run.
+* **Seams**: `migrationsFS` (`SetMigrationsFS`) for a source that cannot be
+  listed or read and a migration without a down section;
+  `NewPgSlotStoreForTest`; the fake slot store gained `failCursor` and
+  `onBegin`; a closed pool for the relay session and the relay begin.
+* **Ignored with a reason**: `pgxpool.NewWithConfig` fails only for a pool
+  size below one, which `ParseConfig` rejects; the stream unit of work's
+  unsettled rollback, which only `runtime.Goexit` reaches; the three
+  envelope checks of the workload consumers, which `Deliver` always
+  satisfies.
+* **Redis**: a key of the wrong type (`SET` on a dead-letter key, then on a
+  partition stream) fails `XRANGE`, `XPENDING`, and `ConsumerLag` with
+  WRONGTYPE, which the checks must report rather than read as empty; 25
+  dead letters show the capped report.
+
+### 8.12 Chaos re-run and benchmark baseline
+
+The seven workloads that were not re-run after the 8.7 fixes ran on the
+rebuilt image at seed 1 for 60 s each (`register`, `register-cached`,
+`bank`, `bank-idempotent`, `idempotent-append`, `remote-send`,
+`cache-staleness`): all pass, every checker green (I1 to I6, L1, L2, DLQ,
+fencing from the database and the logs, log scan, shutdown, workload),
+four or five nemeses per run across all fifteen kinds, about 1.8k
+operations per run, no relay replays. With the `events` seeds of 8.8,
+every workload is green on the image that carries the 8.7 fixes.
+
+`task bench` ran for the first time and `task bench-baseline` recorded
+`coverage/bench-baseline.txt` (six repetitions, quiet machine, AMD Ryzen AI
+9 HX 370, 24 threads, Windows, Go 1.27). G17 holds with room:
+`BenchmarkSend_DefaultChain` 296 ns/op, 280 B/op, 5 allocs/op (cold
+context 283 ns), `BenchmarkSend_Core` 78 ns and 3 allocs, `BenchmarkPublish_InProcess`
+36 ns and 0 allocs, `BenchmarkCache_Hit` 3.1 µs and 44 allocs, the single
+behaviors between 86 and 141 ns except `CacheInvalidation` at 1.0 µs.
+The directory is ignored by git, so the baseline is local to this
+machine; spec 14's open question 5 leaves the reference host to CI.
+
+### 8.13 Mutation gate, first runs
+
+`task mutate` (gremlins v0.6.0, `unleash ./mediator --threshold-efficacy
+80`, unit tests only, no build tags) ran for the first time, three times,
+and the first two runs were wrong in ways worth recording.
+
+* **Windows path bug in gremlins.** `removeModuleFromPath` keys the
+  coverage profile with `filepath.Rel`, which uses backslashes on Windows,
+  while mutant positions come from an `fs.FS` walk with forward slashes, so
+  no file below the calling directory ever matches its coverage and every
+  mutant there is "not covered"; only the root package's files (no
+  separator) are tested. First run: 302 killed, 25 lived, 2768 not
+  covered, efficacy 92.35 percent, mutator coverage 10.57 percent, 2.5
+  minutes, and a gate that passes on a tenth of the code. Linux CI is not
+  affected. The runs below used a local build with `filepath.ToSlash`
+  applied to that path (one line, not in the repository; worth an upstream
+  pull request).
+* **Timeouts sized from a cached coverage run.** gremlins sets each
+  mutant's test timeout to three times the wall time of its coverage run.
+  With a warm test cache that run took 2.7 s, so every mutant got 8 s for
+  a cold compile and run of its package under 24 concurrent workers, and
+  266 of the first 361 mutants timed out (`behavior`, `ctl`); a gate that
+  ignores timeouts would have passed on the rest. `taskMutate` now runs
+  `go clean -testcache` first; the coverage run then takes about 6 s and
+  the timeout about 20 s.
+* **The real run** (patched build, cleared cache): 12 minutes 45 seconds,
+  2018 killed, 227 lived, 57 timed out, 794 not covered, efficacy 89.89
+  percent against the 80 gate, mutator coverage 73.87 percent. The 794
+  uncovered mutants sit on lines only the integration tiers reach (the
+  drivers of `pg` and `redisx`, `ctl`'s commands); a run with `-tags
+  integration,faultinject` would need Docker under every worker and is not
+  what the nightly job asks for. The 57 timeouts are mutants that hang
+  their tests (22 in `behavior/behavior.go`, 6 in `pg/uow.go`, 5 in the
+  cache scheduler, 4 in `httpapi/sse.go`): each of those packages runs
+  cold in one to two seconds, so a mutant that takes twenty is a loop or a
+  wait the mutation broke, a kill in effect that gremlins counts apart.
+* **Survivors, for the triage of spec 11.3** (item 1 of the handoff): 165
+  of the 227 are `CONDITIONALS_BOUNDARY` (a `<` that a `<=` passes just
+  as well), 32 `CONDITIONALS_NEGATION`, 22 `ARITHMETIC_BASE`, 6
+  `INCREMENT_DECREMENT`, 2 `INVERT_NEGATIVES`. By file: `validate`
+  (`format.go` 19, `checkers.go` 18, `schemagen.go` 9, `compile.go` 8),
+  `testkit/history` (`logscan.go` 11, `checkers.go` 9, `history.go` 7,
+  `porcupine.go` 4), `redisx` (`consumers.go` 11, `lease.go` 9,
+  `backoff.go` 6, `limiter.go` 5, `cache.go` 5, `keys.go` 3, others 6),
+  `pg` (`relay.go` 11, `pool.go` 6, `store.go` 4, `uow.go` 3), the core
+  (`mediator.go` 8, `send.go` 5, `pipeline.go` 5, `names.go` 4,
+  `typed.go` 1), `retry/retry.go` 7, `behavior` (`redact.go` 5,
+  `cache_invalidation.go` 3, `timeout.go` 2, `logging.go` 2,
+  `cachemodel/scheduler.go` 3), `httpapi` 7, `ctl/main.go` 2,
+  `testkit/workload/handlers.go` 2, `testkit/memstore` 3,
+  `testkit/invariants` 2. The boundary survivors in `validate` are the
+  length and range checks (`min`, `max`, `len`) whose tables test one side
+  of each boundary; those are the cheapest rows to add.

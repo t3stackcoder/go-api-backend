@@ -363,7 +363,7 @@ func (h *handlers) touch(ctx context.Context, c Touch) (mediator.Void, error) {
 func (h *handlers) recordApply(ctx context.Context, t pgx.Tx, group string, e Bumped) error {
 	env, ok := mediator.EnvelopeFrom(ctx)
 	if !ok {
-		return mediator.E(mediator.CodeInternal, "workload: consumer without an envelope")
+		return mediator.E(mediator.CodeInternal, "workload: consumer without an envelope") // covergate:ignore Deliver always sets the envelope
 	}
 	token, _ := mediator.FencingToken(ctx)
 	if _, err := t.Exec(ctx, `INSERT INTO wl_applied (grp, event_id, key, seq, fencing, node) VALUES ($1, $2, $3, $4, $5, $6)`,
@@ -382,7 +382,7 @@ func (h *handlers) project(ctx context.Context, e Bumped) error {
 	}
 	env, ok := mediator.EnvelopeFrom(ctx)
 	if !ok {
-		return mediator.E(mediator.CodeInternal, "workload: consumer without an envelope")
+		return mediator.E(mediator.CodeInternal, "workload: consumer without an envelope") // covergate:ignore Deliver always sets the envelope
 	}
 	if h.deps.StrictProjection {
 		var last int64
@@ -418,7 +418,7 @@ func (h *handlers) audit(ctx context.Context, e Bumped) error {
 	}
 	env, ok := mediator.EnvelopeFrom(ctx)
 	if !ok {
-		return mediator.E(mediator.CodeInternal, "workload: consumer without an envelope")
+		return mediator.E(mediator.CodeInternal, "workload: consumer without an envelope") // covergate:ignore Deliver always sets the envelope
 	}
 	if _, err := t.Exec(ctx, `INSERT INTO wl_audit (grp, event_id, key, seq) VALUES ($1, $2, $3, $4)`, GroupAudit, env.ID, e.Key, env.Seq); err != nil {
 		if pg.IsUniqueViolation(err) {

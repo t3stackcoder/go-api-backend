@@ -28,6 +28,7 @@ import (
 	"github.com/t3stackcoder/go-api-backend/mediator/redisx"
 	"github.com/t3stackcoder/go-api-backend/mediator/testkit/history"
 	"github.com/t3stackcoder/go-api-backend/mediator/testkit/invariants"
+	"github.com/t3stackcoder/go-api-backend/mediator/testkit/netfault"
 	"github.com/t3stackcoder/go-api-backend/mediator/testkit/workload"
 )
 
@@ -91,6 +92,7 @@ func unique() string {
 // relay, and the consumers, plus the invariants.Env that reads it.
 type env struct {
 	pool   *pgxpool.Pool
+	schema string
 	store  *pg.PgStore
 	client *redis.Client
 	cfg    redisx.Config
@@ -175,7 +177,7 @@ func newEnv(t *testing.T, deps workload.Deps) *env {
 	})
 	inv := invariants.Env{Pool: pool, Redis: client, Cfg: cfg, Groups: groups, Topics: []string{workload.TopicBumped},
 		Partitions: cfg.PartitionsPerTopic, Bound: 30 * time.Second, Poll: 100 * time.Millisecond}
-	return &env{pool: pool, store: store, client: client, cfg: cfg, m: m, inv: inv}
+	return &env{pool: pool, schema: schema, store: store, client: client, cfg: cfg, m: m, inv: inv}
 }
 
 func (e *env) exec(t *testing.T, sql string, args ...any) {
@@ -616,4 +618,146 @@ func TestIntegration_DeadLetters(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertOnly(t, r(invariants.I6(ctx, e.inv)), invariants.IDI6, "not exactly 1..n")
+}
+
+// faultPool opens a pool of one connection on schema through a
+// netfault.Dialer, so a test can drop the connection at one statement.
+func faultPool(t *testing.T, schema string) (*pgxpool.Pool, *netfault.Dialer) {
+	t.Helper()
+	ctx := context.Background()
+	d := &netfault.Dialer{}
+	pc, err := d.Config(pgURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pc.ConnConfig.RuntimeParams["search_path"] = schema
+	pool, err := pgxpool.NewWithConfig(ctx, pc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	if err := pool.Ping(ctx); err != nil {
+		t.Fatal(err)
+	}
+	return pool, d
+}
+
+// TestIntegration_CheckFailures makes one statement of each check fail in
+// turn and asserts the failure is returned instead of read as a clean
+// state: the connection dropped at that statement (testkit/netfault), a
+// column that no longer scans, a Redis key of the wrong type. The
+// corruptions of one node accumulate, so the steps go from the statements
+// the checks reach last to the ones they reach first.
+func TestIntegration_CheckFailures(t *testing.T) {
+	e := newEnv(t, workload.Deps{})
+	ctx := context.Background()
+	for _, key := range []string{"f1", "f2"} {
+		for i := 0; i < 2; i++ {
+			send(t, e, workload.Bump{Key: key, CmdID: fmt.Sprintf("c-%s-%d", key, i)})
+		}
+	}
+	app := workload.Append{Key: "l", Val: 1, CmdID: "c-app"}
+	send(t, e, app)
+	set := workload.SetValue{Key: "r", Val: 1, CmdID: "c-set"}
+	send(t, e, set)
+	assertNone(t, r(invariants.L1(ctx, e.inv)))
+	expApp, _ := invariants.ExpectFor(app)
+	expSet, _ := invariants.ExpectFor(set)
+
+	// A register key no command wrote is a missing signal, not an error.
+	never := expSet
+	never.Register = []string{"r", "never"}
+	if _, err := invariants.I1(ctx, e.inv, map[string]invariants.Expect{"c-set": never}); err != nil {
+		t.Fatalf("missing register row: %v", err)
+	}
+
+	// Postgres: the connection dropped at one statement of each check.
+	fp, d := faultPool(t, e.schema)
+	fenv := e.inv
+	fenv.Pool = fp
+	cmds := map[string]invariants.Expect{"c-app": expApp, "c-set": expSet}
+	i1 := func() error { _, err := invariants.I1(ctx, fenv, cmds); return err }
+	i3 := func() error { _, err := invariants.I3(ctx, fenv); return err }
+	steps := []struct {
+		name, needle string
+		run          func() error
+	}{
+		{"I1 idempotency row", "FROM mediator_idempotency WHERE scope = $1 AND key = $2", i1},
+		{"I1 executions", "FROM wl_executions WHERE scope = $1 AND key = $2", i1},
+		{"I1 outbox by header", "headers->'h'->>$1 = $2", i1},
+		{"I1 outbox by cause", "headers->>'cause' = $1", i1},
+		{"I1 side", "FROM wl_side WHERE cmd_id = $1", i1},
+		{"I1 appends", "FROM wl_appends WHERE cmd_id = $1", i1},
+		{"I1 register", "FROM wl_register WHERE key = $1", i1},
+		{"I2 published rows", "published_at IS NOT NULL AND topic = ANY($1)", func() error { _, err := invariants.I2(ctx, fenv); return err }},
+		{"I3 inbox", "FROM mediator_inbox WHERE consumer_group = $1", i3},
+		{"I3 applied", "FROM wl_applied WHERE grp = $1 ORDER BY applied", i3},
+		{"I3 audit", "FROM wl_audit WHERE grp = $1", i3},
+		{"I3 projection bumps", "FROM wl_bumps ORDER BY key", i3},
+		{"I3 projection rows", "FROM wl_projection WHERE grp = $1 ORDER BY key", i3},
+		{"I4 orphans", "NOT EXISTS (SELECT 1 FROM wl_executions e", func() error { _, err := invariants.I4(ctx, fenv); return err }},
+		{"I6 committed rows", "FROM mediator_outbox WHERE topic = ANY($1)", func() error { _, err := invariants.I6(ctx, fenv); return err }},
+		{"L1 blocked sessions", "pg_stat_activity", func() error { _, err := invariants.L1(ctx, fenv); return err }},
+	}
+	for _, s := range steps {
+		d.FailWrite(s.needle)
+		err := s.run()
+		if d.Armed() {
+			t.Fatalf("%s: statement %q was never sent (%v)", s.name, s.needle, err)
+		}
+		if err == nil {
+			t.Fatalf("%s: the dropped statement must fail the check", s.name)
+		}
+	}
+
+	// More dead letters than a violation carries: the report is capped.
+	keys := e.cfg.Keys()
+	for i := 0; i < 25; i++ {
+		if err := e.client.XAdd(ctx, &redis.XAddArgs{Stream: keys.DLQ(workload.GroupAudit), Values: map[string]any{"n": i}}).Err(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	vs, err := invariants.DLQEmpty(ctx, e.inv)
+	if err != nil || len(vs) != 20 {
+		t.Fatalf("capped dead-letter report: %d %v", len(vs), err)
+	}
+
+	// A column that no longer scans.
+	e.exec(t, `ALTER TABLE wl_bumps ALTER COLUMN n TYPE text`)
+	if _, err := invariants.I3(ctx, e.inv); err == nil {
+		t.Fatal("a row that does not scan must fail the check")
+	}
+
+	// Redis: a dead-letter stream of the wrong type, then a partition stream.
+	if err := e.client.Set(ctx, keys.DLQ(workload.GroupReadModel), "x", 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range []struct {
+		name string
+		run  func() error
+	}{
+		{"I3", func() error { _, err := invariants.I3(ctx, e.inv); return err }},
+		{"I6", func() error { _, err := invariants.I6(ctx, e.inv); return err }},
+		{"DLQEmpty", func() error { _, err := invariants.DLQEmpty(ctx, e.inv); return err }},
+	} {
+		if err := s.run(); err == nil {
+			t.Fatalf("%s: a dead-letter stream of the wrong type must fail the check", s.name)
+		}
+	}
+	if err := e.client.Set(ctx, keys.Stream(workload.TopicBumped, 0), "x", 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range []struct {
+		name string
+		run  func() error
+	}{
+		{"I2", func() error { _, err := invariants.I2(ctx, e.inv); return err }},
+		{"I3", func() error { _, err := invariants.I3(ctx, e.inv); return err }},
+		{"I5", func() error { _, err := invariants.I5(ctx, e.inv); return err }},
+		{"L1", func() error { _, err := invariants.L1(ctx, e.inv); return err }},
+	} {
+		if err := s.run(); err == nil {
+			t.Fatalf("%s: a partition stream of the wrong type must fail the check", s.name)
+		}
+	}
 }

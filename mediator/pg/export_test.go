@@ -67,11 +67,21 @@ func (r *Relay) SlotsForTest() []*Slot                           { return r.slot
 func RelayLockKey(topic string, partition int) string            { return relayLockKey(topic, partition) }
 
 func LoadMigrations(fsys fs.FS) ([]Migration, error) { return loadMigrations(fsys) }
-func SplitMigration(src string) (up, down string)    { return splitMigration(src) }
-func (m migration) Version() int                     { return m.version }
-func (m migration) Name() string                     { return m.name }
-func (m migration) Up() string                       { return m.up }
-func (m migration) Down() string                     { return m.down }
+
+// SetMigrationsFS swaps the migration source and returns the restore func.
+func SetMigrationsFS(fsys fs.FS) (restore func()) {
+	prev := migrationsFS
+	migrationsFS = fsys
+	return func() { migrationsFS = prev }
+}
+
+// NewPgSlotStoreForTest returns the relay's Postgres slot store over pool.
+func NewPgSlotStoreForTest(pool *pgxpool.Pool) SlotStore { return &pgSlotStore{pool: pool} }
+func SplitMigration(src string) (up, down string)        { return splitMigration(src) }
+func (m migration) Version() int                         { return m.version }
+func (m migration) Name() string                         { return m.name }
+func (m migration) Up() string                           { return m.up }
+func (m migration) Down() string                         { return m.down }
 
 func EncodeOutboxHeaders(env *mediator.Envelope) ([]byte, error) { return encodeOutboxHeaders(env) }
 func DecodeOutboxHeaders(raw []byte, env *mediator.Envelope) error {

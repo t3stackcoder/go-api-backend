@@ -277,19 +277,12 @@ func taskOpenAPICheck(a *App, _ []string) error {
 }
 
 // coverThresholds are the packages the gate holds below the 95 percent
-// default, each at its measured level so the number can only go up
-// (design-notes 8.10; raising them is listed in the handoff):
-//   - mediator/pg=89: the Postgres error branches of relay, janitor,
-//     migrate, and tx (lock, batch, cursor, and statement failures) need
-//     connection-level faults that the fault points do not inject yet;
+// default (design-notes 8.10 and 8.11):
 //   - mediator/pg/storetest=80: a conformance suite whose failure branches
-//     run only when a store does not conform;
-//   - mediator/testkit/invariants=94 and mediator/testkit/workload=93:
-//     chaos and sweep support whose uncovered lines are the error returns
-//     of checks and handlers that only a failing Postgres reaches.
+//     run only when a store does not conform.
 //
 // An explicit -thresholds argument replaces them.
-const coverThresholds = "mediator/pg=89,mediator/pg/storetest=80,mediator/testkit/invariants=94,mediator/testkit/workload=93"
+const coverThresholds = "mediator/pg/storetest=80"
 
 // taskCover writes the atomic coverage profile of ./mediator/... and runs
 // the covergate; extra arguments are passed to covergate (for example
@@ -313,9 +306,16 @@ func taskCover(a *App, args []string) error {
 }
 
 // taskMutate runs gremlins on the core packages. gremlins takes a directory,
-// not a package pattern, so ./mediator covers everything below it.
+// not a package pattern, so ./mediator covers everything below it. The test
+// cache is cleared first: gremlins sizes every mutant's test timeout from the
+// wall time of its coverage run, and a run served from the cache in a couple
+// of seconds leaves the real test runs no time, so most mutants time out and
+// the efficacy gate passes on the few that ran (design-notes 8.13).
 func taskMutate(a *App, _ []string) error {
 	return a.optional("gremlins", installGremlins, func() error {
+		if err := a.goRun("clean", "-testcache"); err != nil {
+			return err
+		}
 		return a.run("gremlins", "unleash", "./mediator", "--threshold-efficacy", "80")
 	})
 }

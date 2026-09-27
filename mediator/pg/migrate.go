@@ -41,6 +41,10 @@ var (
 	downMarker    = regexp.MustCompile(`(?mi)^--\s*down\s*$`)
 )
 
+// migrationsFS is the migration source of Migrate, MigrateDown, and
+// MigrationStatus. Tests swap it for a malformed set.
+var migrationsFS fs.FS = migrations.FS
+
 // loadMigrations parses every NNNN_name.sql of fsys, splitting the optional
 // "-- down" section, sorted by version.
 func loadMigrations(fsys fs.FS) ([]migration, error) {
@@ -155,7 +159,7 @@ func inTx(ctx context.Context, conn *pgxpool.Conn, f func(tx pgx.Tx) error) erro
 // and applies every embedded migration with a higher version than the
 // current one, each in its own transaction, recording it (6.7).
 func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
-	ms, err := loadMigrations(migrations.FS)
+	ms, err := loadMigrations(migrationsFS)
 	if err != nil {
 		return err
 	}
@@ -194,7 +198,7 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 // descending order, using their "-- down" sections. It exists for tests of
 // 6.7; migrations are append-only once merged.
 func MigrateDown(ctx context.Context, pool *pgxpool.Pool, toVersion int) error {
-	ms, err := loadMigrations(migrations.FS)
+	ms, err := loadMigrations(migrationsFS)
 	if err != nil {
 		return err
 	}
@@ -237,7 +241,7 @@ func MigrateDown(ctx context.Context, pool *pgxpool.Pool, toVersion int) error {
 // MigrationStatus lists every embedded migration with whether and when it
 // was applied (mediatorctl migrate status).
 func MigrationStatus(ctx context.Context, pool *pgxpool.Pool) ([]MigrationInfo, error) {
-	ms, err := loadMigrations(migrations.FS)
+	ms, err := loadMigrations(migrationsFS)
 	if err != nil {
 		return nil, err
 	}

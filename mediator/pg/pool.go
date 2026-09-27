@@ -40,7 +40,7 @@ func NewPool(ctx context.Context, url string, cfg PoolConfig) (*pgxpool.Pool, er
 	applyPoolConfig(pc, cfg)
 	pool, err := pgxpool.NewWithConfig(ctx, pc)
 	if err != nil {
-		return nil, fmt.Errorf("pg: open pool: %w", err)
+		return nil, fmt.Errorf("pg: open pool: %w", err) // covergate:ignore NewWithConfig fails only for a pool size below one, which ParseConfig rejects
 	}
 	if err := pool.Ping(ctx); err != nil {
 		pool.Close()

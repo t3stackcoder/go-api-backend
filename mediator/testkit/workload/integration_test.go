@@ -111,8 +111,14 @@ type fixture struct {
 
 func newFixture(t *testing.T, deps workload.Deps, extra func(m *mediator.Mediator)) *fixture {
 	t.Helper()
+	return newFixtureStore(t, deps, extra, pg.StoreConfig{Partitions: 4})
+}
+
+// newFixtureStore is newFixture with the store configuration of the test.
+func newFixtureStore(t *testing.T, deps workload.Deps, extra func(m *mediator.Mediator), cfg pg.StoreConfig) *fixture {
+	t.Helper()
 	pool := newSchema(t)
-	store := pg.NewStore(pool, pg.StoreConfig{Partitions: 4})
+	store := pg.NewStore(pool, cfg)
 	m := mediator.New(mediator.WithNodeID("n1"))
 	if err := mediator.Use(m, pg.UnitOfWork(store, pg.UnitOfWorkConfig{}), mediator.Requests(), mediator.Consumers()); err != nil {
 		t.Fatal(err)
@@ -593,6 +599,9 @@ func TestIntegration_StorageErrors(t *testing.T) {
 		{"wl_applied", deliverErr(workload.GroupAudit)},
 		{"wl_applied", deliverErr(workload.GroupPoison)},
 		{"wl_audit", deliverErr(workload.GroupAudit)},
+		{"mediator_idempotency", sendErr(workload.SetValue{Key: "k", CmdID: "c", Keyed: true})},
+		{"mediator_partition_epoch", deliverErr(workload.GroupReadModel)},
+		{"mediator_inbox", deliverErr(workload.GroupAudit)},
 	}
 	for i, s := range steps {
 		t.Run(s.table+"/"+string(rune('a'+i)), func(t *testing.T) {
@@ -608,4 +617,98 @@ func TestIntegration_StorageErrors(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestIntegration_HandlerFailures reaches the handler branches a missing
+// table cannot: a row that no longer scans, a query that fails while it
+// returns rows, a statement the server rejects, a lock that times out
+// after the query started, and a second execution the idempotency
+// behavior did not prevent.
+func TestIntegration_HandlerFailures(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	const (
+		boomFn      = `CREATE FUNCTION boom() RETURNS bigint LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'boom'; END $$`
+		boomTrigger = `CREATE FUNCTION boom_trigger() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'boom'; END $$`
+	)
+	type step struct {
+		name string
+		deps workload.Deps
+		prep func(t *testing.T, f *fixture, e pg.OutboxEntry)
+		run  func(t *testing.T, f *fixture, e pg.OutboxEntry) error
+		code mediator.Code // zero means any error
+	}
+	exec := func(stmts ...string) func(*testing.T, *fixture, pg.OutboxEntry) {
+		return func(t *testing.T, f *fixture, _ pg.OutboxEntry) {
+			for _, s := range stmts {
+				if _, err := f.pool.Exec(ctx, s); err != nil {
+					t.Fatalf("%s: %v", s, err)
+				}
+			}
+		}
+	}
+	sendErr := func(req any) func(*testing.T, *fixture, pg.OutboxEntry) error {
+		return func(_ *testing.T, f *fixture, _ pg.OutboxEntry) error {
+			_, err := f.m.SendAny(ctx, req)
+			return err
+		}
+	}
+	deliverErr := func(group string) func(*testing.T, *fixture, pg.OutboxEntry) error {
+		return func(_ *testing.T, f *fixture, e pg.OutboxEntry) error {
+			return f.m.Deliver(mediator.WithFencingToken(ctx, 1), group, e.Envelope, e.Payload)
+		}
+	}
+	transfer := workload.Transfer{From: "a", To: "b", Amt: 1, CmdID: "c"}
+	steps := []step{
+		{name: "transfer row does not scan", prep: exec(`ALTER TABLE wl_bank ALTER COLUMN balance TYPE text`), run: sendErr(transfer)},
+		{name: "transfer debit rejected", prep: exec(boomTrigger, `CREATE TRIGGER reject BEFORE UPDATE ON wl_bank FOR EACH ROW WHEN (NEW.balance < OLD.balance) EXECUTE FUNCTION boom_trigger()`), run: sendErr(transfer)},
+		{name: "transfer credit rejected", prep: exec(boomTrigger, `CREATE TRIGGER reject BEFORE UPDATE ON wl_bank FOR EACH ROW WHEN (NEW.balance > OLD.balance) EXECUTE FUNCTION boom_trigger()`), run: sendErr(transfer)},
+		{name: "read all row does not scan", prep: exec(`ALTER TABLE wl_bank ALTER COLUMN balance TYPE text`), run: sendErr(workload.ReadAll{})},
+		{name: "read all fails while read", prep: exec(boomFn, `DROP TABLE wl_bank`, `CREATE VIEW wl_bank AS SELECT 'a'::text AS account, boom() AS balance`), run: sendErr(workload.ReadAll{})},
+		{name: "append executed twice", prep: exec(`INSERT INTO wl_appends (cmd_id, key, val) VALUES ('c', 'k', 1)`), run: sendErr(workload.Append{Key: "k", CmdID: "c"}), code: mediator.CodeConflict},
+		{name: "read list row does not scan", prep: exec(`INSERT INTO wl_appends (cmd_id, key, val) VALUES ('c', 'k', 1)`, `ALTER TABLE wl_appends ALTER COLUMN val TYPE text`), run: sendErr(workload.ReadList{Key: "k"})},
+		{name: "read list fails while read", prep: exec(boomFn, `DROP TABLE wl_appends`, `CREATE VIEW wl_appends AS SELECT 'c'::text AS cmd_id, 'k'::text AS key, boom() AS val, 1::bigint AS applied`), run: sendErr(workload.ReadList{Key: "k"})},
+		{name: "projection insert fails", deps: workload.Deps{Groups: workload.AllGroups}, prep: exec(`DROP TABLE wl_projection`), run: deliverErr(workload.GroupReadModel)},
+		{name: "nested touch fails", deps: workload.Deps{Groups: workload.AllGroups, NestedTouch: true}, prep: exec(`DROP TABLE wl_cmd_log`), run: deliverErr(workload.GroupReadModel)},
+		{name: "audit applied twice", deps: workload.Deps{Groups: workload.AllGroups}, prep: func(t *testing.T, f *fixture, e pg.OutboxEntry) {
+			if _, err := f.pool.Exec(ctx, `INSERT INTO wl_audit (grp, event_id, key, seq) VALUES ($1, $2, 'k', 1)`, workload.GroupAudit, e.Envelope.ID); err != nil {
+				t.Fatal(err)
+			}
+		}, run: deliverErr(workload.GroupAudit), code: mediator.CodeConflict},
+	}
+	for _, s := range steps {
+		t.Run(s.name, func(t *testing.T) {
+			t.Parallel()
+			f := newFixture(t, s.deps, nil)
+			send(t, f, workload.Bump{Key: "k"})
+			entry := outboxEntries(t, f)[0]
+			s.prep(t, f, entry)
+			err := s.run(t, f, entry)
+			if err == nil {
+				t.Fatal("the handler must fail")
+			}
+			if s.code != "" && mediator.CodeOf(err) != s.code {
+				t.Fatalf("want %s, got %v", s.code, err)
+			}
+		})
+	}
+
+	// A row lock that times out after the query has started: the failure
+	// arrives with the rows, not with the query.
+	t.Run("transfer waits on a locked row", func(t *testing.T) {
+		t.Parallel()
+		f := newFixtureStore(t, workload.Deps{}, nil, pg.StoreConfig{Partitions: 4, DefaultLockTimeout: 200 * time.Millisecond})
+		holder, err := f.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer holder.Rollback(ctx) //nolint:errcheck // cleanup
+		if _, err := holder.Exec(ctx, `SELECT balance FROM wl_bank WHERE account = 'a' FOR UPDATE`); err != nil {
+			t.Fatal(err)
+		}
+		_, err = f.m.SendAny(ctx, transfer)
+		if !pg.IsLockTimeout(err) {
+			t.Fatalf("want a lock timeout, got %v", err)
+		}
+	})
 }

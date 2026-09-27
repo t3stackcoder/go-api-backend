@@ -5,9 +5,9 @@ contract), `docs/design-notes.md` (decisions, deviations, and the hardening
 and tier outcomes in sections 7 and 8), then this file. Keep this file
 current: update it in the same commit as the work it describes.
 
-Last updated 2026-09-26 at the end of the fifth session (the one that fixed
-the two chaos defects of design-notes 8.7 and ran the tiers listed in
-section 2).
+Last updated 2026-09-27 at the end of the sixth session (the one that raised
+the coverage thresholds, re-ran the seven remaining chaos workloads, recorded
+the benchmark baseline, and ran the mutation gate for the first time).
 
 ## 1. Where things stand
 
@@ -19,135 +19,96 @@ a no-op.
 
 | Area | State |
 |---|---|
-| Core, behaviors, validate, pg, redisx, httpapi, openapi, ctl, otel, testkit | complete; `go test -count=1 ./...` green in 25 packages; lint at zero (design-notes 5, 8.4) |
-| Example service and integration tier (`examples/orders`, `test/integration`) | complete and verified: shutdown drain, ack-after-commit, OpenAPI drift, readiness, end to end, Docker target `orders` |
-| Chaos tier (`test/chaos`, `cmd/chaosnode`) | complete; `events` seeds 1 to 8 green on 60 s runs after the fixes below (design-notes 8.8); the other 7 workloads were green before this session and were not re-run |
-| M7 hardening | done: G17 met (6 allocs, 0.44 µs), generic schema names, metrics single-sourced, retry rule, json/v2 tag grammar (design-notes 8.1 to 8.4) |
-| Fault sweep tier (`test/faultsweep`) | complete; 40 fault points; quick matrix: completeness gate passing with `pg.inbox.fence` swept by every kind, one timing-dependent cell (`SweepShutdown/redis.xreadgroup#1/shutdown`) traced to a pre-existing lease leak at shutdown, fixed, cell green 4 of 4 after; full matrix run for the first time (50 min, 2992 s): every scenario green except 5 cells that exposed two more gaps, both fixed and re-run green (`checkAckedImpliesInbox` now exempts dead letters; `pgTx.Rollback` tears the transaction down under an injected fault so a pool of one is not starved) (design-notes 8.9) |
-| Bug A (G6, voluntary release) and Bug B (G12, relay data loss) | fixed and verified in the fourth session |
-| Defect C, same-node re-acquire overlaps the old reader (G6, involuntary loss) | fixed and verified: unit (`TestLeaseManager_LostLeaseWaitsForWorkerExit`, `TestLeaseManager_EndingTracksWorkerExit`, `TestCompareStreamIDs`), integration (`TestConsumers_ClaimsOwnStaleReaderEntriesBelowBatch`), chaos seed 1 (design-notes 8.7, 8.8) |
-| Defect D, stale owner writes until its next renewal (G14) | fixed and verified: migration `0002_partition_epoch.sql`, `pg.Tx.FencePartition`, `pg.ErrStaleLease`; unit (`TestInbox_FencesStaleLease`, storetest `PartitionEpochFence` on memstore), integration (storetest on Postgres, `TestIntegration_Migrations_UpDownUp`, `TestConsumers_StaleLeaseFenceEndsLeaseAndReacquires`), chaos seed 2 (design-notes 6, 8.7, 8.8) |
-| Coverage gate (`task cover`, integration and fault-injection tags) | run for the first time in this form; all 19 packages meet their thresholds: `mediator`, `behavior`, `validate` at 100, `redisx` 95.7, `testkit` 97.5 (new test), `pg` 89.8, `pg/storetest` 80.1, `testkit/invariants` 94.8, `testkit/workload` 93.9 held by the documented `coverThresholds` default of the cover task (design-notes 8.10); `coverage/summary.md` is the record |
-| Example service in the compose stack (profile `orders`) | smoke-tested: `orders-up` builds and starts healthy on a fresh database (migrations 0001 and 0002 apply at start), `GET /readyz` and `/healthz` 200, `GET /openapi.json` 200 (OpenAPI 3.1.0, six paths), all eight partition leases acquired, `orders-down` clean |
+| Core, behaviors, validate, pg, redisx, httpapi, openapi, ctl, otel, testkit | complete; `go test -count=1 -shuffle=on ./...` green in the 24 packages that have tests (31 in the module); lint at zero as of the fifth session (design-notes 5, 8.4) |
+| Example service and integration tier (`examples/orders`, `test/integration`) | complete and verified in the fifth session: shutdown drain, ack-after-commit, OpenAPI drift, readiness, end to end, Docker target `orders`, compose profile `orders` smoke-tested |
+| Chaos tier (`test/chaos`, `cmd/chaosnode`) | complete; every workload green on the rebuilt image: `events` seeds 1 to 8 (fifth session, design-notes 8.8) and the other seven at seed 1 (this session, 8.12), 60 s runs |
+| M7 hardening | done: G17 met (5 allocs, 296 ns on this machine; 6 and 0.44 µs measured in the fifth), generic schema names, metrics single-sourced, retry rule, json/v2 tag grammar (design-notes 8.1 to 8.4) |
+| Fault sweep tier (`test/faultsweep`) | complete; 40 fault points; quick and full matrices green after the fifth session's fixes (design-notes 8.9); not re-run this session (nothing under it changed) |
+| Coverage gate (`task cover`, integration and fault-injection tags) | green with the default 95 percent threshold everywhere but `pg/storetest` (80): `pg` 100, `testkit/invariants` 100, `testkit/workload` 100, `redisx` 95.8, new `testkit/netfault` 100; 20 packages; `coverage/summary.md` is the record (design-notes 8.11) |
+| Benchmark baseline | recorded: `coverage/bench-baseline.txt` from `task bench` then `task bench-baseline` on a quiet machine; `task bench` now gates against it at 10 percent (design-notes 8.12) |
+| Mutation gate (`task mutate`, gremlins, 80 percent efficacy) | run for the first time: efficacy 89.89 percent (2018 killed, 227 lived, 57 hung, 794 on integration-only lines), 12.7 minutes; the task now clears the test cache first; a gremlins path bug needs a one-line local patch on Windows (section 2, design-notes 8.13) |
 
 Verified complete against the spec before this session: all 7 property
-tests, 6 fuzz targets, 16 CLI commands, 20 metrics, every Makefile target.
-The fault point catalogue is 40 points since this session (`pg.inbox.fence`
-was added).
+tests, 6 fuzz targets, 16 CLI commands, 20 metrics, every Makefile target,
+Defects A to D of the chaos rounds (design-notes 8.5, 8.7, 8.8).
 
-## 2. What the fifth session did
+## 2. What the sixth session did
 
-* **Defect C** (`mediator/redisx`): the lease manager parks an ended lease
-  whose worker has not exited (`leaseManager.ending`, `workerDone`) and
-  `rebalance` will not re-acquire that partition until the worker is gone;
-  the claim-before pass became `claimPendingBefore` / `pendingBefore` and
-  claims every pending entry below the batch, the node's own name included,
-  deciding from the XPENDING summary's lowest ID whether the range scan is
-  needed; the `readCtx` comment states the go-redis behaviour correctly.
-  The park decision and the worker's exited mark are both taken under the
-  manager lock (a worker returning between the lease cancel and the park
-  would otherwise leave the partition parked forever).
-* **Defect D** (`migrations`, `mediator/pg`, `mediator/testkit/memstore`,
-  `mediator/pg/storetest`, `mediator/redisx`): table
-  `mediator_partition_epoch`, `pg.Tx.FencePartition` (upsert with
-  `WHERE epoch <= EXCLUDED.epoch RETURNING 1`, fault point `pg.inbox.fence`,
-  before-fault only), `pg.ErrStaleLease` (not transient), the fence in
-  `pg.Inbox()` before `InboxInsert` whenever a fencing token is in the
-  context, the memstore implementation with per-transaction buffering and
-  the row lock, the storetest conformance subtest, and the `redisx` `handle`
-  branch that *releases* the lease with reason `lost` (compare-and-delete,
-  so a key Redis still holds with the node's old value after a snapshot
-  restore is freed at once; a plain end made the re-acquire wait for the
-  TTL, 2 s in the integration test) and stops the worker without counting
-  an error. The chaos controller and the sweep harness truncate the new
-  table between runs; `TestParseCatalogue_GoldenFile` expects 40 points.
-* **Verification, in the handoff's order:** `go test -count=1 -shuffle=on
-  ./...` green (25 packages); `go test -tags integration,faultinject
-  -count=1 ./mediator/pg/ ./mediator/redisx/ ./mediator/testkit/...` green;
-  chaos `events` seeds 1 to 4 pass on the rebuilt image, with the fence and
-  the claim-below pass visibly firing in seed 2 (design-notes 8.8);
-  seeds 5 to 8 pass as well, seed 7 being the first live run to draw
-  `kill` and `pg-restart` (seed 8 also drew `pg-restart`); the quick sweep's completeness gate passes with the new point
-  swept by every kind, and its one failing cell exposed a third defect,
-  below; the full matrix (never run before) was green except three
-  `SweepConsumer` crash-before cells and the two `pool1` cells at
-  `pg.tx.rollback`, which exposed the two further gaps below, both fixed;
-  `task cover` passes with all 19 packages at or above their thresholds
-  after the documented defaults and the testkit test (design-notes 8.10);
-  `task test-integration` (whole tree, integration tag) is green after the
-  two test fixes below; the compose smoke test of the `orders` profile passes (`/readyz`, `/healthz`, `/openapi.json` all 200 on a fresh database, then `orders-down`).
-* **Lease leak at shutdown** (`mediator/redisx/lease.go`, found by the
-  sweep's `SweepShutdown/redis.xreadgroup#1/shutdown` cell, pre-existing):
-  an acquisition whose `SET NX` landed after `stopAcquiring` gave the key
-  back under the tick's context, which `Run` cancels right after
-  `releaseAll`, so a slow first-tick acquisition (cold Postgres pool for the
-  fencing token) left a key unowned until its TTL. The post-stop release now
-  runs under a detached, bounded context; the fake lease store honours
-  context cancellation and has an `afterAcquire` hook;
-  `TestLeaseManager_AcquireAfterStopReleasesUnderDetachedContext` pins it
-  (design-notes 8.9).
-* **Sweep harness gap** (`test/faultsweep/harness_test.go`):
-  `checkAckedImpliesInbox` flagged dead letters, which are acknowledged
-  after the DLQ copy with no inbox row by design, so any consumer crash cell
-  late enough for the `poison` group to have dead-lettered failed the state
-  check (three cells in the full matrix; the quick matrix's first hits
-  crash before that). The check now exempts entries whose original stream
-  ID is in the group's DLQ; all 18 crash-before cells at the two read
-  points pass (design-notes 8.9).
-* **Rollback fault point starved a pool of one** (`mediator/pg/tx.go`):
-  a fault injected before ROLLBACK returned without tearing the transaction
-  down, so the connection stayed checked out; with `pool1` the node hung
-  for the cell budget. A real failed ROLLBACK breaks the connection and
-  pgxpool releases it, so the fault point now rolls back underneath and
-  still returns the injected error. `TestFault_RollbackFaultReleasesConnection`
-  (the first `integration && faultinject` test in `mediator/pg`) pins it
-  and fails without the fix (design-notes 8.9).
-* `TestConsumers_LeaseLossCancelsHandler` (`mediator/redisx`) read the
-  outcome counters the instant the handler had recorded the delivery, a
-  moment before the worker acknowledges and counts it; it failed once in the
-  whole-tree integration run and now waits for the counter like its other
-  steps.
-* `mediator/ctl`'s CLI integration test hard-coded one migration; it now
-  derives the expected version from the embedded migration files and checks
-  both migrations by name (found by the coverage gate, whose first run
-  failed there).
-* Docs: design-notes 6 (two rows), 8.7 rewritten as fixed, 8.8 and 8.9
-  added; this file rewritten.
+* **Coverage thresholds raised** (item 1 of the last handoff): the held
+  thresholds for `pg`, `testkit/invariants`, and `testkit/workload` are
+  gone from `coverThresholds` (`tools/task/tasks.go`); only `pg/storetest`
+  remains at 80. The gaps were the driver's error branches, closed three
+  ways (design-notes 8.11): statements the server rejects while they run
+  (triggers that raise, a deferred constraint trigger that fails COMMIT,
+  columns retyped to text, views whose column raises, a locked row under a
+  short `lock_timeout`); connection-level failures through the new
+  `mediator/testkit/netfault` package (design-notes 7.9), a pgconn
+  `DialFunc` that fails the next write carrying a chosen SQL fragment or
+  sends it and withholds the reply; and arming every `pg.*` fault point
+  against the real store. Two seams were added to `pg` (`migrationsFS`,
+  `NewPgSlotStoreForTest`), and three defensive lines carry
+  `covergate:ignore` with reasons. No framework code changed otherwise.
+  New tests: `pg/failure_test.go` (unit), `pg/dbfault_integration_test.go`,
+  `pg/faultpoints_integration_test.go` (integration and faultinject),
+  `invariants` `TestIntegration_CheckFailures`, `workload`
+  `TestIntegration_HandlerFailures` plus three rows of
+  `TestIntegration_StorageErrors`, and `netfault`'s own unit test.
+* **Chaos re-run** (item 2): the seven workloads other than `events` at seed
+  1, 60 s, all green with every checker passing (design-notes 8.12); the
+  stack was torn down afterwards.
+* **Benchmark baseline** (item 3, first half): `task bench` on the quiet
+  machine, then `task bench-baseline`; `BenchmarkSend_DefaultChain` at
+  296 ns and 5 allocs (design-notes 8.12). The file is under the
+  git-ignored `coverage/`, so it lives on this machine only.
+* **Mutation gate** (item 3, second half): `task mutate` with gremlins
+  v0.6.0 installed into a scratch `GOBIN`. Finding: gremlins keys its
+  coverage profile with `filepath.Rel`, which uses backslashes on Windows,
+  while mutant positions come from an `fs.FS` walk with forward slashes, so
+  every mutant below the calling directory is reported "not covered" and
+  only the root `mediator` package is actually tested (first run: 302
+  killed, 25 lived, 2768 not covered, efficacy 92.35 percent, mutator
+  coverage 10.57 percent, 2.5 minutes). Linux CI does not have the
+  problem. A one-line local patch (`filepath.ToSlash` in
+  `internal/coverage/coverage.go` `removeModuleFromPath`) makes the gate
+  real on Windows. Second finding: gremlins sizes every mutant's test
+  timeout from the wall time of its coverage run, so a run served from the
+  test cache (2.7 s) starved the real test runs and 266 of the first 361
+  mutants timed out; `taskMutate` now runs `go clean -testcache` first
+  (`tools/task/tasks.go`, with its test). The real run: 12 minutes 45
+  seconds, 2018 killed, 227 lived, 57 timed out (mutants that hang their
+  tests), 794 not covered (integration-only lines), efficacy 89.89 percent
+  against the 80 gate (design-notes 8.13, with the survivors by file). The
+  gremlins patch is not in the repository; the upstream fix is worth a
+  pull request.
+* Docs: design-notes 7.9, 8.11, 8.12, 8.13 added; this file rewritten.
 
 ## 3. What is left, in order
 
 Against spec 14's definition of done for v1.0: every milestone's
-deliverables exist and every tier is green locally; what remains is the
-acceptance tail. Never run anywhere: the race detector, the mutation gate,
-the benchmark baseline (an M1 acceptance item), soak mode, and CI itself
-(including the TypeScript client job). Not started: the two weeks of green
-nightlies, which need a remote. The items below are that tail, in order.
+deliverables exist and every tier is green locally. What remains is the
+acceptance tail that needs a remote or calendar time, plus the survivors of
+the mutation gate.
 
-1. **Raise the coverage thresholds** (`coverThresholds` in
-   `tools/task/tasks.go`, design-notes 8.10): `pg` 89.8 needs
-   connection-level fault injection for the relay, janitor, migrate, outbox,
-   and statement error branches (a pgx-level fault hook, or a proxy that
-   drops the connection at a chosen statement); `testkit/invariants` 94.8
-   and `testkit/workload` 93.9 need tests of their error returns;
-   `pg/storetest` 80.1 is a conformance suite and can stay excused.
-2. **Re-run the other seven chaos workloads** on the rebuilt image (only
-   `events` was re-run after the 8.7 fixes; they were green before).
-3. **Benchmark baseline** (`go run ./tools/task bench` then `bench-baseline`)
-   on a quiet machine, and **mutation testing** (`task mutate`, gremlins,
-   80 percent gate, nightly in CI). Neither has been run.
-4. **CI.** No remote exists. The first push exercises tiers 0 to 4 and the
+1. **Mutation survivors.** Spec 11.3 says surviving mutants are triaged into
+   new table rows. Design-notes 8.13 lists the 227 that lived by file and
+   mutator (165 are boundary conditions, `validate`'s length and range
+   checks first); each is either a missing assertion (add the table row)
+   or an equivalent mutant (record it as such). The gate's threshold rises
+   as the suite matures. To reproduce on Windows, build gremlins with the
+   one-line patch of section 2 into a scratch `GOBIN` and put it on `PATH`.
+2. **CI.** No remote exists. The first push exercises tiers 0 to 4 and the
    openapi job for the first time, including the race detector, which has
-   never run anywhere (no C compiler on this machine).
-5. **Chaos at spec scale.** The nightly matrix is 5 minutes per cell over
-   seeds 1 to 3 (`task chaos-matrix`, `CHAOS_DURATION`). The `kill` and
-   `pg-restart` nemeses were drawn for the first time in seeds 7 and 8 of
-   this session (60 s runs, both green); the other seven workloads have not
-   been re-run since the 8.7 fixes (they were green before); the definition
-   of done wants two weeks of green nightlies, which is calendar time. Soak
-   mode (`-soak`) exists and has not been exercised.
-6. **Commit** only when the user asks, with the attribution line the session
-   specifies. The working tree currently holds the whole fifth session
-   uncommitted (30 files, 26 modified and 4 new, see `git status`).
+   never run anywhere (no C compiler on this machine), and the nightly
+   mutation and benchmark jobs. The `mutate` job runs on Linux, where the
+   gremlins path bug of section 2 does not apply.
+3. **Chaos at spec scale.** The nightly matrix is 5 minutes per cell over
+   seeds 1 to 3 (`task chaos-matrix`, `CHAOS_DURATION`); every cell has
+   passed at 60 s; the definition of done wants two weeks of green
+   nightlies, which is calendar time. Soak mode (`-soak`) exists and has
+   not been exercised.
+4. **Commit** only when the user asks, with the attribution line the session
+   specifies. The sixth session is committed; the tree was clean at the
+   end of it.
 
 ## 4. How to run each tier here
 
@@ -159,36 +120,41 @@ go run ./tools/task test-sweep               # tier 3, full matrix
 go run ./tools/task chaos-up                 # builds the node image (--build)
 go run ./tools/task chaos -workload events -seed 1 -duration 60s
 go run ./tools/task chaos-down
-go run ./tools/task cover                    # needs Docker now
+go run ./tools/task cover                    # needs Docker; about 4 minutes
+go run ./tools/task bench                    # gates against coverage/bench-baseline.txt
+go run ./tools/task mutate                   # gremlins on PATH; see section 2 for Windows
 go run ./tools/task orders-up                # example service on :8080, then orders-down
 ```
 
 `go test -v` in package-list mode buffers a package's output until it
 finishes, so a sweep log stays empty for minutes while the containers are
 visibly cycling in `docker ps`; pass a single package path or `-json` to
-stream. The sweep uses testcontainers unless `PG_URL` and `REDIS_ADDR` are
-both set (CI sets them after `task up`). A chaos run writes `summary.json`
-(`pass`, per-checker `checkers.<name>.ok` and `violations`, `nemeses`),
-`nemesis.jsonl`, and the node logs into its run directory; the node logs
-carry one `consumer apply` line per delivery with `fencing=`, `partition=`,
-`group=`, `key=`, `seq=`, and `event_id=`, and the event ID is a UUIDv7
-whose first 48 bits are the creation time in milliseconds, which is how the
-8.7 timelines were reconstructed. The fixes of 8.7 log `delivery rejected
-by the partition fence; giving the lease up` and `claimed pending entries
-below the batch`. Do not run the sweep and chaos at the same time, and do
-not run `orders-up`/`orders-down` while the chaos stack is up: both
-profiles belong to the same compose project, and `down -v` removes the
-shared Postgres and Redis.
+stream. A package whose test hangs loses all its output to the timeout
+panic; run the suspect test alone with `-run` and `-v`. The sweep uses
+testcontainers unless `PG_URL` and `REDIS_ADDR` are both set (CI sets them
+after `task up`). A chaos run writes `summary.json` (`pass`, per-checker
+`checkers.<name>.ok` and `violations`, `nemesis_total`, `nemeses` by kind,
+`ops`), `nemesis.jsonl`, and the node logs into its run directory; the
+node logs carry one `consumer apply` line per delivery with `fencing=`,
+`partition=`, `group=`, `key=`, `seq=`, and `event_id=`, and the event ID
+is a UUIDv7 whose first 48 bits are the creation time in milliseconds,
+which is how the 8.7 timelines were reconstructed. Do not run the sweep and
+chaos at the same time, and do not run `orders-up`/`orders-down` while the
+chaos stack is up: both profiles belong to the same compose project, and
+`down -v` removes the shared Postgres and Redis. The mutation run is CPU
+bound for minutes; do not run it beside the integration tiers, whose
+`eventually` windows are seconds.
 
-## 5. Environment facts (verified 2026-09-26)
+## 5. Environment facts (verified 2026-09-27)
 
 * Windows 11, Git Bash for commands; `make` not installed (use
-  `go run ./tools/task <name>`); Docker Desktop 29 with Linux containers and
-  Compose v2.40 (it may not be running when a session starts: start
-  `Docker Desktop.exe` and wait for the engine); Node 24 with npx;
-  staticcheck and golangci-lint not installed (the user's golangci-lint is
-  a Go 1.26 build and refuses the module; install v2.14.0 from source with
-  Go 1.27 into a scratch `GOBIN`).
+  `go run ./tools/task <name>`); Docker Desktop 29.1 with Linux containers
+  and Compose v2.40 (it may not be running when a session starts: start
+  `Docker Desktop.exe` and wait for the engine, about a minute); Node 24
+  with npx; benchstat installed; staticcheck and golangci-lint not
+  installed (the user's golangci-lint is a Go 1.26 build and refuses the
+  module; install v2.14.0 from source with Go 1.27 into a scratch `GOBIN`);
+  gremlins v0.6.0 installs and runs, with the path caveat of section 2.
 * No C compiler: `-race` cannot run locally; CI runs it. Use
   `go test -count=2 -shuffle=on` locally.
 * go-redis is v9.22.0 with `ContextTimeoutEnabled`: a command runs
@@ -196,11 +162,30 @@ shared Postgres and Redis.
   the context, so cancelling the context of a blocking `XREADGROUP` does not
   interrupt it; the read returns when Redis replies or `BLOCK` expires.
   Redis does unblock a reader whose stream key is deleted (flush).
+* pgx is v5.11: `Query` prepares a statement before it executes it, so a
+  missing table or column fails `Query` itself and only a runtime error
+  (a raising function, a lock timeout) surfaces in `rows.Err()`; with the
+  default statement cache a repeated statement carries only its name on
+  the wire (`netfault` uses `QueryExecModeDescribeExec` for that reason);
+  a pooled connection that is closed is destroyed at release, so the next
+  acquire opens a fresh one; `pgxpool.NewWithConfig` does not connect
+  unless `MinConns` is set, so a closed pool is a cheap "every acquire
+  fails" fake.
+* Postgres facts that bit tests: a deferred constraint trigger fails the
+  COMMIT with the trigger's SQLSTATE (P0001 for RAISE); `SELECT ... FOR
+  UPDATE SKIP LOCKED` sees nothing while another transaction of the same
+  test holds the rows; `DROP SCHEMA ... CASCADE` waits for every
+  transaction that holds a lock in it, so a test that leaks a transaction
+  hangs its own cleanup; `ALTER COLUMN ... TYPE text` is enough to make a
+  scan fail; `pg_catalog` is searched before `search_path`, so a function
+  there cannot be shadowed by the test schema.
 * `encoding/json/v2` facts that bit agents: nil slices encode as `[]`, map
   order needs `json.Deterministic(true)`, unknown members need
   `json.RejectUnknownMembers(true)`, the map-merge tag is `json:",embed"`,
   `time.Duration` has no default encoding (request types must not use it
-  in JSON fields).
+  in JSON fields), invalid UTF-8 in a string is a marshal error, and
+  `mediator.Build` checks that every response type round-trips its zero
+  value, so a test type whose codec fails must fail only for non-zero values.
 * `httptest.NewTestServer(t, h)` works inside `synctest.Test`.
 * Postgres advisory locks used by the relay, janitor, and migrations are
   database-global: integration tests that run them are sequential or use a
@@ -213,7 +198,8 @@ shared Postgres and Redis.
 
 * Exported APIs of finished packages are frozen; a needed change is recorded
   in `docs/design-notes.md` section 6 first (Defect D's `pg.Tx.FencePartition`
-  and the `mediator_partition_epoch` table are recorded there).
+  and the `mediator_partition_epoch` table are recorded there). Test seams
+  go in `export_test.go`, never in the API.
 * Every I/O call site passes a literal fault point name from
   `mediator/testkit/faultpoints.txt`; `TestFaultPointCatalogue` fails on an
   unlisted literal, `TestParseCatalogue_GoldenFile` in `test/faultsweep/plan`
@@ -222,6 +208,14 @@ shared Postgres and Redis.
   `test/faultsweep/zz_completeness_test.go`; a point with no `FaultAfter`
   call is excused from the ambiguous kind automatically). A new point must
   also be added to the `patterns` of the sweep scenario that exercises it.
+* Fault schedules (`testkit.Arm`) and the migration source seam
+  (`pg.SetMigrationsFS`) are process-wide: a test that uses them does not
+  call `t.Parallel`, so it runs while the parallel tests are paused.
+* Connection-level failures use `testkit/netfault` (design-notes 7.9):
+  build the pool from `Dialer.Config`, warm it with a ping, arm one rule
+  right before the call. Server-side failures prefer a trigger, a retyped
+  column, or a view over the dialer, because they do not depend on what pgx
+  puts on the wire.
 * Integration tests sit beside the code as `*_integration_test.go` with
   `//go:build integration` and their own `TestMain` (testcontainers
   `postgres:18`, `redis:8`); `test/integration` holds cross-package scenarios.
@@ -235,4 +229,4 @@ shared Postgres and Redis.
   `mediator/ctl/integration_test.go`.
 * Decisions that are not in spec.md are indexed in design-notes section 7
   (pg, redisx, behavior, httpapi and openapi, names, test/integration,
-  test/chaos, deploy); do not duplicate them here.
+  test/chaos, deploy, testkit/netfault); do not duplicate them here.

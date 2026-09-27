@@ -17,15 +17,19 @@ import (
 // fakeSlotStore is an in-memory pg.SlotStore: outbox rows with a published
 // flag and one relay cursor, plus failure switches.
 type fakeSlotStore struct {
-	mu        sync.Mutex
-	rows      []fakeRow
-	cursor    *pg.RelayCursor
-	failBegin error
-	failMark  error
-	failAfter error
-	failSave  error
-	commitErr error
-	batches   int
+	mu         sync.Mutex
+	rows       []fakeRow
+	cursor     *pg.RelayCursor
+	failBegin  error
+	failCursor error
+	failMark   error
+	failAfter  error
+	failSave   error
+	commitErr  error
+	batches    int
+	// onBegin runs at the start of every BeginBatch; tests use it to cancel
+	// the context under a failing batch.
+	onBegin func()
 }
 
 type fakeRow struct {
@@ -66,6 +70,9 @@ func (f *fakeSlotStore) unpublished() []int64 {
 }
 
 func (f *fakeSlotStore) BeginBatch(ctx context.Context, topic string, partition, limit int) (pg.RelayBatch, error) {
+	if f.onBegin != nil {
+		f.onBegin()
+	}
 	if f.failBegin != nil {
 		return nil, f.failBegin
 	}
@@ -82,6 +89,9 @@ func (f *fakeSlotStore) BeginBatch(ctx context.Context, topic string, partition,
 }
 
 func (f *fakeSlotStore) Cursor(ctx context.Context, topic string, partition int) (pg.RelayCursor, bool, error) {
+	if f.failCursor != nil {
+		return pg.RelayCursor{}, false, f.failCursor
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.cursor == nil {

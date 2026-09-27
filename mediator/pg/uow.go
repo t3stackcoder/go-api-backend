@@ -277,7 +277,7 @@ func (b *uowBehavior) HandleStream(ctx context.Context, req any, info *mediator.
 				panic(p)
 			}
 			if !settled {
-				u.rollback(ctx, b.cfg)
+				u.rollback(ctx, b.cfg) // covergate:ignore every exit of the loop settles first; only runtime.Goexit reaches this
 			}
 		}()
 		for v, err := range next(txCtx, req) {
