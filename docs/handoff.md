@@ -2,12 +2,14 @@
 
 Written for the next agent continuing this work. Read `spec.md` (the
 contract), `docs/design-notes.md` (decisions, deviations, and the hardening
-and tier outcomes in sections 7 and 8), then this file. Keep this file
+and tier outcomes in sections 7 and 8), then this file. The first
+application on the framework, a usage-based billing service on Polar, has
+its own contract in `spec-billing.md`; read it before touching anything
+under `billing/`, `cmd/billingd`, or `cmd/billingctl`. Keep this file
 current: update it in the same commit as the work it describes.
 
-Last updated 2026-09-27 at the end of the ninth session (the one that
-fixed what the first CI run found, verified the fixes with the race detector
-in a container, made CI manual only, and pushed).
+Last updated 2026-09-27 at the end of the tenth session (the one that
+wrote `spec-billing.md`; nothing of it is implemented yet).
 
 ## 1. Where things stand
 
@@ -39,12 +41,40 @@ container (section 4).
 | Coverage gate (`task cover`, integration and fault-injection tags) | green with the default 95 percent threshold everywhere but `pg/storetest` (80): `pg` 100, `testkit/invariants` 100, `testkit/workload` 100, `redisx` 95.8, `testkit/netfault` 100; 20 packages; `coverage/summary.md` is the record (design-notes 8.11); not re-run in the ninth session (its only production change, in `DecodeEntry`, has unit rows for the new branch) |
 | Benchmark baseline | recorded: `coverage/bench-baseline.txt` from `task bench` then `task bench-baseline` on a quiet machine; `task bench` gates against it at 10 percent (design-notes 8.12); `BenchmarkPublish_InProcess` re-measured at 35.6 to 35.9 ns and 0 allocs after the eighth session's fix |
 | Mutation gate (`task mutate`, gremlins, 95 percent efficacy) | green at the 95 gate: efficacy 96.87 percent (2167 killed, 70 lived and all equivalent, 67 timed out, 793 on integration-only lines), 12.6 minutes with the patched gremlins after the `Publish` fix (design-notes 8.14) |
+| Billing service (`spec-billing.md`) | specified, not started: no `billing/` package, no migrations, no `cmd/billingd`; the spec's milestone BM0 is the first step, and its section 3.5 names the two additive framework changes (an `httpapi` mount option and a generalized `pg.Migrator`) that must be recorded in design-notes 6 before they are made |
 
 Verified complete against the spec before the sixth session: all 7 property
 tests, 6 fuzz targets, 16 CLI commands, 20 metrics, every Makefile target,
 Defects A to D of the chaos rounds (design-notes 8.5, 8.7, 8.8).
 
-## 2. What the eighth and ninth sessions did
+## 2. What the eighth, ninth, and tenth sessions did
+
+* **The billing spec** (tenth session). `spec-billing.md` was written from
+  the framework as implemented (design-notes, not spec.md, where they
+  differ) and from Polar's documentation as of 2026-09-27 (event ingestion
+  with `external_id` deduplication, Standard Webhooks for secrets created
+  on or after 2026-09-08, the customer state endpoint, sandbox at
+  `sandbox-api.polar.sh`). No code was written. The decisions that shape
+  the implementation: the ledger is the source of truth for usage and
+  Polar for money; enforcement is one transaction under one counter row
+  lock; there is no per-usage outbox event; Polar calls never happen inside
+  a request unit of work; the webhook edge is a raw-body mount that stores
+  and publishes, and a `StrictOrder` consumer applies; a fake Polar kept
+  honest by a sandbox conformance suite stands in for Polar in every tier.
+  The two framework changes it needs are in its section 3.5. The
+  `README.md` index and this file point at it. An audit of the spec
+  against the framework sources and Polar's documentation, in the same
+  session and before this first commit, corrected it: Polar credits had
+  been counted twice (the plan's `included_units` and the mirrored
+  grants), `benefit_grant.cycled` was unhandled, prices are stored at
+  10^-12 of a cent to match Polar's twelve-decimal `unit_amount`, the
+  API version is pinned with the `Polar-Version` header,
+  `ResumeSubscription` became `UncancelSubscription`, the `cap_reached`
+  notification commits in a `RequiresNew` transaction, the notification
+  unique key is `NULLS NOT DISTINCT`, and the plan tables moved to
+  migration 0001. Nothing else changed.
+
+The rest of this section is the eighth and ninth sessions as recorded before.
 
 * **Mutation triage closed** (eighth session). Design-notes 8.14 holds the
   per-mutant record of the seventh session's triage (156 killed by new unit
@@ -121,8 +151,21 @@ Defects A to D of the chaos rounds (design-notes 8.5, 8.7, 8.8).
 Against spec 14's definition of done for v1.0: every milestone's
 deliverables exist, every tier is green locally, the mutation triage is
 closed, the first CI run's findings are fixed, and the tree is pushed. What
-remains is calendar time, at the user's discretion.
+remains for the framework is calendar time, at the user's discretion. The
+next body of work is the billing service.
 
+0. **Billing, from BM0.** `spec-billing.md` section 16 is the milestone
+   plan and section 13 the guarantees each milestone must prove. BM0 is
+   the scaffold: the two framework changes of its section 3.5 (recorded in
+   design-notes 6 first, each with unit rows), the `billing/` layout with
+   every request registered, migration 0001, `cmd/billingd` and
+   `cmd/billingctl`, `api/billing-openapi.json` with its drift check, and
+   the `task` targets of its section 15.2. The spec's section 17.2 lists
+   the questions only the Polar sandbox can answer; they are settled at
+   BM2 by the conformance run and recorded in the spec, not guessed.
+   Conventions of section 6 below apply unchanged: new fault points go in
+   the shared catalogue (its Appendix A), the billing sweep scenarios live
+   in `test/faultsweep`, and every table list learns the `billing_*` tables.
 1. **Long chaos soak.** The matrix is 5 minutes per cell over seeds 1
    to 3 (`task chaos-matrix`, `CHAOS_DURATION`; 20 minutes per cell in the
    CI job); every cell has passed at 60 s. spec 14 wants two weeks of

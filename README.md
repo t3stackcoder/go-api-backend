@@ -10,6 +10,9 @@ chaos runs).
 - [spec.md](spec.md) is the complete specification and wins over everything else.
 - [docs/design-notes.md](docs/design-notes.md) records the package contracts,
   the import graph, and the deliberate deviations from the spec.
+- [spec-billing.md](spec-billing.md) specifies the first application built on
+  the framework, a usage-based billing service with Polar as the payment
+  provider; it is written, not yet implemented.
 
 ## Layout
 
