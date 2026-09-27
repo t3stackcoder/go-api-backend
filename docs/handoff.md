@@ -19,10 +19,12 @@ had it removed in the eighth session), so a push is
 `git push https://github.com/t3stackcoder/go-api-backend main`. CI
 (`.github/workflows/ci.yml`) has run once, on the eighth session's push; its
 findings are fixed in the local commit (design-notes 8.15) and the three
-runs of that day were cancelled. The workflow has no cron schedule, and the
-fault sweep runs, like the long tiers, only by manual dispatch with
-`nightly=true` (design-notes 6): a push runs static, unit, short fuzz,
-integration, and openapi, about ten minutes. The whole tree builds, vets,
+runs of that day were cancelled. The workflow has no cron schedule and no
+push or pull-request trigger (design-notes 6): nothing runs in CI unless
+someone dispatches it by hand from the Actions tab, which runs the five
+short jobs (static, unit, short fuzz, integration, openapi, about ten
+minutes) and, with `nightly=true` ticked, the long tiers as well. The whole
+tree builds, vets,
 and is gofmt-clean under every build tag (`integration`, `faultinject`,
 `faultsweep`, `chaos`), `go mod tidy` is a no-op, golangci-lint v2.14.0
 with `.golangci.yml` and staticcheck report nothing, and
@@ -93,11 +95,14 @@ Defects A to D of the chaos rounds (design-notes 8.5, 8.7, 8.8).
   golangci-lint v2.14.0 built from source (0 issues), staticcheck, gofmt,
   `go vet` under every tag, `go mod tidy -diff`, the full suite here, and
   `task fuzz -fuzztime 30s` over the six targets.
-* **Fault sweep job moved to manual dispatch** (ninth session). The `sweep`
-  job in `.github/workflows/ci.yml` carries the long tiers' condition
-  (`workflow_dispatch` with `nightly=true`); recorded as a deviation from
-  spec 11.3 in design-notes 6 with the reason (the user's cost decision).
-  The dispatch input keeps the name `nightly`.
+* **CI made manual only** (ninth session). First the `sweep` job in
+  `.github/workflows/ci.yml` got the long tiers' condition
+  (`workflow_dispatch` with `nightly=true`); then, at the user's direction,
+  the push and pull-request triggers were removed altogether, so the
+  workflow runs only when dispatched by hand. Recorded as a deviation from
+  spec 11.3 in design-notes 6 with the reason: the framework is finished
+  and is not re-tested unless it changes. The dispatch input keeps the
+  name `nightly`.
 * Docs: design-notes 6 row and 8.15 added; this file rewritten.
 
 ## 3. What is left, in order
@@ -110,11 +115,11 @@ user's decision or calendar time.
 1. **Push, when the user wants it.** The local commit carries everything;
    `git push https://github.com/t3stackcoder/go-api-backend main` (or
    `git remote add origin https://github.com/t3stackcoder/go-api-backend`
-   first) fast-forwards GitHub. A push starts the five short jobs only
-   (static, unit with `-race` and the coverage gate, short fuzz,
-   integration, openapi), about ten minutes of wall clock; nothing long
-   starts without a manual dispatch. Each failed job was re-run here with
-   the same tool and command. The one step not repeated locally is the
+   first) fast-forwards GitHub. A push starts nothing in CI; to check a
+   change there, dispatch the workflow by hand from the Actions tab (the
+   five short jobs, about ten minutes; tick `nightly=true` for the long
+   tiers). Each job that failed in the first run was re-run here with the
+   same tool and command. The one step not repeated locally is the
    coverage gate inside the unit job (`task cover`, four minutes with
    Docker); the only production change is in `DecodeEntry`'s handling of
    the `at` field, and its new branch has unit rows.

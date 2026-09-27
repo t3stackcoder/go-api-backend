@@ -2,17 +2,16 @@
 # `go run ./tools/task <name>` entry points developers use locally, so the
 # commands are defined once in tools/task.
 #
-# Push and pull request: static, unit, fuzz-short, integration, openapi, the
-# jobs that finish in minutes.
-# Manual dispatch with `nightly=true` only (there is no cron schedule): the
-# fault sweep, fuzz for 30 min per target, mutation testing, benchmarks with
-# the benchstat gate, and the chaos matrix against the compose `chaos` profile.
+# Nothing runs on its own: there is no cron schedule and no push or pull
+# request trigger (design-notes 6). The workflow runs only when dispatched by
+# hand from the Actions tab. Every dispatch runs static, unit, fuzz-short,
+# integration, and openapi, the jobs that finish in minutes; ticking
+# `nightly=true` adds the fault sweep, fuzz for 30 min per target, mutation
+# testing, benchmarks with the benchstat gate, and the chaos matrix against
+# the compose `chaos` profile.
 name: ci
 
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
     inputs:
       nightly:

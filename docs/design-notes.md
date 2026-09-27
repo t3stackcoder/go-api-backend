@@ -251,7 +251,7 @@ func WriteProblem(w http.ResponseWriter, r *http.Request, err error)
 | Timeout "applies `context.WithTimeout`" (5.6) | `behavior.deadlineCtx`: one allocation, observably equivalent, lazily backed by `context.WithDeadline` on the first `Done()` | G17: saves 4 allocations on the no-I/O path; children derived by pgx, go-redis, or errgroup still attach without a watcher goroutine (`TestDeadlineCtx_NoWatcherGoroutines`) |
 | Spec 6.2 table list | Migration `0002_partition_epoch.sql` adds `mediator_partition_epoch (consumer_group, topic, partition, epoch, updated_at)`, primary key `(consumer_group, topic, partition)` | Fencing at the effect (G14, 8.7): the lease store cannot close the window between Redis forgetting a lease key and the old owner's next renewal tick, so the consumer's token is checked in the transaction that applies the effect |
 | `pg.Tx` interface frozen | `FencePartition(ctx, group, topic, partition, token) (ok bool, err error)` added, fault point `pg.inbox.fence`; `Inbox()` calls it before `InboxInsert` whenever `mediator.FencingToken(ctx)` is present and returns `CodeConflict` wrapping `pg.ErrStaleLease` (not transient) when the token is below the stored epoch | The token has to be checked where the effect happens, which is Postgres (G14, 8.7); the upsert's row lock also serializes the two owners' transactions |
-| Spec 11.3: tiers 0 to 4 on every push, the long tiers nightly (11.6 and 14 count on nightly runs) | No cron schedule. Every push runs static, unit (with `-race` and the coverage gate), short fuzz, integration, and the openapi job, about ten minutes of wall clock; the fault sweep, 30-minute fuzz, mutation gate, benchmarks, and chaos matrix run only by manual dispatch of the workflow with `nightly=true` | The user's decision in the eighth and ninth sessions: with no front end there is nothing to soak every night, and the sweep's 40 to 75 minutes on every push is not worth waiting for. Every tier still runs locally (handoff section 4) and on demand; spec 14's two weeks of green nightlies is on hold until there is something to soak |
+| Spec 11.3: tiers 0 to 4 on every push, the long tiers nightly (11.6 and 14 count on nightly runs) | No cron schedule and no push or pull-request trigger: nothing runs in CI unless someone dispatches the workflow by hand from the Actions tab. A dispatch runs static, unit (with `-race` and the coverage gate), short fuzz, integration, and the openapi job, about ten minutes of wall clock; ticking `nightly=true` adds the fault sweep, 30-minute fuzz, mutation gate, benchmarks, and chaos matrix | The user's decision in the eighth and ninth sessions: the framework is finished and is not to be re-tested unless it changes, with no front end there is nothing to soak every night, and the sweep's 40 to 75 minutes per run is not worth waiting for. A future change is verified by dispatching the workflow by hand or with the local commands of handoff section 4; spec 14's two weeks of green nightlies is on hold until there is something to soak |
 
 ## 7. Decisions recorded by the package agents
 
@@ -1331,10 +1331,13 @@ was fast-forwarded back to `9989273` first.
   was at 34 minutes when it was cancelled, cap 75) and the user had asked,
   in the same session, for the nightly schedule to go because there is
   nothing to soak yet. The `sweep` job now carries the same
-  `workflow_dispatch && inputs.nightly` condition as the long tiers, so a
-  push runs static, unit, short fuzz, integration, and openapi, about ten
-  minutes. The dispatch input is still named `nightly` (its description
-  lists the fault sweep now) so the documented `nightly=true` keeps working.
+  `workflow_dispatch && inputs.nightly` condition as the long tiers. Later
+  in the session, at the user's direction, the push and pull-request
+  triggers went too: the workflow now runs only when dispatched by hand,
+  the five short jobs on every dispatch and the long tiers when
+  `nightly=true` is ticked (section 6). The dispatch input is still named
+  `nightly` (its description lists the fault sweep now) so the documented
+  `nightly=true` keeps working.
 * **State of the two copies.** GitHub holds `9989273`; the local clone is
   one commit ahead with these fixes and has no remote configured (the user
   had it removed in the eighth session). Nothing was pushed in the ninth
