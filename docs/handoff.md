@@ -76,8 +76,9 @@ Defects A to D of the chaos rounds (design-notes 8.5, 8.7, 8.8).
   `tools/task/app_test.go`, and the `nightly-mutate` job name in
   `.github/workflows/ci.yml`. spec 11 still says "80 percent, rising as the
   suite matures", which this is.
-* Docs: design-notes 8.14 added; this file rewritten. The eighth session's
-  changes were left uncommitted for the user to commit (section 3 item 3).
+* Docs: design-notes 8.14 added; this file rewritten. Committed and
+  pushed at the user's request, then the cron schedule removed and the
+  first CI run's findings recorded (section 3 item 1) in two more commits.
 
 ## 3. What is left, in order
 
@@ -86,17 +87,57 @@ deliverables exist, every tier is green locally, and the mutation triage is
 closed. What remains is the acceptance tail that needs a remote or calendar
 time.
 
-1. **CI.** The first push run (the eighth session) exercised tiers 0 to 4
-   and the openapi job for the first time, including the race detector,
-   which had never run anywhere (no C compiler on this machine): openapi
-   and integration passed; tier 0 static and tier 1 unit failed on that
-   run and were under triage when this was written, with the sweep and
-   short fuzz still running. The long tiers have not run in CI. When the
-   `mutate` job is dispatched it runs on Linux, where the gremlins path
-   bug of design-notes 8.13 does not apply, and gates at 95; a slower
-   runner may turn kills into timeouts and lower the killed count that
-   efficacy is computed from, so if it fails narrowly, compare its LIVED
-   list with 8.14 before touching the gate.
+1. **Fix what the first CI run found.** The first push run (the eighth
+   session, run 36318721586 on the Actions tab) exercised tiers 0 to 4 and
+   the openapi job for the first time. openapi and tier 4 integration
+   passed; the fault sweep was still running when this was written; three
+   jobs failed, none of it caused by that session's changes:
+   * **Tier 0 static (golangci-lint), three findings.** A comment
+     misspelling, `modelling`, at `mediator/pg/tx.go:80` (misspell); two
+     staticcheck QF1008 hints, "could remove embedded field `Conn` from
+     selector", at `mediator/testkit/netfault/netfault.go:139` and `:146`.
+     staticcheck, govulncheck, gofmt and vet passed.
+   * **Tier 1 unit under `-race`, four data races**, the race detector's
+     first run anywhere (no C compiler on this machine). Every frame pair
+     is a test fake shared between goroutines without a mutex; three of
+     the four tests were extended by the seventh session's triage. In
+     `behavior`, `TestCacheInvalidation_RetryRecovers`: a write at
+     `cache_invalidation_test.go:158` (the test's metrics recorder, under
+     `metrics.go:91`) against a read at `:115` from the invalidation
+     goroutine (`cache_invalidation.go:177`, through
+     `cachemodel/memory.go:72`). In `httpapi`,
+     `TestHealth/readyz_with_passing_checks`: two health checks started at
+     `httpapi.go:236` both write the test's variable at
+     `health_test.go:32`. In `pg`, `TestSlot_RunLoop`: the test writes at
+     `relay_test.go:482` while the slot loop (`relay.go:344`, `:431`) reads
+     the memstore stream at `testkit/memstore/streams.go:85`; the only one
+     with a production file on the read side, so check whether
+     `memstore` takes its lock on that path before blaming the test. In
+     `redisx`, `TestLeaseManager_RunLoop`: the lease manager (`lease.go:298`,
+     `:320`) writes into the test's fake at `lease_test.go:119` while the
+     test goroutine started at `lease_test.go:580` reads it. The full
+     reports are in the job log; the fix is a mutex (or an atomic) in each
+     fake. `go test -race` cannot run here; push and let CI check.
+   * **Tier 2 short fuzz, one failure.** `FuzzEnvelopeDecode` in
+     `mediator/redisx` (`fuzz_test.go:36`, "round trip changed the entry")
+     on a 325-byte input that the fuzzer minimised and wrote to
+     `testdata/fuzz/FuzzEnvelopeDecode/5515dd0f123bbdbc` on the runner; it
+     is in the `fuzz-crashers` artifact of that run, not in the
+     repository. The printed `got` and `want` are identical, so the
+     difference is one `%v` hides and `reflect.DeepEqual` sees: most
+     likely a nil `Headers` map on one side and an empty one on the other
+     (design-notes 5 lists json/v2's `{}` behaviour), possibly a
+     `time.Time` location. Download the artifact, put the file under
+     `mediator/redisx/testdata/fuzz/FuzzEnvelopeDecode/`, run
+     `go test -run=FuzzEnvelopeDecode/5515dd0f123bbdbc ./mediator/redisx`,
+     and either fix the decoder or make the comparison canonical; the
+     corpus entry is then committed as a regression test (spec 11.3).
+   The other five short fuzz targets passed. The long tiers have not run
+   in CI. When the `mutate` job is dispatched it runs on Linux, where the
+   gremlins path bug of design-notes 8.13 does not apply, and gates at 95;
+   a slower runner may turn kills into timeouts and lower the killed count
+   that efficacy is computed from, so if it fails narrowly, compare its
+   LIVED list with 8.14 before touching the gate.
 2. **Chaos at spec scale.** The matrix is 5 minutes per cell over seeds 1
    to 3 (`task chaos-matrix`, `CHAOS_DURATION`; 20 minutes per cell in the
    CI job); every cell has passed at 60 s. spec 14 wants two weeks of
